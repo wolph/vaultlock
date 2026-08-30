@@ -981,7 +981,9 @@ inspect_init_volume_absence() {
       and (.Containers | type == "array")
       and (.Containers | length > 0)
       and all(.Containers[];
-        type == "object" and (.Volumes | type == "array"))' \
+        type == "object"
+          and (.Volumes | type == "array")
+          and all(.Volumes[]; type == "object"))' \
     >/dev/null 2>&1 \
     || die "cannot inspect APFS volumes for init: invalid APFS list schema"
   invalid_record_count=$(printf '%s' "$apfs_json" | jq -er \
@@ -999,6 +1001,22 @@ inspect_init_volume_absence() {
   if (( invalid_record_count > 0 )); then
     die "cannot inspect APFS volumes for init: vault volume record missing UUID or device"
   fi
+  printf '%s' "$apfs_json" | jq -e \
+    'all(.Containers[].Volumes[];
+      ((has("Name") | not)
+        or ((.Name | type) == "string" and (.Name | length) > 0))
+      and ((has("VolumeName") | not)
+        or ((.VolumeName | type) == "string" and (.VolumeName | length) > 0))
+      and (has("Name") or has("VolumeName"))
+      and ((.VolumeUUID | type) == "string"
+        and (.VolumeUUID | length) > 0)
+      and ((.DeviceIdentifier | type) == "string"
+        and (.DeviceIdentifier
+          | test("^disk[1-9][0-9]*s[1-9][0-9]*$")))
+      and ((has("MountPoint") | not)
+        or (.MountPoint | type) == "string"))' \
+    >/dev/null 2>&1 \
+    || die "cannot inspect APFS volumes for init: invalid APFS list schema"
   conflict_count=$(printf '%s' "$apfs_json" | jq -er \
       --arg volume "$VOLUME" --arg mount "$MOUNT_POINT" \
       '[.Containers[].Volumes[] | select(
@@ -1098,21 +1116,26 @@ require_init_state_dir_identity() {
     || die "state directory identity changed during init"
 }
 
-verify_installed_init_recovery() { # phase
-  local phase=$1 actual_identity final_identity actual_content
-  require_init_state_dir_identity
-  [[ -f "$INIT_RECOVERY_PATH" && ! -L "$INIT_RECOVERY_PATH" ]] \
-    || die "installed recovery material changed before $phase"
-  actual_identity=$(path_identity "$INIT_RECOVERY_PATH") \
-    || die "installed recovery material changed before $phase"
+installed_init_recovery_is_valid() {
+  local state_dir_identity actual_identity final_identity actual_content
+  state_dir_identity=$(path_identity "$STATE_DIR") || return 1
+  [[ "$state_dir_identity" == "$INIT_STATE_DIR_IDENTITY" \
+      && -d "$STATE_DIR" && ! -L "$STATE_DIR" \
+      && -f "$INIT_RECOVERY_PATH" && ! -L "$INIT_RECOVERY_PATH" ]] \
+    || return 1
+  actual_identity=$(path_identity "$INIT_RECOVERY_PATH") || return 1
   actual_content=$(cat -- "$INIT_RECOVERY_PATH" && printf '\034') \
-    || die "installed recovery material changed before $phase"
-  final_identity=$(path_identity "$INIT_RECOVERY_PATH") \
-    || die "installed recovery material changed before $phase"
+    || return 1
+  final_identity=$(path_identity "$INIT_RECOVERY_PATH") || return 1
   [[ -n "$INIT_RECOVERY_IDENTITY" \
       && "$actual_identity" == "$INIT_RECOVERY_IDENTITY" \
       && "$final_identity" == "$INIT_RECOVERY_IDENTITY" \
-      && "$actual_content" == "$INIT_PASSPHRASE"$'\034' ]] \
+      && "$actual_content" == "$INIT_PASSPHRASE"$'\034' ]]
+}
+
+verify_installed_init_recovery() { # phase
+  local phase=$1
+  installed_init_recovery_is_valid \
     || die "installed recovery material changed before $phase"
 }
 
@@ -1164,13 +1187,17 @@ created_device_from_add_output() { # output
   while IFS= read -r line; do
     if [[ "$line" == "$completion_prefix"* ]]; then
       candidate=${line#"$completion_prefix"}
-      [[ "$candidate" =~ ^disk[[:alnum:]]+$ && -z "$device" ]] \
+      valid_apfs_volume_device "$candidate" && [[ -z "$device" ]] \
         || return 1
       device=$candidate
     fi
   done <<< "$output"
   [[ -n "$device" ]] || return 1
   printf '%s\n' "$device"
+}
+
+valid_apfs_volume_device() { # device
+  [[ "$1" =~ ^disk[123456789][0123456789]*s[123456789][0123456789]*$ ]]
 }
 
 read_created_apfs_identity() { # device
@@ -1186,7 +1213,8 @@ read_created_apfs_identity() { # device
   device=$(printf '%s' "$plist" \
     | plutil -extract DeviceIdentifier raw -expect string -o - - 2>/dev/null) \
     || return 1
-  [[ -n "$name" && -n "$uuid" && "$device" =~ ^disk[[:alnum:]]+$ ]] \
+  [[ -n "$name" && -n "$uuid" ]] \
+    && valid_apfs_volume_device "$device" \
     || return 1
   printf '%s\t%s\t%s\n' "$name" "$uuid" "$device"
 }
@@ -1231,14 +1259,16 @@ read_apfs_identity() { # target
   mount_point=$(printf '%s' "$plist" \
     | plutil -extract MountPoint raw -expect string -o - - 2>/dev/null) \
     || return 1
-  [[ -n "$uuid" && "$device" =~ ^disk[[:alnum:]]+$ \
-      && "$locked" == "false" && "$mount_point" == "$MOUNT_POINT" ]] \
+  [[ -n "$uuid" && "$locked" == "false" \
+      && "$mount_point" == "$MOUNT_POINT" ]] \
+    && valid_apfs_volume_device "$device" \
     || return 1
   printf '%s\t%s\n' "$uuid" "$device"
 }
 
 execute_init_write_state() {
   local identity uuid device temporary_state temporary_identity installed_identity
+  verify_installed_init_recovery "state creation"
   identity=$(read_apfs_identity "$MOUNT_POINT") \
     || die "cannot discover final APFS identity, protected recovery material remains at $STATE_DIR/passphrase.txt"
   IFS=$'\t' read -r uuid device <<< "$identity"
@@ -1277,26 +1307,71 @@ execute_init_write_state() {
 
 remove_owned_init_state() {
   local actual_identity final_identity
-  require_init_state_dir_identity
+  local actual_state_dir_identity
+  if [[ ! -e "$state_file" && ! -L "$state_file" ]]; then
+    return 0
+  fi
+  actual_state_dir_identity=$(path_identity "$STATE_DIR") || return 2
+  [[ "$actual_state_dir_identity" == "$INIT_STATE_DIR_IDENTITY" \
+      && -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
+    || return 2
   [[ -f "$state_file" && ! -L "$state_file" \
       && -n "$INIT_STATE_IDENTITY" ]] \
-    || die "created vault failed verification and installed state is not safely removable"
+    || return 2
   actual_identity=$(path_identity "$state_file") \
-    || die "created vault failed verification and installed state identity is unavailable"
+    || return 2
   [[ "$actual_identity" == "$INIT_STATE_IDENTITY" ]] \
-    || die "created vault failed verification and installed state identity changed"
+    || return 2
   final_identity=$(path_identity "$state_file") \
-    || die "created vault failed verification and installed state identity is unavailable"
+    || return 2
   [[ "$final_identity" == "$INIT_STATE_IDENTITY" ]] \
-    || die "created vault failed verification and installed state identity changed"
-  rm -f -- "$state_file" \
-    || die "created vault failed verification and installed state cannot be removed"
+    || return 2
+  if ! rm -f -- "$state_file"; then
+    [[ ! -e "$state_file" && ! -L "$state_file" ]] && return 0
+    return 3
+  fi
   [[ ! -e "$state_file" && ! -L "$state_file" ]] \
-    || die "created vault failed verification and installed state remains"
+    || return 3
+}
+
+die_after_init_state_cleanup() { # primary_error
+  local primary_error=$1 cleanup_status
+  if remove_owned_init_state; then
+    die "$primary_error"
+  else
+    cleanup_status=$?
+  fi
+  case "$cleanup_status" in
+    2)
+      die "$primary_error; installed state retained because ownership could not be proven"
+      ;;
+    3)
+      die "$primary_error; installed state removal failed after ownership was proven"
+      ;;
+    *)
+      die "$primary_error; installed state cleanup failed unexpectedly"
+      ;;
+  esac
+}
+
+init_state_identity_is_current() {
+  local actual_identity
+  [[ -f "$state_file" && ! -L "$state_file" \
+      && -n "$INIT_STATE_IDENTITY" ]] \
+    || return 1
+  actual_identity=$(path_identity "$state_file") || return 1
+  [[ "$actual_identity" == "$INIT_STATE_IDENTITY" ]]
 }
 
 verify_init_target() {
-  verify_installed_init_recovery "final verification"
+  if ! installed_init_recovery_is_valid; then
+    die_after_init_state_cleanup \
+      "installed recovery material changed before final verification"
+  fi
+  if ! init_state_identity_is_current; then
+    die_after_init_state_cleanup \
+      "installed state identity changed before final verification"
+  fi
   inspect_runtime_state
   classify_runtime_state
   if [[ "$RUNTIME_ASSESSMENT" == "usable" \
@@ -1304,11 +1379,13 @@ verify_init_target() {
       && "$SNAPSHOT_ACTUAL_UUID" == "$INIT_CREATED_UUID" \
       && "$SNAPSHOT_DEVICE" == "$INIT_CREATED_DEVICE" \
       && "$PLAN_CONTEXT_UUID" == "$INIT_CREATED_UUID" \
-      && "$PLAN_CONTEXT_DEVICE" == "$INIT_CREATED_DEVICE" ]]; then
+      && "$PLAN_CONTEXT_DEVICE" == "$INIT_CREATED_DEVICE" ]] \
+      && installed_init_recovery_is_valid \
+      && init_state_identity_is_current; then
     return 0
   fi
-  remove_owned_init_state
-  die "created vault failed usable-target verification"
+  die_after_init_state_cleanup \
+    "created vault failed usable-target verification"
 }
 
 path_has_control_character() {
