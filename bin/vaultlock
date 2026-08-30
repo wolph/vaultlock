@@ -27,11 +27,31 @@ BSD_FIND=/usr/bin/find
 BSD_LS=/bin/ls
 BSD_STAT=/usr/bin/stat
 DITTO_COMMAND=/usr/bin/ditto
+PS_COMMAND=/bin/ps
+OPENSSL_COMMAND=/usr/bin/openssl
+MKDIR_COMMAND=/bin/mkdir
+MKTEMP_COMMAND=/usr/bin/mktemp
+LN_COMMAND=/bin/ln
+MV_COMMAND=/bin/mv
+RM_COMMAND=/bin/rm
+RMDIR_COMMAND=/bin/rmdir
+CHMOD_COMMAND=/bin/chmod
+TRANSITION_COMMAND=""
 if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]]; then
   BSD_FIND=${VAULTLOCK_TEST_BSD_FIND:-$BSD_FIND}
   BSD_LS=${VAULTLOCK_TEST_BSD_LS:-$BSD_LS}
   BSD_STAT=${VAULTLOCK_TEST_BSD_STAT:-$BSD_STAT}
   DITTO_COMMAND=${VAULTLOCK_TEST_DITTO:-$DITTO_COMMAND}
+  PS_COMMAND=${VAULTLOCK_TEST_PS:-$PS_COMMAND}
+  OPENSSL_COMMAND=${VAULTLOCK_TEST_OPENSSL:-$OPENSSL_COMMAND}
+  MKDIR_COMMAND=${VAULTLOCK_TEST_MKDIR:-$MKDIR_COMMAND}
+  MKTEMP_COMMAND=${VAULTLOCK_TEST_MKTEMP:-$MKTEMP_COMMAND}
+  LN_COMMAND=${VAULTLOCK_TEST_LN:-$LN_COMMAND}
+  MV_COMMAND=${VAULTLOCK_TEST_MV:-$MV_COMMAND}
+  RM_COMMAND=${VAULTLOCK_TEST_RM:-$RM_COMMAND}
+  RMDIR_COMMAND=${VAULTLOCK_TEST_RMDIR:-$RMDIR_COMMAND}
+  CHMOD_COMMAND=${VAULTLOCK_TEST_CHMOD:-$CHMOD_COMMAND}
+  TRANSITION_COMMAND=${VAULTLOCK_TEST_TRANSITION:-}
 fi
 CONFIRM_DEVICE=${VAULTLOCK_CONFIRM_DEVICE:-/dev/tty}
 KEYCHAIN_SERVICE="vaultlock-$VOLUME"
@@ -55,6 +75,26 @@ PLAN_CONTEXT_DEADLINE_EPOCH=""
 PLAN_CONTEXT_ROUND=""
 PLAN_TARGET_TEXT=""
 PLAN_REQUEST_TEXT=""
+FROZEN_PLAN_FIELD_NAMES=()
+FROZEN_PLAN_FIELD_VALUES=()
+CANDIDATE_PLAN_FIELD_NAMES=()
+CANDIDATE_PLAN_FIELD_VALUES=()
+
+OPERATION_LOCK_DIR=$HOME/.vaultlock-operation.lock
+OPERATION_LOCK_COMMAND=""
+OPERATION_LOCK_TOKEN=""
+OPERATION_LOCK_DIR_IDENTITY=""
+OPERATION_LOCK_OWNER_IDENTITY=""
+OPERATION_LOCK_OWNER_DIGEST=""
+OPERATION_LOCK_ACTIVE=false
+OPERATION_LOCK_TEMP=""
+INSPECTED_LOCK_DIR_IDENTITY=""
+INSPECTED_LOCK_OWNER_IDENTITY=""
+INSPECTED_LOCK_OWNER_DIGEST=""
+INSPECTED_LOCK_PID=""
+INSPECTED_LOCK_START=""
+INSPECTED_LOCK_COMMAND=""
+INSPECTED_LOCK_TOKEN=""
 
 INIT_PASSPHRASE=""
 INIT_RECOVERY_PATH=""
@@ -629,6 +669,527 @@ render_runtime_summary() {
   fi
 }
 
+run_named_transition() { # transition subject
+  [[ -z "$TRANSITION_COMMAND" ]] \
+    || "$TRANSITION_COMMAND" "$1" "$2"
+}
+
+operation_owner_digest() { # path
+  local output
+  output=$(/usr/bin/shasum -a 256 -- "$1" 2>/dev/null) || return 1
+  [[ "$output" =~ ^([0-9a-f]{64})[[:space:]] ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+operation_path_identity() { # path
+  /usr/bin/stat -f '%d:%i' -- "$1" 2>/dev/null
+}
+
+inspect_operation_lock() {
+  local directory_metadata owner_metadata line1 line2 line3 line4 line5 extra
+  [[ -d "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" ]] \
+    || return 1
+  directory_metadata=$(
+    /usr/bin/stat -f '%d:%i:%Lp:%u' -- "$OPERATION_LOCK_DIR" 2>/dev/null
+  ) || return 1
+  IFS=: read -r directory_device directory_inode directory_mode directory_uid \
+    <<< "$directory_metadata"
+  [[ "$directory_mode" == "700" && "$directory_uid" == "$UID" ]] \
+    || return 1
+  [[ -f "$OPERATION_LOCK_DIR/owner" \
+    && ! -L "$OPERATION_LOCK_DIR/owner" ]] || return 1
+  owner_metadata=$(
+    /usr/bin/stat -f '%d:%i:%Lp:%u:%l' -- "$OPERATION_LOCK_DIR/owner" \
+      2>/dev/null
+  ) || return 1
+  IFS=: read -r owner_device owner_inode owner_mode owner_uid owner_nlink \
+    <<< "$owner_metadata"
+  [[ "$owner_mode" == "600" && "$owner_uid" == "$UID" \
+    && "$owner_nlink" == "1" ]] || return 1
+  {
+    IFS= read -r line1
+    IFS= read -r line2
+    IFS= read -r line3
+    IFS= read -r line4
+    IFS= read -r line5
+    ! IFS= read -r extra
+  } < "$OPERATION_LOCK_DIR/owner" || return 1
+  [[ "$line1" == "version=1" \
+    && "$line2" =~ ^pid=([1-9][0-9]*)$ \
+    && "$line3" == start=* \
+    && -n "${line3#start=}" \
+    && "$line4" =~ ^command=(init|adopt|lock|unlock)$ \
+    && "$line5" =~ ^token=([0-9a-f]{64})$ ]] || return 1
+  INSPECTED_LOCK_DIR_IDENTITY=$directory_device:$directory_inode
+  INSPECTED_LOCK_OWNER_IDENTITY=$owner_device:$owner_inode
+  INSPECTED_LOCK_OWNER_DIGEST=$(operation_owner_digest \
+    "$OPERATION_LOCK_DIR/owner") || return 1
+  INSPECTED_LOCK_PID=${line2#pid=}
+  INSPECTED_LOCK_START=${line3#start=}
+  INSPECTED_LOCK_COMMAND=${line4#command=}
+  INSPECTED_LOCK_TOKEN=${line5#token=}
+}
+
+revalidate_inspected_operation_lock() {
+  local expected_directory=$INSPECTED_LOCK_DIR_IDENTITY
+  local expected_owner=$INSPECTED_LOCK_OWNER_IDENTITY
+  local expected_digest=$INSPECTED_LOCK_OWNER_DIGEST
+  local expected_token=$INSPECTED_LOCK_TOKEN
+  inspect_operation_lock \
+    && [[ "$INSPECTED_LOCK_DIR_IDENTITY" == "$expected_directory" \
+      && "$INSPECTED_LOCK_OWNER_IDENTITY" == "$expected_owner" \
+      && "$INSPECTED_LOCK_OWNER_DIGEST" == "$expected_digest" \
+      && "$INSPECTED_LOCK_TOKEN" == "$expected_token" ]]
+}
+
+probe_process_start() { # pid
+  local output status
+  if output=$(LC_ALL=C "$PS_COMMAND" -p "$1" -o lstart= 2>/dev/null); then
+    status=0
+  else
+    status=$?
+  fi
+  output=${output#"${output%%[![:space:]]*}"}
+  output=${output%"${output##*[![:space:]]}"}
+  if [[ "$status" -eq 1 && -z "$output" ]]; then
+    PROCESS_PROBE_KIND=absent
+    PROCESS_PROBE_START=""
+    return 0
+  fi
+  if [[ "$status" -eq 0 && "$output" != *$'\n'* \
+    && "$output" =~ ^[A-Z][a-z]{2}[[:space:]]+[A-Z][a-z]{2}[[:space:]]+[0-9]{1,2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+[0-9]{4}$ ]]; then
+    PROCESS_PROBE_KIND=present
+    PROCESS_PROBE_START=$output
+    return 0
+  fi
+  PROCESS_PROBE_KIND=ambiguous
+  PROCESS_PROBE_START=""
+}
+
+classify_inspected_operation_lock() {
+  local first_kind first_start second_kind second_start
+  probe_process_start "$INSPECTED_LOCK_PID"
+  first_kind=$PROCESS_PROBE_KIND
+  first_start=$PROCESS_PROBE_START
+  probe_process_start "$INSPECTED_LOCK_PID"
+  second_kind=$PROCESS_PROBE_KIND
+  second_start=$PROCESS_PROBE_START
+  if [[ "$first_kind" == absent && "$second_kind" == absent ]]; then
+    OPERATION_LOCK_CLASSIFICATION=stale
+    return 0
+  fi
+  if [[ "$first_kind" == present && "$second_kind" == present \
+    && "$first_start" == "$second_start" ]]; then
+    if [[ "$first_start" == "$INSPECTED_LOCK_START" ]]; then
+      OPERATION_LOCK_CLASSIFICATION=live
+    else
+      OPERATION_LOCK_CLASSIFICATION=stale
+    fi
+    return 0
+  fi
+  OPERATION_LOCK_CLASSIFICATION=ambiguous
+}
+
+generate_operation_token() {
+  local token
+  token=$("$OPENSSL_COMMAND" rand -hex 32 2>/dev/null) || return 1
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$token"
+}
+
+release_owned_operation_lock() {
+  local directory_identity owner_identity owner_digest
+  [[ "$OPERATION_LOCK_ACTIVE" == true ]] || return 0
+  [[ -d "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" \
+    && -f "$OPERATION_LOCK_DIR/owner" \
+    && ! -L "$OPERATION_LOCK_DIR/owner" ]] || return 1
+  directory_identity=$(operation_path_identity "$OPERATION_LOCK_DIR") \
+    || return 1
+  owner_identity=$(operation_path_identity "$OPERATION_LOCK_DIR/owner") \
+    || return 1
+  owner_digest=$(operation_owner_digest "$OPERATION_LOCK_DIR/owner") \
+    || return 1
+  [[ "$directory_identity" == "$OPERATION_LOCK_DIR_IDENTITY" \
+    && "$owner_identity" == "$OPERATION_LOCK_OWNER_IDENTITY" \
+    && "$owner_digest" == "$OPERATION_LOCK_OWNER_DIGEST" ]] || return 1
+  inspect_operation_lock || return 1
+  [[ "$INSPECTED_LOCK_TOKEN" == "$OPERATION_LOCK_TOKEN" \
+    && "$INSPECTED_LOCK_COMMAND" == "$OPERATION_LOCK_COMMAND" ]] \
+    || return 1
+  "$RM_COMMAND" -f -- "$OPERATION_LOCK_DIR/owner" || return 1
+  "$RMDIR_COMMAND" -- "$OPERATION_LOCK_DIR" || return 1
+  OPERATION_LOCK_ACTIVE=false
+}
+
+operation_cleanup_dispatcher() { # signal
+  local signal=$1 status=$? release_failed=false
+  trap - EXIT HUP INT TERM
+  if [[ "$OPERATION_LOCK_ACTIVE" == true ]]; then
+    if ! release_owned_operation_lock; then
+      release_failed=true
+      printf 'vaultlock: operation lock retained: %s\n' \
+        "$OPERATION_LOCK_DIR" >&2
+    fi
+  fi
+  case "$signal" in
+    HUP) status=129 ;;
+    INT) status=130 ;;
+    TERM) status=143 ;;
+    EXIT) ;;
+  esac
+  [[ "$status" -ne 0 || "$release_failed" == false ]] || status=1
+  exit "$status"
+}
+
+install_operation_cleanup_traps() {
+  trap 'operation_cleanup_dispatcher EXIT' EXIT
+  trap 'operation_cleanup_dispatcher HUP' HUP
+  trap 'operation_cleanup_dispatcher INT' INT
+  trap 'operation_cleanup_dispatcher TERM' TERM
+}
+
+create_owned_operation_lock() {
+  local start temporary
+  probe_process_start "$$"
+  [[ "$PROCESS_PROBE_KIND" == present ]] \
+    || die "cannot inspect current process for operation lock"
+  start=$PROCESS_PROBE_START
+  temporary=$("$MKTEMP_COMMAND" "$HOME/.vaultlock-operation.owner.XXXXXX") \
+    || die "cannot create operation lock owner staging file"
+  OPERATION_LOCK_TEMP=$temporary
+  "$CHMOD_COMMAND" 600 "$temporary" \
+    || die "cannot protect operation lock owner staging file"
+  printf 'version=1\npid=%s\nstart=%s\ncommand=%s\ntoken=%s\n' \
+    "$$" "$start" "$OPERATION_LOCK_COMMAND" "$OPERATION_LOCK_TOKEN" \
+    > "$temporary"
+  "$LN_COMMAND" -- "$temporary" "$OPERATION_LOCK_DIR/owner" \
+    || die "cannot install operation lock owner record"
+  "$RM_COMMAND" -f -- "$temporary" \
+    || die "cannot remove operation lock owner staging file"
+  OPERATION_LOCK_TEMP=""
+  inspect_operation_lock || die "cannot verify operation lock owner record"
+  [[ "$INSPECTED_LOCK_PID" == "$$" \
+    && "$INSPECTED_LOCK_START" == "$start" \
+    && "$INSPECTED_LOCK_COMMAND" == "$OPERATION_LOCK_COMMAND" \
+    && "$INSPECTED_LOCK_TOKEN" == "$OPERATION_LOCK_TOKEN" ]] \
+    || die "operation lock owner verification failed"
+  OPERATION_LOCK_DIR_IDENTITY=$INSPECTED_LOCK_DIR_IDENTITY
+  OPERATION_LOCK_OWNER_IDENTITY=$INSPECTED_LOCK_OWNER_IDENTITY
+  OPERATION_LOCK_OWNER_DIGEST=$INSPECTED_LOCK_OWNER_DIGEST
+  OPERATION_LOCK_ACTIVE=true
+}
+
+quarantine_inspected_stale_operation_lock() {
+  local suffix quarantine quarantine_identity expected_identity
+  expected_identity=$INSPECTED_LOCK_DIR_IDENTITY
+  run_named_transition operation_lock_final_check \
+    "$OPERATION_LOCK_DIR/owner"
+  revalidate_inspected_operation_lock \
+    || die "operation lock changed during final verification"
+  suffix=$(generate_operation_token) \
+    || die "cannot generate stale operation lock quarantine suffix"
+  if [[ "$suffix" == "$OPERATION_LOCK_TOKEN" ]]; then
+    suffix=$(generate_operation_token) \
+      || die "cannot generate distinct stale operation lock quarantine suffix"
+  fi
+  [[ "$suffix" != "$OPERATION_LOCK_TOKEN" ]] \
+    || die "stale operation lock quarantine suffix is not distinct"
+  quarantine=$OPERATION_LOCK_DIR.quarantine.$suffix
+  [[ ! -e "$quarantine" && ! -L "$quarantine" ]] \
+    || die "stale operation lock quarantine path already exists"
+  "$MV_COMMAND" -n -- "$OPERATION_LOCK_DIR" "$quarantine" \
+    || die "cannot quarantine verified stale operation lock"
+  [[ ! -e "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" ]] \
+    || die "stale operation lock source remains after quarantine"
+  quarantine_identity=$(operation_path_identity "$quarantine") || \
+    die "cannot verify stale operation lock quarantine"
+  [[ "$quarantine_identity" == "$expected_identity" ]] \
+    || die "stale operation lock quarantine identity changed"
+  note "Retained stale operation lock quarantine: $quarantine"
+}
+
+acquire_operation_lock() { # command
+  local attempt
+  OPERATION_LOCK_COMMAND=$1
+  install_operation_cleanup_traps
+  OPERATION_LOCK_TOKEN=$(generate_operation_token) \
+    || die "cannot generate operation lock token"
+  for attempt in 1 2; do
+    if "$MKDIR_COMMAND" -m 700 -- "$OPERATION_LOCK_DIR" 2>/dev/null; then
+      create_owned_operation_lock
+      return 0
+    fi
+    [[ "$attempt" -eq 1 ]] \
+      || die "cannot acquire cooperative operation lock at $OPERATION_LOCK_DIR"
+    inspect_operation_lock || die "malformed operation lock owner"
+    classify_inspected_operation_lock
+    case "$OPERATION_LOCK_CLASSIFICATION" in
+      live)
+        die "operation lock is held by live pid $INSPECTED_LOCK_PID command $INSPECTED_LOCK_COMMAND"
+        ;;
+      stale) quarantine_inspected_stale_operation_lock ;;
+      ambiguous) die "cannot safely classify operation lock owner" ;;
+    esac
+  done
+}
+
+finish_operation_lock() {
+  trap - EXIT HUP INT TERM
+  if ! release_owned_operation_lock; then
+    printf 'vaultlock: operation lock retained: %s\n' \
+      "$OPERATION_LOCK_DIR" >&2
+    return 1
+  fi
+}
+
+plan_add_coordination_start() {
+  plan_add operation_lock_acquire \
+    "Acquire cooperative operation lock at $OPERATION_LOCK_DIR"
+  plan_add operation_lock_quarantine \
+    "Conditionally quarantine a verified stale operation lock"
+}
+
+plan_add_coordination_finish() {
+  plan_add operation_lock_release "Release cooperative operation lock"
+}
+
+append_frozen_plan_field() { # name value
+  FROZEN_PLAN_FIELD_NAMES+=("$1")
+  FROZEN_PLAN_FIELD_VALUES+=("$2")
+}
+
+append_candidate_plan_field() { # name value
+  CANDIDATE_PLAN_FIELD_NAMES+=("$1")
+  CANDIDATE_PLAN_FIELD_VALUES+=("$2")
+}
+
+capture_common_frozen_plan_fields() { # command
+  local index argument_index locked
+  append_frozen_plan_field schema 1
+  append_frozen_plan_field command "$1"
+  append_frozen_plan_field option_dry_run "$OPTION_DRY_RUN"
+  append_frozen_plan_field option_yes "$OPTION_YES"
+  append_frozen_plan_field option_hooks "$OPTION_HOOKS"
+  append_frozen_plan_field operands "$OPTION_OPERANDS"
+  append_frozen_plan_field volume "$VOLUME"
+  append_frozen_plan_field mount_point "$MOUNT_POINT"
+  append_frozen_plan_field state_dir "$STATE_DIR"
+  append_frozen_plan_field context_uuid "$PLAN_CONTEXT_UUID"
+  append_frozen_plan_field context_device "$PLAN_CONTEXT_DEVICE"
+  append_frozen_plan_field context_deadline "$PLAN_CONTEXT_DEADLINE"
+  append_frozen_plan_field context_deadline_epoch "$PLAN_CONTEXT_DEADLINE_EPOCH"
+  append_frozen_plan_field context_round "$PLAN_CONTEXT_ROUND"
+  append_frozen_plan_field snapshot_state_valid "${SNAPSHOT_STATE_VALID:-}"
+  append_frozen_plan_field snapshot_init_absent "$SNAPSHOT_INIT_ABSENT"
+  append_frozen_plan_field snapshot_recorded_locked \
+    "${SNAPSHOT_RECORDED_LOCKED:-}"
+  append_frozen_plan_field snapshot_expected_uuid \
+    "${SNAPSHOT_EXPECTED_UUID:-}"
+  append_frozen_plan_field snapshot_apfs_valid "${SNAPSHOT_APFS_VALID:-}"
+  append_frozen_plan_field snapshot_apfs_locked "${SNAPSHOT_APFS_LOCKED:-}"
+  append_frozen_plan_field snapshot_actual_uuid "${SNAPSHOT_ACTUAL_UUID:-}"
+  append_frozen_plan_field snapshot_device "${SNAPSHOT_DEVICE:-}"
+  append_frozen_plan_field snapshot_mount "${SNAPSHOT_ACTUAL_MOUNT_POINT:-}"
+  append_frozen_plan_field snapshot_plaintext "${SNAPSHOT_PLAINTEXT_PRESENT:-}"
+  append_frozen_plan_field snapshot_ciphertext "${SNAPSHOT_CIPHERTEXT_PRESENT:-}"
+  append_frozen_plan_field snapshot_hash "${SNAPSHOT_HASH_PRESENT:-}"
+  append_frozen_plan_field assessment "${RUNTIME_ASSESSMENT:-}"
+  for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
+    append_frozen_plan_field "operation_id_$index" \
+      "${PLAN_OPERATION_IDS[$index]}"
+    append_frozen_plan_field "hook_path_$index" "${PLAN_HOOK_PATHS[$index]}"
+    append_frozen_plan_field "hook_phase_$index" "${PLAN_HOOK_PHASES[$index]}"
+    append_frozen_plan_field "hook_scope_$index" "${PLAN_HOOK_SCOPES[$index]}"
+    append_frozen_plan_field "hook_directory_$index" \
+      "${PLAN_HOOK_DIRECTORIES[$index]}"
+    if [[ "${PLAN_OPERATION_IDS[$index]}" == hook ]]; then
+      locked=$(hook_locked_value "${PLAN_HOOK_PHASES[$index]}")
+      build_hook_argv "${PLAN_HOOK_PHASES[$index]}" \
+        "${PLAN_HOOK_SCOPES[$index]}" "$PLAN_CONTEXT_UUID" \
+        "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
+        "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
+      append_frozen_plan_field "hook_argv_count_$index" "${#HOOK_ARGV[@]}"
+      for ((argument_index=0; argument_index<${#HOOK_ARGV[@]}; \
+          argument_index++)); do
+        append_frozen_plan_field \
+          "hook_argv_${index}_$argument_index" \
+          "${HOOK_ARGV[$argument_index]}"
+      done
+    else
+      append_frozen_plan_field "hook_argv_count_$index" 0
+    fi
+  done
+}
+
+capture_common_candidate_plan_fields() { # command
+  local index argument_index locked
+  append_candidate_plan_field schema 1
+  append_candidate_plan_field command "$1"
+  append_candidate_plan_field option_dry_run "$OPTION_DRY_RUN"
+  append_candidate_plan_field option_yes "$OPTION_YES"
+  append_candidate_plan_field option_hooks "$OPTION_HOOKS"
+  append_candidate_plan_field operands "$OPTION_OPERANDS"
+  append_candidate_plan_field volume "$VOLUME"
+  append_candidate_plan_field mount_point "$MOUNT_POINT"
+  append_candidate_plan_field state_dir "$STATE_DIR"
+  append_candidate_plan_field context_uuid "$PLAN_CONTEXT_UUID"
+  append_candidate_plan_field context_device "$PLAN_CONTEXT_DEVICE"
+  append_candidate_plan_field context_deadline "$PLAN_CONTEXT_DEADLINE"
+  append_candidate_plan_field context_deadline_epoch "$PLAN_CONTEXT_DEADLINE_EPOCH"
+  append_candidate_plan_field context_round "$PLAN_CONTEXT_ROUND"
+  append_candidate_plan_field snapshot_state_valid "${SNAPSHOT_STATE_VALID:-}"
+  append_candidate_plan_field snapshot_init_absent "$SNAPSHOT_INIT_ABSENT"
+  append_candidate_plan_field snapshot_recorded_locked \
+    "${SNAPSHOT_RECORDED_LOCKED:-}"
+  append_candidate_plan_field snapshot_expected_uuid \
+    "${SNAPSHOT_EXPECTED_UUID:-}"
+  append_candidate_plan_field snapshot_apfs_valid "${SNAPSHOT_APFS_VALID:-}"
+  append_candidate_plan_field snapshot_apfs_locked "${SNAPSHOT_APFS_LOCKED:-}"
+  append_candidate_plan_field snapshot_actual_uuid "${SNAPSHOT_ACTUAL_UUID:-}"
+  append_candidate_plan_field snapshot_device "${SNAPSHOT_DEVICE:-}"
+  append_candidate_plan_field snapshot_mount "${SNAPSHOT_ACTUAL_MOUNT_POINT:-}"
+  append_candidate_plan_field snapshot_plaintext "${SNAPSHOT_PLAINTEXT_PRESENT:-}"
+  append_candidate_plan_field snapshot_ciphertext "${SNAPSHOT_CIPHERTEXT_PRESENT:-}"
+  append_candidate_plan_field snapshot_hash "${SNAPSHOT_HASH_PRESENT:-}"
+  append_candidate_plan_field assessment "${RUNTIME_ASSESSMENT:-}"
+  for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
+    append_candidate_plan_field "operation_id_$index" \
+      "${PLAN_OPERATION_IDS[$index]}"
+    append_candidate_plan_field "hook_path_$index" "${PLAN_HOOK_PATHS[$index]}"
+    append_candidate_plan_field "hook_phase_$index" "${PLAN_HOOK_PHASES[$index]}"
+    append_candidate_plan_field "hook_scope_$index" "${PLAN_HOOK_SCOPES[$index]}"
+    append_candidate_plan_field "hook_directory_$index" \
+      "${PLAN_HOOK_DIRECTORIES[$index]}"
+    if [[ "${PLAN_OPERATION_IDS[$index]}" == hook ]]; then
+      locked=$(hook_locked_value "${PLAN_HOOK_PHASES[$index]}")
+      build_hook_argv "${PLAN_HOOK_PHASES[$index]}" \
+        "${PLAN_HOOK_SCOPES[$index]}" "$PLAN_CONTEXT_UUID" \
+        "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
+        "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
+      append_candidate_plan_field "hook_argv_count_$index" \
+        "${#HOOK_ARGV[@]}"
+      for ((argument_index=0; argument_index<${#HOOK_ARGV[@]}; \
+          argument_index++)); do
+        append_candidate_plan_field \
+          "hook_argv_${index}_$argument_index" \
+          "${HOOK_ARGV[$argument_index]}"
+      done
+    else
+      append_candidate_plan_field "hook_argv_count_$index" 0
+    fi
+  done
+}
+
+freeze_planned_command_snapshot() { # command
+  local command=$1 state_dir_identity state_file_identity
+  FROZEN_PLAN_FIELD_NAMES=()
+  FROZEN_PLAN_FIELD_VALUES=()
+  capture_common_frozen_plan_fields "$command"
+  case "$command" in
+    init)
+      state_dir_identity=$(path_identity "$STATE_DIR") || \
+        die "cannot freeze state directory identity"
+      if [[ -e "$state_file" || -L "$state_file" ]]; then
+        state_file_identity=$(path_identity "$state_file") || \
+          die "cannot freeze state file identity"
+      else
+        state_file_identity=absent
+      fi
+      append_frozen_plan_field typed_operand_count 0
+      append_frozen_plan_field state_dir_identity "$state_dir_identity"
+      append_frozen_plan_field state_file_identity "$state_file_identity"
+      ;;
+    adopt)
+      append_frozen_plan_field typed_operand_count 1
+      append_frozen_plan_field typed_operand_0_name source
+      append_frozen_plan_field typed_operand_0_value "$ADOPT_SOURCE"
+      append_frozen_plan_field adopt_source_identity "$ADOPT_SOURCE_IDENTITY"
+      append_frozen_plan_field adopt_source_device "$ADOPT_SOURCE_DEVICE"
+      append_frozen_plan_field adopt_parent "$ADOPT_PARENT"
+      append_frozen_plan_field adopt_parent_identity "$ADOPT_PARENT_IDENTITY"
+      append_frozen_plan_field adopt_destination "$ADOPT_DESTINATION"
+      append_frozen_plan_field adopt_destination_identity \
+        "$ADOPT_DESTINATION_IDENTITY"
+      append_frozen_plan_field adopt_destination_device \
+        "$ADOPT_DESTINATION_DEVICE"
+      ;;
+  esac
+}
+
+capture_candidate_planned_command_snapshot() { # command
+  local command=$1 state_dir_identity state_file_identity
+  CANDIDATE_PLAN_FIELD_NAMES=()
+  CANDIDATE_PLAN_FIELD_VALUES=()
+  capture_common_candidate_plan_fields "$command"
+  case "$command" in
+    init)
+      state_dir_identity=$(path_identity "$STATE_DIR") || \
+        die "cannot capture candidate state directory identity"
+      if [[ -e "$state_file" || -L "$state_file" ]]; then
+        state_file_identity=$(path_identity "$state_file") || \
+          die "cannot capture candidate state file identity"
+      else
+        state_file_identity=absent
+      fi
+      append_candidate_plan_field typed_operand_count 0
+      append_candidate_plan_field state_dir_identity "$state_dir_identity"
+      append_candidate_plan_field state_file_identity "$state_file_identity"
+      ;;
+    adopt)
+      append_candidate_plan_field typed_operand_count 1
+      append_candidate_plan_field typed_operand_0_name source
+      append_candidate_plan_field typed_operand_0_value "$ADOPT_SOURCE"
+      append_candidate_plan_field adopt_source_identity "$ADOPT_SOURCE_IDENTITY"
+      append_candidate_plan_field adopt_source_device "$ADOPT_SOURCE_DEVICE"
+      append_candidate_plan_field adopt_parent "$ADOPT_PARENT"
+      append_candidate_plan_field adopt_parent_identity "$ADOPT_PARENT_IDENTITY"
+      append_candidate_plan_field adopt_destination "$ADOPT_DESTINATION"
+      append_candidate_plan_field adopt_destination_identity \
+        "$ADOPT_DESTINATION_IDENTITY"
+      append_candidate_plan_field adopt_destination_device \
+        "$ADOPT_DESTINATION_DEVICE"
+      ;;
+  esac
+}
+
+compare_frozen_candidate_plan_snapshots() {
+  local index
+  [[ "${#FROZEN_PLAN_FIELD_NAMES[@]}" \
+    -eq "${#CANDIDATE_PLAN_FIELD_NAMES[@]}" ]] || return 1
+  for ((index=0; index<${#FROZEN_PLAN_FIELD_NAMES[@]}; index++)); do
+    [[ "${FROZEN_PLAN_FIELD_NAMES[$index]}" \
+      == "${CANDIDATE_PLAN_FIELD_NAMES[$index]}" \
+      && "${FROZEN_PLAN_FIELD_VALUES[$index]}" \
+      == "${CANDIDATE_PLAN_FIELD_VALUES[$index]}" ]] || return 1
+  done
+}
+
+revalidate_plan_under_operation_lock() { # command
+  local command=$1
+  case "$command" in
+    init)
+      run_named_transition plan_revalidation_before_inspection "$state_file"
+      [[ ! -e "$state_file" && ! -L "$state_file" ]] \
+        || die "plan changed after operation lock acquisition: state already exists"
+      inspect_init_absent_state
+      ;;
+    adopt)
+      run_named_transition plan_revalidation_before_inspection "$ADOPT_SOURCE"
+      inspect_adopt_state
+      ;;
+  esac
+  plan_reset
+  plan_add_coordination_start
+  case "$command" in
+    init) build_init_plan ;;
+    adopt) build_adopt_plan ;;
+  esac
+  plan_add_coordination_finish
+  capture_candidate_planned_command_snapshot "$command"
+  compare_frozen_candidate_plan_snapshots \
+    || die "plan changed after operation lock acquisition"
+}
+
 plan_reset() {
   PLAN_OPERATION_IDS=()
   PLAN_OPERATION_TEXT=()
@@ -677,8 +1238,9 @@ tle_encrypt|tle_verify_future|persist_locked_recovery|remove_plaintext|\
 tm_delete_data_snapshots|apfs_lock|verify_locked_postconditions|tle_decrypt|\
 verify_decrypted_hash|apfs_unlock|persist_plaintext|persist_unlocked_state|\
 verify_secure_target|verify_unlocked_target|\
-init_prepare_state|init_create_volume|init_write_state|\
-adopt_copy|adopt_verify|adopt_replace_source)
+    init_prepare_state|init_create_volume|init_write_state|\
+    adopt_copy|adopt_verify|adopt_replace_source|\
+    operation_lock_acquire|operation_lock_quarantine|operation_lock_release)
       ;;
     *)
       die "unknown plan operation ID: $operation_id"
@@ -1147,6 +1709,7 @@ preflight_adopt_dependencies() {
   require_executable "$BSD_LS" "BSD ls"
   require_executable "$BSD_STAT" "BSD stat"
   require_executable /usr/bin/shasum shasum
+  require_executable /usr/bin/cmp cmp
   require_executable /usr/bin/sed sed
   require_executable /usr/bin/sort sort
   require_executable /usr/bin/tr tr
@@ -1492,11 +2055,19 @@ remove_owned_init_state() {
     || { INIT_STATE_CLEANUP_DETAIL="$state_file; unexpected entry retained at $quarantine_path"; return 3; }
   ensure_init_quarantine_private "$quarantine_dir" "$quarantine_identity" \
     || { INIT_STATE_CLEANUP_DETAIL="$state_file; quarantine directory retained at $quarantine_dir"; return 3; }
+  run_named_transition init_cleanup_before_state_quarantine_move "$state_file" \
+    || { INIT_STATE_CLEANUP_DETAIL=$state_file; return 3; }
   if ! mv -- "$state_file" "$quarantine_path"; then
     rmdir -- "$quarantine_dir" 2>/dev/null || true
     INIT_STATE_CLEANUP_DETAIL=$state_file
     return 3
   fi
+  run_named_transition init_cleanup_after_state_quarantine_move \
+    "$quarantine_path" || {
+    restore_quarantined_init_state \
+      "$quarantine_dir" "$quarantine_identity" "$quarantine_path"
+    return 2
+  }
   if ! ensure_init_quarantine_private \
       "$quarantine_dir" "$quarantine_identity"; then
     restore_quarantined_init_state \
@@ -1703,7 +2274,7 @@ empty_payload_digest() {
 }
 
 path_stat_signature() { # path
-  "$BSD_STAT" -f '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9Fc:%f:%r:%l' -- "$1" \
+  "$BSD_STAT" -f '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9FB:%f:%r:%l' -- "$1" \
     2>/dev/null
 }
 
@@ -1743,6 +2314,32 @@ path_xattr_listing() { # path
     | LC_ALL=C /usr/bin/sort
 }
 
+decode_ls_escaped_name() { # escaped name
+  local encoded=$1 decoded="" character escape octal
+  while [[ -n "$encoded" ]]; do
+    character=${encoded:0:1}
+    encoded=${encoded:1}
+    if [[ "$character" != \\ ]]; then
+      decoded=$decoded$character
+      continue
+    fi
+    [[ -n "$encoded" ]] || return 1
+    escape=${encoded:0:1}
+    if [[ "$escape" == \\ ]]; then
+      decoded=$decoded\\
+      encoded=${encoded:1}
+      continue
+    fi
+    [[ "${#encoded}" -ge 3 ]] || return 1
+    octal=${encoded:0:3}
+    [[ "$octal" =~ ^[0-7]{3}$ && "$octal" != "000" ]] || return 1
+    printf -v character '%b' "\\$octal"
+    decoded=$decoded$character
+    encoded=${encoded:3}
+  done
+  printf '%s' "$decoded"
+}
+
 path_xattr_manifest_stream() { # path
   local path=$1 before after line escaped_name size_field size name value
   before=$(path_xattr_listing "$path") || return 1
@@ -1754,7 +2351,7 @@ path_xattr_manifest_stream() { # path
     size_field=${line#*$'\t'}
     size=$(printf '%s' "$size_field" | /usr/bin/tr -d '[:space:]')
     [[ "$size" =~ ^[0-9]+$ ]] || return 1
-    printf -v name '%b' "$escaped_name"
+    name=$(decode_ls_escaped_name "$escaped_name") || return 1
     value=$(/usr/bin/xattr -psx -- "$name" "$path" 2>/dev/null \
       | /usr/bin/tr -d '[:space:]') || return 1
     [[ "$value" =~ ^[0-9A-Fa-f]*$ \
@@ -1779,50 +2376,81 @@ hex_string() { # string
 
 build_hardlink_map() { # root expected_device map
   local root=$1 expected_device=$2 map=$3 path metadata
-  local device inode mode uid gid size mtime ctime flags rdev nlink
-  local relative path_hex
-  : > "$map" || return 1
-  while IFS= read -r -d '' path; do
-    metadata=$(path_stat_signature "$path") || return 1
-    IFS=: read -r device inode mode uid gid size mtime ctime flags rdev nlink \
-      <<< "$metadata"
-    [[ "$device" == "$expected_device" ]] || return 1
-    if [[ "$path" == "$root" ]]; then
-      relative=.
-    elif [[ "$path" == "$root/"* ]]; then
-      relative=${path#"$root/"}
-    else
-      return 1
-    fi
-    path_hex=$(hex_string "$relative") || return 1
-    printf '%s:%s\t%s\t%s\n' "$device" "$inode" "$path_hex" "$nlink" \
-      >> "$map" || return 1
-  done < <(LC_ALL=C "$BSD_FIND" -P -s -x "$root" -type f -print0)
-}
-
-hardlink_anchor_from_map() { # map identity nlink
-  local map=$1 wanted_identity=$2 expected_nlink=$3
-  local identity path_hex nlink anchor="" count=0
+  local device inode mode uid gid size mtime birthtime flags rdev nlink
+  local relative path_hex raw sorted grouped identity current_identity=""
+  local current_nlink="" anchor group_count=0 group_paths=() group_path
+  raw=$map.raw
+  sorted=$map.sorted
+  grouped=$map.grouped
+  : > "$raw" || return 1
+  if ! LC_ALL=C "$BSD_FIND" -P -s -x "$root" -type f -print0 \
+      | while IFS= read -r -d '' path; do
+        metadata=$(path_stat_signature "$path") || return 1
+        IFS=: read -r device inode mode uid gid size mtime birthtime flags \
+          rdev nlink <<< "$metadata"
+        [[ "$device" == "$expected_device" ]] || return 1
+        if [[ "$path" == "$root" ]]; then
+          relative=.
+        elif [[ "$path" == "$root/"* ]]; then
+          relative=${path#"$root/"}
+        else
+          return 1
+        fi
+        path_hex=$(hex_string "$relative") || return 1
+        printf '%s:%s\t%s\t%s\n' "$device" "$inode" "$path_hex" "$nlink" \
+          >> "$raw" || return 1
+      done; then
+    return 1
+  fi
+  LC_ALL=C /usr/bin/sort -t $'\t' -k1,1 -k2,2 "$raw" > "$sorted" \
+    || return 1
+  : > "$grouped" || return 1
   while IFS=$'\t' read -r identity path_hex nlink; do
-    [[ "$identity" == "$wanted_identity" ]] || continue
-    [[ "$nlink" == "$expected_nlink" ]] || return 1
-    count=$((count + 1))
-    if [[ -z "$anchor" || "$path_hex" < "$anchor" ]]; then
-      anchor=$path_hex
+    if [[ -n "$current_identity" && "$identity" != "$current_identity" ]]; then
+      [[ "$group_count" -eq "$current_nlink" ]] || return 1
+      anchor=${group_paths[0]}
+      for group_path in "${group_paths[@]}"; do
+        printf '%s\t%s\n' "$group_path" "$anchor" >> "$grouped" \
+          || return 1
+      done
+      group_paths=()
+      group_count=0
+      current_nlink=""
     fi
-  done < "$map"
-  [[ "$count" == "$expected_nlink" ]] || return 1
-  printf '%s\n' "$anchor"
+    current_identity=$identity
+    [[ -z "$current_nlink" || "$nlink" == "$current_nlink" ]] \
+      || return 1
+    current_nlink=$nlink
+    group_paths+=("$path_hex")
+    group_count=$((group_count + 1))
+  done < "$sorted"
+  if [[ -n "$current_identity" ]]; then
+    [[ "$group_count" -eq "$current_nlink" ]] || return 1
+    anchor=${group_paths[0]}
+    for group_path in "${group_paths[@]}"; do
+      printf '%s\t%s\n' "$group_path" "$anchor" >> "$grouped" \
+        || return 1
+    done
+  fi
+  LC_ALL=C /usr/bin/sort -t $'\t' -k1,1 "$grouped" > "$map" \
+    || return 1
+  /bin/rm -f -- "$raw" "$sorted" "$grouped"
 }
 
 tree_manifest_stream_with_map() { # root expected_device hardlink_map
   local root=$1 expected_device=$2 hardlink_map=$3 path relative type
-  local metadata device inode mode uid gid size mtime ctime flags rdev nlink
+  local metadata device inode mode uid gid size mtime birthtime flags rdev nlink
   local before after payload acl xattrs hardlink relative_hex
+  local map_path map_anchor map_present=false manifest_size manifest_rdev
   local LC_ALL=C
-  printf 'vaultlock-manifest-v2\0'
+  printf 'vaultlock-manifest-v3\0'
   LC_ALL=C "$BSD_FIND" -P -s -x "$root" -print0 \
-    | while IFS= read -r -d '' path; do
+    | (
+      exec 3< "$hardlink_map"
+      if IFS=$'\t' read -r map_path map_anchor <&3; then
+        map_present=true
+      fi
+      while IFS= read -r -d '' path; do
       if [[ "$path" == "$root" ]]; then
         relative=.
       elif [[ "$path" == "$root/"* ]]; then
@@ -1833,7 +2461,7 @@ tree_manifest_stream_with_map() { # root expected_device hardlink_map
       relative_hex=$(hex_string "$relative") || return 1
       before=$(path_stat_signature "$path") || return 1
       metadata=$before
-      IFS=: read -r device inode mode uid gid size mtime ctime flags rdev nlink \
+      IFS=: read -r device inode mode uid gid size mtime birthtime flags rdev nlink \
         <<< "$metadata"
       [[ "$device" == "$expected_device" ]] || return 1
       [[ "$flags" =~ ^[0-9]+$ ]] || return 1
@@ -1854,18 +2482,33 @@ tree_manifest_stream_with_map() { # root expected_device hardlink_map
       acl=$(path_acl_digest "$path") || return 1
       xattrs=$(path_xattr_digest "$path") || return 1
       if [[ "$type" == "f" ]]; then
-        hardlink=$(hardlink_anchor_from_map "$hardlink_map" \
-          "$device:$inode" "$nlink") || return 1
+        [[ "$map_present" == true && "$map_path" == "$relative_hex" ]] \
+          || return 1
+        hardlink=$map_anchor
+        if IFS=$'\t' read -r map_path map_anchor <&3; then
+          map_present=true
+        else
+          map_present=false
+        fi
       else
         hardlink=-
+      fi
+      manifest_size=$size
+      manifest_rdev=$rdev
+      if [[ "$type" == d ]]; then
+        manifest_size=0
+        manifest_rdev=0
       fi
       payload=$(path_payload_digest "$type" "$path") || return 1
       after=$(path_stat_signature "$path") || return 1
       [[ "$before" == "$after" ]] || return 1
-      printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
-        "$relative_hex" "$type" "$mode" "$size" "$rdev" "$uid" "$gid" \
-        "$mtime" "$flags" "$acl" "$xattrs" "$hardlink" "$payload"
-    done
+      printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
+        "$relative_hex" "$type" "$mode" "$manifest_size" "$manifest_rdev" \
+        "$uid" "$gid" "$mtime" "$birthtime" "$flags" "$acl" "$xattrs" \
+        "$hardlink" "$payload"
+      done
+      [[ "$map_present" == false ]]
+    )
 }
 
 tree_manifest_stream() { # root expected_device
@@ -1883,7 +2526,8 @@ tree_manifest_stream() { # root expected_device
   else
     status=1
   fi
-  /bin/rm -f "$hardlink_map" || return 1
+  /bin/rm -f "$hardlink_map" "$hardlink_map.raw" \
+    "$hardlink_map.sorted" "$hardlink_map.grouped" || return 1
   return "$status"
 }
 
@@ -1931,6 +2575,113 @@ assert_adopt_destination_manifest() { # failure message
   [[ "$digest" == "$ADOPT_DESTINATION_TREE_DIGEST" ]] || die "$1"
 }
 
+path_timestamp_kind() { # path
+  if [[ -L "$1" ]]; then
+    printf 'l\n'
+  elif [[ -d "$1" ]]; then
+    printf 'd\n'
+  elif [[ -f "$1" ]]; then
+    printf 'f\n'
+  else
+    return 1
+  fi
+}
+
+epoch_timestamp_to_utc_iso() { # seconds.nanoseconds
+  local timestamp=$1 seconds nanoseconds prefix
+  [[ "$timestamp" =~ ^([0-9]+)\.([0-9]{9})$ ]] || return 1
+  seconds=${BASH_REMATCH[1]}
+  nanoseconds=${BASH_REMATCH[2]}
+  prefix=$(/bin/date -u -r "$seconds" '+%Y-%m-%dT%H:%M:%S' \
+    2>/dev/null) || return 1
+  printf '%s.%sZ\n' "$prefix" "$nanoseconds"
+}
+
+epoch_timestamp_is_before() { # candidate boundary
+  local candidate=$1 boundary=$2 candidate_seconds candidate_nanoseconds
+  local boundary_seconds boundary_nanoseconds
+  [[ "$candidate" =~ ^([0-9]+)\.([0-9]{9})$ ]] || return 2
+  candidate_seconds=${BASH_REMATCH[1]}
+  candidate_nanoseconds=${BASH_REMATCH[2]}
+  [[ "$boundary" =~ ^([0-9]+)\.([0-9]{9})$ ]] || return 2
+  boundary_seconds=${BASH_REMATCH[1]}
+  boundary_nanoseconds=${BASH_REMATCH[2]}
+  if (( candidate_seconds < boundary_seconds )); then
+    return 0
+  fi
+  if (( candidate_seconds > boundary_seconds )); then
+    return 1
+  fi
+  (( 10#$candidate_nanoseconds < 10#$boundary_nanoseconds ))
+}
+
+restore_adopt_copy_birthtimes() {
+  local source_path relative destination_path source_identity
+  local destination_identity source_kind destination_kind source_times
+  local source_atime source_mtime source_birthtime destination_birthtime
+  local birth_iso atime_iso mtime_iso restored_source_times
+  local restored_destination_times comparison_status
+  LC_ALL=C "$BSD_FIND" -P -s -x "$ADOPT_SOURCE" -depth -print0 \
+    | while IFS= read -r -d '' source_path; do
+      if [[ "$source_path" == "$ADOPT_SOURCE" ]]; then
+        destination_path=$ADOPT_DESTINATION
+      elif [[ "$source_path" == "$ADOPT_SOURCE/"* ]]; then
+        relative=${source_path#"$ADOPT_SOURCE/"}
+        destination_path=$ADOPT_DESTINATION/$relative
+      else
+        return 1
+      fi
+      source_kind=$(path_timestamp_kind "$source_path") || return 1
+      destination_kind=$(path_timestamp_kind "$destination_path") || return 1
+      [[ "$destination_kind" == "$source_kind" ]] || return 1
+      source_identity=$(path_identity "$source_path") || return 1
+      destination_identity=$(path_identity "$destination_path") || return 1
+      source_times=$("$BSD_STAT" -f '%.9Fa:%.9Fm:%.9FB' -- \
+        "$source_path" 2>/dev/null) || return 1
+      IFS=: read -r source_atime source_mtime source_birthtime \
+        <<< "$source_times"
+      destination_birthtime=$("$BSD_STAT" -f '%.9FB' -- \
+        "$destination_path" 2>/dev/null) || return 1
+      if epoch_timestamp_is_before "$destination_birthtime" \
+          "$source_birthtime"; then
+        return 1
+      else
+        comparison_status=$?
+      fi
+      [[ "$comparison_status" -eq 1 ]] || return 1
+      birth_iso=$(epoch_timestamp_to_utc_iso "$source_birthtime") \
+        || return 1
+      if [[ "$source_kind" == l ]]; then
+        atime_iso=$(epoch_timestamp_to_utc_iso "$source_atime") || return 1
+        mtime_iso=$(epoch_timestamp_to_utc_iso "$source_mtime") || return 1
+        /usr/bin/touch -c -h -m -d "$birth_iso" "$destination_path" \
+          || return 1
+        /usr/bin/touch -c -h -a -d "$atime_iso" "$destination_path" \
+          || return 1
+        /usr/bin/touch -c -h -m -d "$mtime_iso" "$destination_path" \
+          || return 1
+      else
+        /usr/bin/touch -c -m -d "$birth_iso" "$destination_path" \
+          || return 1
+        /usr/bin/touch -c -r "$source_path" "$destination_path" \
+          || return 1
+      fi
+      [[ "$(path_timestamp_kind "$source_path")" == "$source_kind" \
+        && "$(path_timestamp_kind "$destination_path")" \
+          == "$destination_kind" \
+        && "$(path_identity "$source_path")" == "$source_identity" \
+        && "$(path_identity "$destination_path")" \
+          == "$destination_identity" ]] || return 1
+      restored_source_times=$("$BSD_STAT" -f '%.9Fa:%.9Fm:%.9FB' -- \
+        "$source_path" 2>/dev/null) || return 1
+      restored_destination_times=$("$BSD_STAT" \
+        -f '%.9Fa:%.9Fm:%.9FB' -- "$destination_path" 2>/dev/null) \
+        || return 1
+      [[ "$restored_source_times" == "$source_times" \
+        && "$restored_destination_times" == "$source_times" ]] || return 1
+    done
+}
+
 execute_adopt_copy() {
   assert_path_identity "$ADOPT_PARENT" "$ADOPT_PARENT_IDENTITY" \
     "source parent"
@@ -1948,6 +2699,11 @@ execute_adopt_copy() {
   /usr/bin/env -u DITTONORSRC "$DITTO_COMMAND" -X --rsrc --extattr --acl \
     --qtn --preserveHFSCompression "$ADOPT_SOURCE" "$ADOPT_DESTINATION" \
     || die "copy failed, source remains at $ADOPT_SOURCE and partial copy may remain at $ADOPT_DESTINATION"
+  run_named_transition adopt_copy_before_source_identity_check \
+    "$ADOPT_SOURCE"
+  assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
+  restore_adopt_copy_birthtimes \
+    || die "copy verification failed, source remains at $ADOPT_SOURCE and partial copy may remain at $ADOPT_DESTINATION"
 }
 
 execute_adopt_verify() {
@@ -1965,6 +2721,8 @@ execute_adopt_verify() {
   verify_adopt_mount_identity
   ADOPT_DESTINATION_IDENTITY=$(path_identity "$ADOPT_DESTINATION") \
     || die "cannot capture copied destination identity"
+  run_named_transition adopt_verify_before_destination_identity_check \
+    "$ADOPT_DESTINATION"
   assert_path_identity "$ADOPT_DESTINATION" "$ADOPT_DESTINATION_IDENTITY" \
     "destination"
   ADOPT_DESTINATION_DEVICE=$("$BSD_STAT" -f '%d' -- "$ADOPT_DESTINATION" \
@@ -2038,8 +2796,14 @@ describe_adopt_rollback_locations() {
     detail="${detail}unverified backup retained at $display_backup"
   fi
   if [[ -e "$ADOPT_STAGED_LINK" || -L "$ADOPT_STAGED_LINK" ]]; then
+    run_named_transition adopt_reporting_before_staged_classification \
+      "$ADOPT_STAGED_LINK" || return 1
     [[ -z "$detail" ]] || detail="$detail; "
-    detail="${detail}staged link retained at $display_staged_link"
+    if adopt_staged_link_owned_at "$ADOPT_STAGED_LINK"; then
+      detail="${detail}staged link retained at $display_staged_link"
+    else
+      detail="${detail}unverified staged path retained at $display_staged_link"
+    fi
   fi
   [[ -n "$detail" ]] \
     || detail="no adopt source or backup location could be verified"
@@ -2048,6 +2812,14 @@ describe_adopt_rollback_locations() {
 
 rollback_adopt_source() {
   local backup_identity backup_digest restored_identity restored_digest
+  run_named_transition adopt_rollback_before_source_link_move "$ADOPT_BACKUP" \
+    || return 1
+  [[ -d "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
+  backup_identity=$(path_identity "$ADOPT_BACKUP") || return 1
+  [[ "$backup_identity" == "$ADOPT_BACKUP_IDENTITY" ]] || return 1
+  backup_digest=$(stable_tree_digest "$ADOPT_BACKUP" "$backup_identity" \
+    "$ADOPT_BACKUP_DEVICE") || return 1
+  [[ "$backup_digest" == "$ADOPT_BACKUP_TREE_DIGEST" ]] || return 1
   if [[ -e "$ADOPT_SOURCE" || -L "$ADOPT_SOURCE" ]]; then
     adopt_staged_link_owned_at "$ADOPT_SOURCE" || return 1
     [[ ! -e "$ADOPT_STAGED_LINK" && ! -L "$ADOPT_STAGED_LINK" ]] \
@@ -2192,15 +2964,9 @@ verify_adopt_directory_skeleton() {
   [[ "$digest" == "$ADOPT_DIRECTORY_SKELETON_DIGEST" ]]
 }
 
-create_adopt_directory_skeleton() {
-  local root=$ADOPT_BACKUP_QUARANTINE/backup path relative identity mode device
-  ADOPT_DIRECTORY_SKELETON=$ADOPT_BACKUP_QUARANTINE/.directory-skeleton
-  if ! (umask 077; set -o noclobber; : > "$ADOPT_DIRECTORY_SKELETON") \
-      2>/dev/null; then
-    die "cannot create protected directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
-  fi
-  chmod 600 "$ADOPT_DIRECTORY_SKELETON" \
-    || die "cannot protect directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+capture_adopt_directory_skeleton() { # output
+  local output=$1 root=$ADOPT_BACKUP_QUARANTINE/backup
+  local path relative identity mode device
   if ! LC_ALL=C "$BSD_FIND" -P -s -x "$root" -depth -type d -print0 \
       | while IFS= read -r -d '' path; do
         if [[ "$path" == "$root" ]]; then
@@ -2215,8 +2981,21 @@ create_adopt_directory_skeleton() {
         identity=$(path_identity "$path") || return 1
         mode=$(path_mode "$path") || return 1
         printf '%s\0%s\0%s\0' "$relative" "$identity" "$mode" \
-          >> "$ADOPT_DIRECTORY_SKELETON" || return 1
+          >> "$output" || return 1
       done; then
+    return 1
+  fi
+}
+
+create_adopt_directory_skeleton() {
+  ADOPT_DIRECTORY_SKELETON=$ADOPT_BACKUP_QUARANTINE/.directory-skeleton
+  if ! (umask 077; set -o noclobber; : > "$ADOPT_DIRECTORY_SKELETON") \
+      2>/dev/null; then
+    die "cannot create protected directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  fi
+  chmod 600 "$ADOPT_DIRECTORY_SKELETON" \
+    || die "cannot protect directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  if ! capture_adopt_directory_skeleton "$ADOPT_DIRECTORY_SKELETON"; then
     die "cannot capture directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   fi
   ADOPT_DIRECTORY_SKELETON_IDENTITY=$(path_identity \
@@ -2229,52 +3008,26 @@ create_adopt_directory_skeleton() {
     || die "directory skeleton verification failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
 }
 
-directory_is_in_adopt_skeleton() { # relative identity mode
-  local expected_relative=$1 expected_identity=$2 expected_mode=$3
-  local relative identity mode
-  while IFS= read -r -d '' relative \
-      && IFS= read -r -d '' identity \
-      && IFS= read -r -d '' mode; do
-    if [[ "$relative" == "$expected_relative" \
-        && "$identity" == "$expected_identity" \
-        && "$mode" == "$expected_mode" ]]; then
-      return 0
-    fi
-  done < "$ADOPT_DIRECTORY_SKELETON"
-  return 1
-}
-
-adopt_quarantine_directories_are_captured() {
-  local root=$ADOPT_BACKUP_QUARANTINE/backup path relative identity mode device
-  verify_adopt_directory_skeleton || return 1
-  LC_ALL=C "$BSD_FIND" -P -s -x "$root" -depth -type d -print0 \
-    | while IFS= read -r -d '' path; do
-      if [[ "$path" == "$root" ]]; then
-        relative=.
-      elif [[ "$path" == "$root/"* ]]; then
-        relative=${path#"$root/"}
-      else
-        return 1
-      fi
-      [[ ! -L "$path" && -d "$path" ]] || return 1
-      device=$("$BSD_STAT" -f '%d' -- "$path" 2>/dev/null) || return 1
-      [[ "$device" == "$ADOPT_BACKUP_DEVICE" ]] || return 1
-      identity=$(path_identity "$path") || return 1
-      mode=$(path_mode "$path") || return 1
-      directory_is_in_adopt_skeleton "$relative" "$identity" "$mode" \
-        || return 1
-    done
-}
-
 delete_captured_adopt_directories() {
   local root=$ADOPT_BACKUP_QUARANTINE/backup relative identity mode path device
+  local current_skeleton
+  verify_adopt_directory_skeleton \
+    || die "directory skeleton changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  current_skeleton=$(mktemp \
+    "$ADOPT_BACKUP_QUARANTINE/.directory-current.XXXXXX") \
+    || die "cannot create current directory snapshot, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  chmod 600 "$current_skeleton" \
+    || die "cannot protect current directory snapshot, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  if ! capture_adopt_directory_skeleton "$current_skeleton" \
+      || ! /usr/bin/cmp -s "$ADOPT_DIRECTORY_SKELETON" "$current_skeleton"; then
+    /bin/rm -f -- "$current_skeleton"
+    die "directory cleanup boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  fi
+  /bin/rm -f -- "$current_skeleton" \
+    || die "current directory snapshot cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   while IFS= read -r -d '' relative \
       && IFS= read -r -d '' identity \
       && IFS= read -r -d '' mode; do
-    verify_adopt_directory_skeleton \
-      || die "directory skeleton changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
-    adopt_quarantine_directories_are_captured \
-      || die "directory cleanup boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
     if [[ "$relative" == "." ]]; then
       path=$root
     else
@@ -2331,13 +3084,9 @@ delete_quarantined_adopt_backup() {
     || die "replacement succeeded but backup cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   adopt_quarantined_backup_is_empty_tree \
     || die "backup cleanup boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
-  adopt_quarantine_directories_are_captured \
-    || die "directory cleanup boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   delete_captured_adopt_directories
   [[ ! -e "$quarantined" && ! -L "$quarantined" ]] \
     || die "replacement succeeded but quarantined backup remains at $quarantined"
-  verify_adopt_directory_skeleton \
-    || die "directory skeleton changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   /bin/rm -f -- "$ADOPT_DIRECTORY_SKELETON" \
     || die "directory skeleton cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   [[ ! -e "$ADOPT_DIRECTORY_SKELETON" \
@@ -2716,11 +3465,13 @@ run_dry_run_plan() { # command
   inspect_runtime_state
   classify_runtime_state
   plan_reset
+  plan_add_coordination_start
   case "$command" in
     lock) build_lock_plan ;;
     unlock) build_unlock_plan ;;
     *) die "no dry-run planner for command: $command" ;;
   esac
+  plan_add_coordination_finish
   render_plan "$command"
   printf 'Result: no changes made\n'
 }
@@ -2736,6 +3487,7 @@ execute_plan() {
       adopt_copy) execute_adopt_copy ;;
       adopt_verify) execute_adopt_verify ;;
       adopt_replace_source) execute_adopt_replace_source ;;
+      operation_lock_acquire|operation_lock_quarantine|operation_lock_release) ;;
       *) die "no executor for plan operation: $operation_id" ;;
     esac
   done
@@ -2747,24 +3499,28 @@ run_planned_command() { # command
     init)
       inspect_init_absent_state
       plan_reset
+      plan_add_coordination_start
       build_init_plan
+      plan_add_coordination_finish
       ;;
     adopt)
       inspect_adopt_state
       plan_reset
+      plan_add_coordination_start
       build_adopt_plan
+      plan_add_coordination_finish
       ;;
     *) die "no planned command runner for: $command" ;;
   esac
+  freeze_planned_command_snapshot "$command"
   render_plan "$command"
   if [[ "$OPTION_DRY_RUN" == "true" ]]; then
     printf 'Result: no changes made\n'
     return 0
   fi
   confirm_plan
-  if [[ "$command" == "init" ]]; then
-    inspect_init_absent_state
-  fi
+  acquire_operation_lock "$command"
+  revalidate_plan_under_operation_lock "$command"
   execute_plan
   case "$command" in
     init)
@@ -2776,6 +3532,7 @@ run_planned_command() { # command
       note "Result: adopted $ADOPT_SOURCE -> $ADOPT_DESTINATION"
       ;;
   esac
+  finish_operation_lock
 }
 
 dispatch_init() {

@@ -33,8 +33,10 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         printf '%s\n' "diskutil $*" >> "$VAULTLOCK_TEST_MUTATION_LOG"
       fi
       ;;
-    security|tmutil|ditto|mv|ln|rm|rmdir|mkdir|chmod|mktemp)
+  security|tmutil|ditto|mv|ln|rm|rmdir|mkdir|chmod|mktemp)
+    if [[ " $* " != *"$HOME/.vaultlock-operation"* ]]; then
       printf '%s\n' "$fixture_command $*" >> "$VAULTLOCK_TEST_MUTATION_LOG"
+    fi
       ;;
     tle)
       for fixture_argument in "$@"; do
@@ -443,6 +445,19 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         fixture_ditto_source=$fixture_ditto_destination
         fixture_ditto_destination=$fixture_argument
       done
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_ditto" ]]; then
+        fixture_ditto_signal=$(< "$VAULTLOCK_TEST_APFS_STATE/signal_ditto")
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/signal_ditto"
+        /bin/kill -s "$fixture_ditto_signal" "$PPID"
+        exit 0
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/hold_ditto" ]]; then
+        : > "$VAULTLOCK_TEST_APFS_STATE/ditto_entered"
+        while [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/release_ditto" ]]; do
+          /bin/sleep 0.01
+        done
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/hold_ditto"
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_ditto" ]]; then
         /bin/mkdir -p "$fixture_ditto_destination"
         printf 'partial\n' > "$fixture_ditto_destination/partial-copy"
@@ -492,12 +507,33 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     stat)
       fixture_stat_path=""
       for fixture_argument in "$@"; do fixture_stat_path=$fixture_argument; done
+      if [[ ( -f "$VAULTLOCK_TEST_APFS_STATE/normalize_copy_directory_metadata" \
+          || -f "$VAULTLOCK_TEST_APFS_STATE/drop_copy_birthtime" ) \
+        && "$fixture_stat_path" == "$VAULTLOCK_MOUNT_POINT"/* \
+        && -d "$fixture_stat_path" \
+        && "${1:-}" == "-f" \
+        && "${2:-}" == '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9FB:%f:%r:%l' ]]; then
+        fixture_directory_metadata=$(/usr/bin/stat "$@") || exit 1
+        IFS=: read -r fixture_device fixture_inode fixture_mode fixture_uid \
+          fixture_gid fixture_size fixture_mtime fixture_birthtime fixture_flags \
+          fixture_rdev fixture_nlink <<< "$fixture_directory_metadata"
+        [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/normalize_copy_directory_metadata" ]] \
+          || { fixture_size=999; fixture_rdev=999; }
+        [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/drop_copy_birthtime" ]] \
+          || fixture_birthtime=1.000000000
+        printf '%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s\n' \
+          "$fixture_device" "$fixture_inode" "$fixture_mode" "$fixture_uid" \
+          "$fixture_gid" "$fixture_size" "$fixture_mtime" \
+          "$fixture_birthtime" "$fixture_flags" "$fixture_rdev" \
+          "$fixture_nlink"
+        exit 0
+      fi
       if [[ ( -f "$VAULTLOCK_TEST_APFS_STATE/source_compressed_flags" \
             || -f "$VAULTLOCK_TEST_APFS_STATE/source_immutable_flags" \
             || -f "$VAULTLOCK_TEST_APFS_STATE/source_append_flags" ) \
           && "$fixture_stat_path" != "$VAULTLOCK_MOUNT_POINT"/* \
           && "${1:-}" == "-f" \
-          && "${2:-}" == '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9Fc:%f:%r:%l' ]]; then
+          && "${2:-}" == '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9FB:%f:%r:%l' ]]; then
         fixture_flag_metadata=$(/usr/bin/stat "$@") || exit 1
         IFS=: read -r fixture_device fixture_inode fixture_mode fixture_uid \
           fixture_gid fixture_size fixture_mtime fixture_ctime fixture_flags \
@@ -515,7 +551,7 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/copy_complete" \
           && "$fixture_stat_path" == "$VAULTLOCK_MOUNT_POINT"/* \
           && "${1:-}" == "-f" \
-          && "${2:-}" == '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9Fc:%f:%r:%l' ]]; then
+          && "${2:-}" == '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9FB:%f:%r:%l' ]]; then
         fixture_owner_metadata=$(/usr/bin/stat "$@") || exit 1
         IFS=: read -r fixture_device fixture_inode fixture_mode fixture_uid \
           fixture_gid fixture_size fixture_mtime fixture_ctime fixture_flags \
@@ -530,7 +566,7 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         if [[ "${1:-}" == "-f" && "${2:-}" == "%d" ]]; then
           printf '999\n'
         elif [[ "${1:-}" == "-f" \
-            && "${2:-}" == '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9Fc:%f:%r:%l' ]]; then
+            && "${2:-}" == '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9FB:%f:%r:%l' ]]; then
           fixture_foreign_metadata=$(/usr/bin/stat "$@") || exit 1
           printf '999:%s\n' "${fixture_foreign_metadata#*:}"
         else
@@ -548,17 +584,6 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         /usr/bin/stat -f '%d:%i' "$VAULTLOCK_STATE_DIR/state.json" \
           > "$VAULTLOCK_TEST_APFS_STATE/state_install_inode_after_rewrite"
         /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/overwrite_state_after_install_identity"
-      elif [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/state.json" \
-          && -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_before_quarantine_move" \
-          && -f "$VAULTLOCK_TEST_APFS_STATE/final_info_complete" ]]; then
-        /usr/bin/stat "$@" || exit 1
-        fixture_state_stat_count=$(fixture_read cleanup_state_stat_count) \
-          || fixture_state_stat_count=0
-        fixture_state_stat_count=$((fixture_state_stat_count + 1))
-        fixture_write cleanup_state_stat_count "$fixture_state_stat_count"
-        if [[ $fixture_state_stat_count -ge 4 ]]; then
-          fixture_replace_cleanup_state "$VAULTLOCK_STATE_DIR/state.json"
-        fi
       elif [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/passphrase.txt" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/recovery_boundary_race" ]]; then
         /usr/bin/stat "$@" || exit 1
@@ -607,24 +632,19 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/rollback_moved" \
           && "$fixture_stat_path" != "$VAULTLOCK_MOUNT_POINT"/* ]]; then
         printf '996:996\n'
-      elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_destination_identity" \
-          && "$fixture_stat_path" == "$VAULTLOCK_MOUNT_POINT"/* ]]; then
-        fixture_destination_stat_count=0
-        if [[ -f "$VAULTLOCK_TEST_APFS_STATE/destination_stat_count" ]]; then
-          fixture_destination_stat_count=$(< "$VAULTLOCK_TEST_APFS_STATE/destination_stat_count")
-        fi
-        fixture_destination_stat_count=$((fixture_destination_stat_count + 1))
-        printf '%s\n' "$fixture_destination_stat_count" \
-          > "$VAULTLOCK_TEST_APFS_STATE/destination_stat_count"
-        if [[ $fixture_destination_stat_count -gt 1 ]]; then
-          printf '998:998\n'
-          exit 0
-        fi
-        /usr/bin/stat "$@"
-      elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_source_identity_after_copy" \
-          && -f "$VAULTLOCK_TEST_APFS_STATE/copy_complete" \
-          && "$fixture_stat_path" != "$VAULTLOCK_MOUNT_POINT"/* ]]; then
+      elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/named_source_identity_swap" \
+          && "$fixture_stat_path" \
+            == "$(< "$VAULTLOCK_TEST_APFS_STATE/named_source_identity_swap")" \
+          && "${1:-}" == "-f" && "${2:-}" == "%d:%i" ]]; then
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/named_source_identity_swap"
         printf '999:999\n'
+      elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/named_destination_identity_swap" \
+          && "$fixture_stat_path" \
+            == "$(< "$VAULTLOCK_TEST_APFS_STATE/named_destination_identity_swap")" \
+          && "${1:-}" == "-f" && "${2:-}" == "%d:%i" ]]; then
+        /bin/rm -f \
+          "$VAULTLOCK_TEST_APFS_STATE/named_destination_identity_swap"
+        printf '998:998\n'
       else
         /usr/bin/stat "$@"
       fi
@@ -640,6 +660,17 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       fi
       ;;
     find)
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/count_directory_traversals" \
+        && " $* " == *" -depth "* \
+        && " $* " == *" -type d "* ]]; then
+        fixture_directory_traversals=0
+        [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/directory_traversal_count" ]] \
+          || fixture_directory_traversals=$(< \
+            "$VAULTLOCK_TEST_APFS_STATE/directory_traversal_count")
+        fixture_directory_traversals=$((fixture_directory_traversals + 1))
+        fixture_write directory_traversal_count "$fixture_directory_traversals"
+        [[ "$fixture_directory_traversals" -le 3 ]] || exit 70
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_cleanup" \
           && " $* " == *" -exec /bin/rm "* ]]; then
         exit 1
@@ -669,12 +700,6 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         fixture_mv_source=$fixture_mv_destination
         fixture_mv_destination=$fixture_argument
       done
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_before_quarantine_move" \
-          && "$fixture_mv_source" == "$VAULTLOCK_STATE_DIR/state.json" \
-          && "$fixture_mv_destination" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.*/state.json ]]; then
-        fixture_replace_cleanup_state "$VAULTLOCK_STATE_DIR/state.json"
-        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_before_quarantine_move"
-      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/make_quarantine_nonprivate_before_move" \
           && "$fixture_mv_source" == "$VAULTLOCK_STATE_DIR/state.json" \
           && "$fixture_mv_destination" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.*/state.json ]]; then
@@ -726,11 +751,6 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_backup_at_quarantine_boundary"
         fi
       fi
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move" \
-          && "$fixture_mv_destination" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.*/state.json ]]; then
-        fixture_replace_cleanup_state "$fixture_mv_destination"
-        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move"
-      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_restored_identity" \
           && "$fixture_mv_source" == *.vaultlock-backup \
           && "$fixture_mv_destination" == "${fixture_mv_source%.vaultlock-backup}" ]]; then
@@ -738,10 +758,13 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       fi
       ;;
     ln)
-      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_ln" ]] || exit 1
-      /bin/ln "$@"
       fixture_ln_destination=""
       for fixture_argument in "$@"; do fixture_ln_destination=$fixture_argument; done
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_ln" \
+        && "$fixture_ln_destination" != "$HOME/.vaultlock-operation.lock/owner" ]]; then
+        exit 1
+      fi
+      /bin/ln "$@"
       if [[ "$fixture_ln_destination" == "$VAULTLOCK_STATE_DIR/state.json" ]]; then
         : > "$VAULTLOCK_TEST_APFS_STATE/state_link_installed"
       fi
@@ -749,6 +772,10 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     rm)
       fixture_rm_path=""
       for fixture_argument in "$@"; do fixture_rm_path=$fixture_argument; done
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_operation_lock_release" \
+          && "$fixture_rm_path" == "$HOME/.vaultlock-operation.lock/owner" ]]; then
+        exit 1
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_cleanup" \
           && " $* " == *" -rf "* ]]; then
         exit 1
@@ -761,14 +788,6 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_staged_link_cleanup" \
           && "$fixture_rm_path" == *.vaultlock-link ]]; then
         exit 1
-      fi
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move" \
-          && " $* " == *"$VAULTLOCK_STATE_DIR/state.json"* ]]; then
-        printf '%s\n' '{"unowned":"cleanup replacement"}' \
-          > "$VAULTLOCK_STATE_DIR/state.json"
-        /usr/bin/stat -f '%d:%i' "$VAULTLOCK_STATE_DIR/state.json" \
-          > "$VAULTLOCK_TEST_APFS_STATE/cleanup_replacement_identity"
-        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move"
       fi
       /bin/rm "$@" || exit 1
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/modify_recovery_after_state" \
@@ -828,6 +847,67 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       fi
       ;;
     mktemp) /usr/bin/mktemp "$@" ;;
+    ps)
+      [[ "${1:-}" == "-p" && "${2:-}" =~ ^[0-9]+$ \
+        && "${3:-}" == "-o" && "${4:-}" == "lstart=" \
+        && $# -eq 4 ]] || exit 64
+      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/ps_ambiguous" ]] || exit 2
+      [[ "${2:-}" != "999999" ]] || exit 1
+      printf 'Sun Aug 30 10:00:00 2026\n'
+      ;;
+    openssl)
+      [[ "$*" == "rand -hex 32" ]] || exit 64
+      if [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/token_generated" ]]; then
+        : > "$VAULTLOCK_TEST_APFS_STATE/token_generated"
+        printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
+      elif [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/token_generated_twice" ]]; then
+        : > "$VAULTLOCK_TEST_APFS_STATE/token_generated_twice"
+        printf 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n'
+      else
+        printf 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n'
+      fi
+      ;;
+    transition-fixture)
+      fixture_transition=${1:-}
+      fixture_subject=${2:-}
+      fixture_transition_marker=$VAULTLOCK_TEST_APFS_STATE/transition_$fixture_transition
+      [[ -f "$fixture_transition_marker" ]] || exit 0
+      fixture_transition_action=$(< "$fixture_transition_marker")
+      case "$fixture_transition_action" in
+        adopt_source_identity_swap)
+          printf '%s\n' "$fixture_subject" \
+            > "$VAULTLOCK_TEST_APFS_STATE/named_source_identity_swap"
+          ;;
+        adopt_destination_identity_swap)
+          printf '%s\n' "$fixture_subject" \
+            > "$VAULTLOCK_TEST_APFS_STATE/named_destination_identity_swap"
+          ;;
+        init_state_identity_swap)
+          fixture_replace_cleanup_state "$fixture_subject"
+          ;;
+        init_state_create)
+          printf '{"introduced":"plan drift"}\n' \
+            > "$VAULTLOCK_STATE_DIR/state.json"
+          ;;
+        owner_identity_swap)
+          /bin/mv "$fixture_subject" "$fixture_subject.pre-transition"
+          printf 'version=1\npid=broken\n' > "$fixture_subject"
+          /bin/chmod 600 "$fixture_subject"
+          ;;
+        adopt_backup_identity_swap)
+          /bin/mv "$fixture_subject" "$fixture_subject.pre-transition"
+          /usr/bin/ditto "$fixture_subject.pre-transition" "$fixture_subject"
+          ;;
+        adopt_staged_identity_swap)
+          fixture_staged_target=$(/usr/bin/readlink "$fixture_subject") \
+            || exit 1
+          /bin/mv "$fixture_subject" "$fixture_subject.pre-transition"
+          /bin/ln -s "$fixture_staged_target" "$fixture_subject"
+          ;;
+        *) exit 64 ;;
+      esac
+      /bin/rm -f "$fixture_transition_marker"
+      ;;
     mount|tle|tmutil|curl)
       ;;
     *)
@@ -861,7 +941,7 @@ mkdir -p "$fake_bin" "$gnu_bin" "$apfs_state" "$state_dir" "$mount_point"
 TEST_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 for fake_command in diskutil security sudo tle tmutil curl mount head base64 \
   ditto dirname basename stat find ls wc readlink mv ln rm rmdir mkdir chmod \
-  mktemp \
+  mktemp ps openssl transition-fixture \
   mount-fixture bash-version-fixture; do
   ln -s "$TEST_SELF" "$fake_bin/$fake_command"
 done
@@ -952,11 +1032,64 @@ run_vaultlock() {
   VAULTLOCK_TEST_BSD_FIND="$fake_bin/find" \
   VAULTLOCK_TEST_BSD_LS="$fake_bin/ls" \
   VAULTLOCK_TEST_BSD_STAT="$fake_bin/stat" \
+  VAULTLOCK_TEST_PS="$fake_bin/ps" \
+  VAULTLOCK_TEST_OPENSSL="$fake_bin/openssl" \
+  VAULTLOCK_TEST_MKDIR="$fake_bin/mkdir" \
+  VAULTLOCK_TEST_MKTEMP="$fake_bin/mktemp" \
+  VAULTLOCK_TEST_LN="$fake_bin/ln" \
+  VAULTLOCK_TEST_MV="$fake_bin/mv" \
+  VAULTLOCK_TEST_RM="$fake_bin/rm" \
+  VAULTLOCK_TEST_RMDIR="$fake_bin/rmdir" \
+  VAULTLOCK_TEST_CHMOD="$fake_bin/chmod" \
+  VAULTLOCK_TEST_TRANSITION="$fake_bin/transition-fixture" \
   VAULTLOCK_TEST_ACTION_LOG="$action_log" \
   VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
   VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
   VAULTLOCK_TEST_APFS_STATE="$apfs_state" \
   /bin/bash "$VL" "$@"
+}
+
+start_vaultlock_background() { # output command...
+  local output=$1
+  shift
+  /usr/bin/env \
+    "HOME=$test_home" \
+    "PATH=$fake_bin" \
+    "VAULTLOCK_STATE_DIR=$state_dir" \
+    "VAULTLOCK_MOUNT_POINT=$mount_point" \
+    "VAULTLOCK_MOUNT_COMMAND=$fake_bin/mount-fixture" \
+    "VAULTLOCK_CONFIRM_DEVICE=$confirm_device" \
+    "VAULTLOCK_TEST_FAKE_SYSTEM=1" \
+    "VAULTLOCK_TEST_FAKE_BIN=$fake_bin" \
+    "VAULTLOCK_TEST_DITTO=$fake_bin/ditto" \
+    "VAULTLOCK_TEST_BSD_FIND=$fake_bin/find" \
+    "VAULTLOCK_TEST_BSD_LS=$fake_bin/ls" \
+    "VAULTLOCK_TEST_BSD_STAT=$fake_bin/stat" \
+    "VAULTLOCK_TEST_PS=$fake_bin/ps" \
+    "VAULTLOCK_TEST_OPENSSL=$fake_bin/openssl" \
+    "VAULTLOCK_TEST_MKDIR=$fake_bin/mkdir" \
+    "VAULTLOCK_TEST_MKTEMP=$fake_bin/mktemp" \
+    "VAULTLOCK_TEST_LN=$fake_bin/ln" \
+    "VAULTLOCK_TEST_MV=$fake_bin/mv" \
+    "VAULTLOCK_TEST_RM=$fake_bin/rm" \
+    "VAULTLOCK_TEST_RMDIR=$fake_bin/rmdir" \
+    "VAULTLOCK_TEST_CHMOD=$fake_bin/chmod" \
+    "VAULTLOCK_TEST_TRANSITION=$fake_bin/transition-fixture" \
+    "VAULTLOCK_TEST_ACTION_LOG=$action_log" \
+    "VAULTLOCK_TEST_MUTATION_LOG=$mutation_log" \
+    "VAULTLOCK_TEST_HOOK_LOG=$hook_log" \
+    "VAULTLOCK_TEST_APFS_STATE=$apfs_state" \
+    /bin/bash "$VL" "$@" > "$output" 2>&1 &
+  BACKGROUND_VAULTLOCK_PID=$!
+}
+
+wait_for_fixture() { # path
+  local path=$1 attempts=0
+  while [[ ! -e "$path" && "$attempts" -lt 500 ]]; do
+    /bin/sleep 0.01
+    attempts=$((attempts + 1))
+  done
+  [[ -e "$path" ]]
 }
 
 run_vaultlock_with_gnu_path() {
@@ -973,6 +1106,16 @@ run_vaultlock_with_gnu_path() {
   VAULTLOCK_TEST_BSD_FIND="$fake_bin/find" \
   VAULTLOCK_TEST_BSD_LS="$fake_bin/ls" \
   VAULTLOCK_TEST_BSD_STAT="$fake_bin/stat" \
+  VAULTLOCK_TEST_PS="$fake_bin/ps" \
+  VAULTLOCK_TEST_OPENSSL="$fake_bin/openssl" \
+  VAULTLOCK_TEST_MKDIR="$fake_bin/mkdir" \
+  VAULTLOCK_TEST_MKTEMP="$fake_bin/mktemp" \
+  VAULTLOCK_TEST_LN="$fake_bin/ln" \
+  VAULTLOCK_TEST_MV="$fake_bin/mv" \
+  VAULTLOCK_TEST_RM="$fake_bin/rm" \
+  VAULTLOCK_TEST_RMDIR="$fake_bin/rmdir" \
+  VAULTLOCK_TEST_CHMOD="$fake_bin/chmod" \
+  VAULTLOCK_TEST_TRANSITION="$fake_bin/transition-fixture" \
   VAULTLOCK_TEST_ACTION_LOG="$action_log" \
   VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
   VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
@@ -995,6 +1138,16 @@ run_vaultlock_with_stdin() { # input command...
   VAULTLOCK_TEST_BSD_FIND="$fake_bin/find" \
   VAULTLOCK_TEST_BSD_LS="$fake_bin/ls" \
   VAULTLOCK_TEST_BSD_STAT="$fake_bin/stat" \
+  VAULTLOCK_TEST_PS="$fake_bin/ps" \
+  VAULTLOCK_TEST_OPENSSL="$fake_bin/openssl" \
+  VAULTLOCK_TEST_MKDIR="$fake_bin/mkdir" \
+  VAULTLOCK_TEST_MKTEMP="$fake_bin/mktemp" \
+  VAULTLOCK_TEST_LN="$fake_bin/ln" \
+  VAULTLOCK_TEST_MV="$fake_bin/mv" \
+  VAULTLOCK_TEST_RM="$fake_bin/rm" \
+  VAULTLOCK_TEST_RMDIR="$fake_bin/rmdir" \
+  VAULTLOCK_TEST_CHMOD="$fake_bin/chmod" \
+  VAULTLOCK_TEST_TRANSITION="$fake_bin/transition-fixture" \
   VAULTLOCK_TEST_ACTION_LOG="$action_log" \
   VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
   VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
@@ -1017,6 +1170,16 @@ run_vaultlock_tty_yes() {
     "VAULTLOCK_TEST_BSD_FIND=$fake_bin/find" \
     "VAULTLOCK_TEST_BSD_LS=$fake_bin/ls" \
     "VAULTLOCK_TEST_BSD_STAT=$fake_bin/stat" \
+    "VAULTLOCK_TEST_PS=$fake_bin/ps" \
+    "VAULTLOCK_TEST_OPENSSL=$fake_bin/openssl" \
+    "VAULTLOCK_TEST_MKDIR=$fake_bin/mkdir" \
+    "VAULTLOCK_TEST_MKTEMP=$fake_bin/mktemp" \
+    "VAULTLOCK_TEST_LN=$fake_bin/ln" \
+    "VAULTLOCK_TEST_MV=$fake_bin/mv" \
+    "VAULTLOCK_TEST_RM=$fake_bin/rm" \
+    "VAULTLOCK_TEST_RMDIR=$fake_bin/rmdir" \
+    "VAULTLOCK_TEST_CHMOD=$fake_bin/chmod" \
+    "VAULTLOCK_TEST_TRANSITION=$fake_bin/transition-fixture" \
     "VAULTLOCK_TEST_ACTION_LOG=$action_log" \
     "VAULTLOCK_TEST_MUTATION_LOG=$mutation_log" \
     "VAULTLOCK_TEST_HOOK_LOG=$hook_log" \
@@ -1077,6 +1240,39 @@ write_apfs_state() { # locked mounted uuid device
   printf '%s\n' "$fixture_mount_point" > "$apfs_state/mount_point"
   printf '%s\n' normal > "$apfs_state/plist_mode"
   printf '%s\n' string > "$apfs_state/mount_point_type"
+}
+
+operation_lock_dir=$test_home/.vaultlock-operation.lock
+fake_process_start='Sun Aug 30 10:00:00 2026'
+fake_operation_token=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+create_operation_lock() { # pid start command token
+  /bin/mkdir -m 700 "$operation_lock_dir"
+  printf 'version=1\npid=%s\nstart=%s\ncommand=%s\ntoken=%s\n' \
+    "$1" "$2" "$3" "$4" > "$operation_lock_dir/owner"
+  /bin/chmod 600 "$operation_lock_dir/owner"
+}
+
+clear_operation_locks() {
+  local path
+  for path in "$operation_lock_dir" "$operation_lock_dir".quarantine.*; do
+    [[ -d "$path" && ! -L "$path" ]] || continue
+    /bin/rm -f "$path/owner" "$path/owner.pre-transition"
+    /bin/rmdir "$path"
+  done
+}
+
+reset_operation_lock_fixture() {
+  clear_operation_locks
+  /bin/rm -f "$apfs_state/token_generated" \
+    "$apfs_state/token_generated_twice" \
+    "$apfs_state/ps_ambiguous" \
+    "$apfs_state/signal_ditto" \
+    "$apfs_state/fail_operation_lock_release" \
+    "$apfs_state/hold_ditto" \
+    "$apfs_state/ditto_entered" \
+    "$apfs_state/release_ditto" \
+    "$apfs_state"/transition_*
 }
 
 write_recovery_state() { # plaintext ciphertext hash
@@ -1545,6 +1741,31 @@ check_secret_absent() { # description output secret
   fi
 }
 
+normalize_domain_plan_actions() {
+  /usr/bin/awk '
+    /Acquire cooperative operation lock/ { next }
+    /Conditionally quarantine a verified stale operation lock/ { next }
+    /Release cooperative operation lock/ { next }
+    /^  [0-9]+[.] / {
+      sub(/^  [0-9]+[.] /, "")
+      count += 1
+      printf "  %d. %s\n", count, $0
+      next
+    }
+    { print }
+  '
+}
+
+check_plan_coordination() { # description plan
+  local description=$1 plan=$2
+  check_contains "$description plans operation-lock acquisition" \
+    "Acquire cooperative operation lock at $operation_lock_dir" "$plan"
+  check_contains "$description plans verified stale-lock quarantine" \
+    "Conditionally quarantine a verified stale operation lock" "$plan"
+  check_contains "$description plans operation-lock release" \
+    "Release cooperative operation lock" "$plan"
+}
+
 fake_passphrase='FAKE-PASSPHRASE-DO-NOT-PRINT'
 fake_hash='FAKE-HASH-DO-NOT-PRINT'
 fake_ciphertext='FAKE-CIPHERTEXT-DO-NOT-PRINT'
@@ -1596,8 +1817,10 @@ check_contains "lock dry-run resolves deadline" \
   'Requested deadline: ' "$lock_plan"
 check_contains "lock dry-run resolves target round" \
   'Resolved drand round: target ' "$lock_plan"
-lock_actions=$(sed -n '/^Actions:$/,/^Confirmation:/p' <<< "$lock_plan")
-expected_lock_actions=$(cat <<EOF
+check_plan_coordination "lock dry-run" "$lock_plan"
+lock_actions=$(sed -n '/^Actions:$/,/^Confirmation:/p' <<< "$lock_plan" \
+  | normalize_domain_plan_actions)
+expected_lock_actions=$(cat <<EOF | normalize_domain_plan_actions
 Actions:
   1. Verify the existing plaintext recovery material against its stored hash for repair
   2. Unlock the expected APFS volume with the verified existing recovery material for repair
@@ -1670,15 +1893,17 @@ check_contains "unlock dry-run defers unavailable local hooks" \
   "$unlock_plan"
 check_contains "unlock dry-run lists global post hook after deferred item" \
   "20-post\\ hook --phase post-unlock --scope global" "$unlock_plan"
+check_plan_coordination "unlock dry-run" "$unlock_plan"
 unlock_order=$(printf '%s\n' "$unlock_plan" \
-  | grep -E 'pre-unlock|Decrypt|Verify the decrypted|Unlock the expected|Verify the mounted|Write the verified|Update the keychain|record the unlocked|Defer discovery|post-unlock' \
+  | grep -E 'pre-unlock|Decrypt|Verify the decrypted|Unlock the expected|Verify the mounted|Write the verified|Update the keychain|record the unlocked|Defer discovery|post-unlock|cooperative operation lock' \
+  | normalize_domain_plan_actions \
   || true)
 quoted_pre_hook=$(printf '%q' "$state_dir/hooks/pre-unlock.d/10-pre hook")
 quoted_post_hook=$(printf '%q' "$state_dir/hooks/post-unlock.d/20-post hook")
 quoted_mount_point=$(printf '%q' "$mount_point")
 quoted_state_dir=$(printf '%q' "$state_dir")
 quoted_state_file=$(printf '%q' "$state_dir/state.json")
-expected_unlock_order=$(cat <<EOF
+expected_unlock_order=$(cat <<EOF | normalize_domain_plan_actions
   1. Run hook $quoted_pre_hook --phase pre-unlock --scope global --volume vault --mount-point $quoted_mount_point --volume-uuid UUID-123 --device disk9s1 --state-dir $quoted_state_dir --state-file $quoted_state_file --deadline 2099-01-02T03:04:00+0100 --deadline-epoch 4070999040 --round 792731235 --locked true
   2. Decrypt the stored time-lock ciphertext after its drand round is available
   3. Verify the decrypted recovery material against the stored hash
@@ -1733,9 +1958,10 @@ rm -f "$state_dir/passphrase.tle" "$apfs_state/mount_point"
 repair_unlock_plan=$(run_vaultlock unlock --dry-run)
 repair_unlock_order=$(printf '%s\n' "$repair_unlock_plan" \
   | grep -E 'Verify the existing plaintext|Unlock the expected APFS|Mount the expected APFS|Verify the mounted UUID|Verify the unlocked and mounted|Defer post-unlock|post-unlock.d/20-post' \
+  | normalize_domain_plan_actions \
   || true)
 quoted_post_hook=$(printf '%q' "$state_dir/hooks/post-unlock.d/20-post hook")
-expected_repair_unlock_order=$(cat <<EOF
+expected_repair_unlock_order=$(cat <<EOF | normalize_domain_plan_actions
   1. Verify the existing plaintext recovery material against its stored hash for repair
   2. Unlock the expected APFS volume with the verified existing recovery material for repair
   3. Mount the expected APFS volume at $mount_point for repair
@@ -1753,8 +1979,9 @@ check_count "recorded-unlocked repair disables hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$repair_unlock_no_hooks"
 repair_no_hooks_order=$(printf '%s\n' "$repair_unlock_no_hooks" \
   | grep -E 'Verify the existing plaintext|Unlock the expected APFS|Mount the expected APFS|Verify the mounted UUID|Verify the unlocked and mounted|Hooks disabled' \
+  | normalize_domain_plan_actions \
   || true)
-expected_repair_no_hooks_order=$(cat <<EOF
+expected_repair_no_hooks_order=$(cat <<EOF | normalize_domain_plan_actions
   1. Verify the existing plaintext recovery material against its stored hash for repair
   2. Unlock the expected APFS volume with the verified existing recovery material for repair
   3. Mount the expected APFS volume at $mount_point for repair
@@ -1869,8 +2096,10 @@ rm -f "$apfs_state/keychain_marker"
 : > "$mutation_log"
 
 init_plan=$(run_vaultlock init --dry-run)
-init_actions=$(printf '%s\n' "$init_plan" | grep -E '^  [123]\. ' || true)
-expected_init_actions=$(cat <<'EOF'
+check_plan_coordination "init dry-run" "$init_plan"
+init_actions=$(printf '%s\n' "$init_plan" | grep -E '^  [0-9]+\. ' \
+  | normalize_domain_plan_actions || true)
+expected_init_actions=$(cat <<'EOF' | normalize_domain_plan_actions
   1. Prepare protected state and generate recovery material
   2. Store recovery material in the keychain and create the encrypted APFS volume
   3. Discover the new volume identity and write initial unlocked state
@@ -1971,6 +2200,7 @@ fi
 
 : > "$mutation_log"
 adopt_plan=$(run_vaultlock adopt --dry-run "$adopt_source")
+check_plan_coordination "adopt dry-run" "$adopt_plan"
 check_contains "adopt dry-run plans copy" \
   "Copy $adopt_source_resolved to $mount_point/source directory" "$adopt_plan"
 check_contains "adopt dry-run plans verification" \
@@ -2023,6 +2253,10 @@ reset_adopt_fixture() {
     "$apfs_state/drop_copy_mtime" "$apfs_state/drop_copy_flags" \
     "$apfs_state/drop_copy_xattrs" "$apfs_state/drop_copy_owner_metadata" \
     "$apfs_state/drop_copy_acl" "$apfs_state/break_copy_hardlink" \
+    "$apfs_state/normalize_copy_directory_metadata" \
+    "$apfs_state/drop_copy_birthtime" \
+    "$apfs_state/count_directory_traversals" \
+    "$apfs_state/directory_traversal_count" \
     "$apfs_state/rename_copy_trailing_newline" \
     "$apfs_state/source_compressed_flags" \
     "$apfs_state/source_immutable_flags" \
@@ -2035,8 +2269,11 @@ reset_adopt_fixture() {
     "$apfs_state/fail_staged_link_cleanup" \
     "$apfs_state/swap_mount_uuid_after_copy" \
     "$apfs_state/swap_mount_device_after_copy" \
-    "$apfs_state/swap_source_identity_after_copy" \
-    "$apfs_state/swap_destination_identity" "$apfs_state/fail_ln" \
+    "$apfs_state/transition_adopt_copy_before_source_identity_check" \
+    "$apfs_state/transition_adopt_verify_before_destination_identity_check" \
+    "$apfs_state/named_source_identity_swap" \
+    "$apfs_state/named_destination_identity_swap" \
+    "$apfs_state/fail_ln" \
     "$apfs_state/swap_backup_identity" "$apfs_state/adopt_link_move_failed" \
     "$apfs_state/race_source_symlink_on_link_move_failure" \
     "$apfs_state/swap_restored_identity" "$apfs_state/rollback_moved" \
@@ -2044,9 +2281,11 @@ reset_adopt_fixture() {
     "$apfs_state/fail_backup_move" "$apfs_state/fail_link_move" \
     "$apfs_state/fail_rollback_move" "$apfs_state/fail_cleanup" \
     "$apfs_state/copy_complete" \
-    "$apfs_state/destination_stat_count" \
     "$apfs_state/gnu_path_tool_called"
+  write_json_state false null null null UUID-INIT
   write_apfs_state false true UUID-INIT disk8s1
+  printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
+  rm -f "$state_dir/passphrase.tle" "$state_dir/passphrase.sha256"
 }
 
 new_adopt_source() { # name
@@ -2308,13 +2547,15 @@ check "adopt same-count replacement retains backup" 1 \
 
 reset_adopt_fixture
 source_swap_source=$(new_adopt_source source-swap)
-: > "$apfs_state/swap_source_identity_after_copy"
+printf 'adopt_source_identity_swap\n' \
+  > "$apfs_state/transition_adopt_copy_before_source_identity_check"
 expect_adopt_failure_preserves_source "adopt source identity swap" \
   "$source_swap_source" 'source identity changed'
 
 reset_adopt_fixture
 destination_swap_source=$(new_adopt_source destination-swap)
-: > "$apfs_state/swap_destination_identity"
+printf 'adopt_destination_identity_swap\n' \
+  > "$apfs_state/transition_adopt_verify_before_destination_identity_check"
 expect_adopt_failure_preserves_source "adopt destination identity swap" \
   "$destination_swap_source" 'destination identity changed'
 
@@ -2595,12 +2836,11 @@ reset_init_fixture() {
     "$apfs_state/final_info_complete" \
     "$apfs_state/state_inode_before_rewrite" \
     "$apfs_state/state_inode_after_rewrite" \
-    "$apfs_state/swap_state_before_quarantine_move" \
-    "$apfs_state/swap_state_after_quarantine_move" \
+    "$apfs_state/transition_init_cleanup_before_state_quarantine_move" \
+    "$apfs_state/transition_init_cleanup_after_state_quarantine_move" \
     "$apfs_state/make_quarantine_nonprivate_before_move" \
     "$apfs_state/quarantine_made_nonprivate" \
     "$apfs_state/quarantine_reprotected_mode" \
-    "$apfs_state/cleanup_state_stat_count" \
     "$apfs_state/cleanup_original_identity" \
     "$apfs_state/cleanup_replacement_identity" \
     "$apfs_state/security_output_artifact_seen" \
@@ -3003,7 +3243,8 @@ check_count "init in-place state rewrite does not report success" 0 \
 for cleanup_swap_phase in before after; do
   reset_init_fixture
   : > "$apfs_state/swap_identity_after_state"
-  : > "$apfs_state/swap_state_${cleanup_swap_phase}_quarantine_move"
+  printf 'init_state_identity_swap\n' \
+    > "$apfs_state/transition_init_cleanup_${cleanup_swap_phase}_state_quarantine_move"
   if cleanup_swap_output=$(run_vaultlock init --yes 2>&1); then
     record_failure "init rejects state swap ${cleanup_swap_phase} quarantine move"
   else
@@ -3129,5 +3370,374 @@ else
 fi
 mv "$confirm_device.saved" "$confirm_device"
 check_empty "init missing confirmation device performs no mutation" "$mutation_log"
+
+# Cooperative operation lock and post-confirmation plan convergence.
+reset_operation_lock_fixture
+reset_init_fixture
+run_vaultlock init --dry-run >/dev/null
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "init dry-run creates no operation lock"
+[[ ! -e "$apfs_state/token_generated" ]] \
+  || record_failure "init dry-run generates no operation token"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+declined_lock_source=$(new_adopt_source operation-lock-declined)
+if run_vaultlock adopt "$declined_lock_source" >/dev/null 2>&1; then
+  record_failure "adopt operation-lock decline exits nonzero"
+fi
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "adopt decline creates no operation lock"
+[[ ! -e "$apfs_state/token_generated" ]] \
+  || record_failure "adopt decline generates no operation token"
+
+for locked_command in init adopt; do
+  reset_operation_lock_fixture
+  if [[ "$locked_command" == "init" ]]; then
+    reset_init_fixture
+    locked_arguments=(init --yes)
+  else
+    reset_adopt_fixture
+    locked_source=$(new_adopt_source operation-lock-live)
+    locked_arguments=(adopt --yes "$locked_source")
+  fi
+  create_operation_lock 12345 "$fake_process_start" adopt "$fake_operation_token"
+  if live_lock_output=$(run_vaultlock "${locked_arguments[@]}" 2>&1); then
+    record_failure "$locked_command refuses live cooperative operation lock"
+  else
+    check_contains "$locked_command live lock reports owner" \
+      'operation lock is held by live' "$live_lock_output"
+  fi
+  check_empty "$locked_command live lock stops before domain mutation" \
+    "$mutation_log"
+done
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+stale_lock_source=$(new_adopt_source operation-lock-stale)
+create_operation_lock 999999 "$fake_process_start" adopt "$fake_operation_token"
+if stale_lock_output=$(run_vaultlock adopt --yes "$stale_lock_source" 2>&1); then
+  :
+else
+  record_failure "adopt replaces verified stale operation lock: $stale_lock_output"
+fi
+stale_lock_quarantine_count=$(find "$test_home" -maxdepth 1 -type d \
+  -name '.vaultlock-operation.lock.quarantine.*' | wc -l | tr -d ' ')
+check "adopt retains one verified stale operation lock" 1 \
+  "$stale_lock_quarantine_count"
+check_contains "adopt reports retained stale operation lock" \
+  '.vaultlock-operation.lock.quarantine.' "$stale_lock_output"
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "adopt releases replacement operation lock"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+malformed_lock_source=$(new_adopt_source operation-lock-malformed)
+create_operation_lock 12345 "$fake_process_start" adopt "$fake_operation_token"
+printf 'version=1\npid=broken\n' > "$operation_lock_dir/owner"
+/bin/chmod 600 "$operation_lock_dir/owner"
+if malformed_lock_output=$(run_vaultlock adopt --yes \
+    "$malformed_lock_source" 2>&1); then
+  record_failure "adopt rejects malformed operation lock owner"
+else
+  check_contains "adopt malformed operation lock fails closed" \
+    'malformed operation lock owner' "$malformed_lock_output"
+fi
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "adopt preserves malformed operation lock"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+ambiguous_lock_source=$(new_adopt_source operation-lock-ambiguous)
+create_operation_lock 12345 "$fake_process_start" adopt "$fake_operation_token"
+: > "$apfs_state/ps_ambiguous"
+if ambiguous_lock_output=$(run_vaultlock adopt --yes \
+    "$ambiguous_lock_source" 2>&1); then
+  record_failure "adopt rejects ambiguous operation lock process probe"
+else
+  check_contains "adopt ambiguous process probe fails closed" \
+    'cannot safely classify operation lock owner' "$ambiguous_lock_output"
+fi
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "adopt preserves ambiguously owned operation lock"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+swapped_lock_source=$(new_adopt_source operation-lock-owner-swap)
+create_operation_lock 999999 "$fake_process_start" adopt "$fake_operation_token"
+printf 'owner_identity_swap\n' \
+  > "$apfs_state/transition_operation_lock_final_check"
+if swapped_lock_output=$(run_vaultlock adopt --yes \
+    "$swapped_lock_source" 2>&1); then
+  record_failure "adopt rejects operation lock owner identity swap"
+else
+  check_contains "adopt operation lock owner swap fails closed" \
+    'operation lock changed during final verification' "$swapped_lock_output"
+fi
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "adopt preserves swapped operation lock"
+
+reset_operation_lock_fixture
+reset_init_fixture
+printf 'init_state_create\n' \
+  > "$apfs_state/transition_plan_revalidation_before_inspection"
+if init_drift_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init rejects post-acquisition plan drift"
+else
+  check_contains "init reports post-acquisition plan drift" \
+    'plan changed after operation lock acquisition' "$init_drift_output"
+fi
+check_count "init plan drift stops before APFS mutation" 0 \
+  'diskutil apfs addVolume' "$(< "$mutation_log")"
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "init plan drift releases operation lock"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+adopt_drift_source=$(new_adopt_source operation-lock-plan-drift)
+printf 'adopt_source_identity_swap\n' \
+  > "$apfs_state/transition_plan_revalidation_before_inspection"
+if adopt_drift_output=$(run_vaultlock adopt --yes \
+    "$adopt_drift_source" 2>&1); then
+  record_failure "adopt rejects identical-content source identity plan drift"
+else
+  check_contains "adopt reports source identity plan drift" \
+    'plan changed after operation lock acquisition' "$adopt_drift_output"
+fi
+check_count "adopt plan drift stops before copy" 0 'ditto ' \
+  "$(< "$mutation_log")"
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "adopt plan drift releases operation lock"
+
+reset_operation_lock_fixture
+reset_init_fixture
+if operation_lock_init_success=$(run_vaultlock init --yes 2>&1); then
+  :
+else
+  record_failure "successful init with operation lock: $operation_lock_init_success"
+fi
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "successful init releases operation lock"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+operation_lock_adopt_source=$(new_adopt_source operation-lock-success)
+if operation_lock_adopt_success=$(run_vaultlock adopt --yes \
+    "$operation_lock_adopt_source" 2>&1); then
+  :
+else
+  record_failure "successful adopt with operation lock: $operation_lock_adopt_success"
+fi
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "successful adopt releases operation lock"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+operation_lock_failure_source=$(new_adopt_source operation-lock-domain-failure)
+: > "$apfs_state/fail_ditto"
+if operation_lock_failure_output=$(run_vaultlock adopt --yes \
+    "$operation_lock_failure_source" 2>&1); then
+  record_failure \
+    "adopt domain failure exits nonzero with operation lock: $operation_lock_failure_output"
+fi
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "adopt domain failure releases operation lock"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+operation_lock_release_source=$(new_adopt_source operation-lock-release-failure)
+: > "$apfs_state/fail_operation_lock_release"
+if release_failure_output=$(run_vaultlock adopt --yes \
+    "$operation_lock_release_source" 2>&1); then
+  record_failure "adopt operation lock release failure exits nonzero"
+else
+  check_contains "adopt operation lock release failure reports retained lock" \
+    "$operation_lock_dir" "$release_failure_output"
+fi
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "adopt operation lock release failure retains lock"
+
+for signal_case in TERM:143 HUP:129 INT:130; do
+  reset_operation_lock_fixture
+  reset_adopt_fixture
+  operation_signal=${signal_case%%:*}
+  operation_signal_status=${signal_case##*:}
+  operation_signal_source=$(new_adopt_source \
+    "operation-lock-signal-${operation_signal}")
+  printf '%s\n' "$operation_signal" > "$apfs_state/signal_ditto"
+  if operation_signal_output=$(run_vaultlock adopt --yes \
+      "$operation_signal_source" 2>&1); then
+    operation_signal_actual=0
+  else
+    operation_signal_actual=$?
+  fi
+  : "$operation_signal_output"
+  check "adopt $operation_signal preserves signal exit status" \
+    "$operation_signal_status" "$operation_signal_actual"
+  [[ ! -e "$operation_lock_dir" ]] \
+    || record_failure "adopt $operation_signal releases operation lock"
+done
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+operation_first_source=$(new_adopt_source operation-lock-first)
+operation_second_source=$(new_adopt_source operation-lock-second)
+: > "$apfs_state/hold_ditto"
+operation_first_output="$test_root/operation-first.out"
+start_vaultlock_background "$operation_first_output" adopt --yes \
+  "$operation_first_source"
+operation_first_pid=$BACKGROUND_VAULTLOCK_PID
+if ! wait_for_fixture "$apfs_state/ditto_entered"; then
+  record_failure "first concurrent adopt reaches ditto"
+fi
+operation_second_output="$test_root/operation-second.out"
+start_vaultlock_background "$operation_second_output" adopt --yes \
+  "$operation_second_source"
+operation_second_pid=$BACKGROUND_VAULTLOCK_PID
+/bin/sleep 0.2
+if /bin/kill -0 "$operation_second_pid" 2>/dev/null; then
+  : > "$apfs_state/release_ditto"
+fi
+if wait "$operation_second_pid"; then
+  operation_second_status=0
+else
+  operation_second_status=$?
+fi
+if [[ "$operation_second_status" -eq 0 ]]; then
+  record_failure "second concurrent adopt is refused"
+else
+  operation_second_text=$(< "$operation_second_output")
+  check_contains "second concurrent adopt reports live owner" \
+    'operation lock is held by live' "$operation_second_text"
+fi
+check_count "only one concurrent adopt reaches ditto" 1 'ditto ' \
+  "$(< "$mutation_log")"
+[[ -e "$apfs_state/release_ditto" ]] \
+  || : > "$apfs_state/release_ditto"
+if wait "$operation_first_pid"; then
+  :
+else
+  record_failure "first concurrent adopt completes after release"
+fi
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "concurrent adopt releases operation lock"
+
+reset_operation_lock_fixture
+
+reset_adopt_fixture
+normalized_directory_source=$(new_adopt_source adopt-directory-normalization)
+: > "$apfs_state/normalize_copy_directory_metadata"
+if normalized_directory_output=$(run_vaultlock adopt --yes \
+    "$normalized_directory_source" 2>&1); then
+  check_contains "adopt normalizes directory size and rdev" \
+    'Result: adopted' "$normalized_directory_output"
+else
+  record_failure "adopt normalizes directory size and rdev"
+fi
+
+reset_adopt_fixture
+birthtime_source=$(new_adopt_source adopt-directory-birthtime)
+: > "$apfs_state/drop_copy_birthtime"
+if birthtime_output=$(run_vaultlock adopt --yes "$birthtime_source" 2>&1); then
+  record_failure "adopt detects copied directory birthtime loss"
+else
+  check_contains "adopt reports directory birthtime mismatch" \
+    'copy verification failed' "$birthtime_output"
+fi
+
+reset_adopt_fixture
+symlink_timestamp_source=$(new_adopt_source adopt-symlink-timestamps)
+symlink_timestamp_path=$symlink_timestamp_source/timestamp-link
+/bin/ln -s subdirectory/file "$symlink_timestamp_path"
+/usr/bin/touch -c -h -a -d '2026-08-28T09:08:07.123456789Z' \
+  "$symlink_timestamp_path"
+/usr/bin/touch -c -h -m -d '2026-08-27T06:05:04.987654321Z' \
+  "$symlink_timestamp_path"
+expected_symlink_timestamps=$(/usr/bin/stat -f '%.9Fa:%.9Fm:%.9FB' -- \
+  "$symlink_timestamp_path")
+if symlink_timestamp_output=$(run_vaultlock adopt --yes \
+    "$symlink_timestamp_source" 2>&1); then
+  check "adopt preserves exact symlink atime mtime birthtime" \
+    "$expected_symlink_timestamps" \
+    "$(/usr/bin/stat -f '%.9Fa:%.9Fm:%.9FB' -- \
+      "$mount_point/adopt-symlink-timestamps/timestamp-link")"
+else
+  record_failure \
+    "adopt preserves exact symlink timestamps: $symlink_timestamp_output"
+fi
+
+reset_adopt_fixture
+large_directory_source=$(new_adopt_source adopt-large-directory-skeleton)
+large_directory_path=$large_directory_source
+for large_directory_index in {1..16}; do
+  large_directory_path=$large_directory_path/d$large_directory_index
+  mkdir "$large_directory_path"
+done
+printf 'deep payload\n' > "$large_directory_path/deep-file"
+: > "$apfs_state/count_directory_traversals"
+if large_directory_output=$(run_vaultlock adopt --yes \
+    "$large_directory_source" 2>&1); then
+  :
+else
+  record_failure \
+    "adopt cleans deterministic 16-directory skeleton: $large_directory_output"
+fi
+large_directory_traversals=$(< "$apfs_state/directory_traversal_count")
+if [[ "$large_directory_traversals" -le 3 ]]; then
+  printf 'ok   adopt directory cleanup uses bounded traversals\n'
+else
+  record_failure "adopt directory cleanup uses bounded traversals: $large_directory_traversals"
+fi
+
+reset_adopt_fixture
+rollback_order_source=$(new_adopt_source adopt-rollback-verification-order)
+: > "$apfs_state/fail_link_verification"
+printf 'adopt_backup_identity_swap\n' \
+  > "$apfs_state/transition_adopt_rollback_before_source_link_move"
+if rollback_order_output=$(run_vaultlock adopt --yes \
+    "$rollback_order_source" 2>&1); then
+  record_failure "adopt rollback rejects replaced backup"
+else
+  check_contains "adopt rollback reports unverified backup" \
+    'unverified backup retained' "$rollback_order_output"
+fi
+[[ -L "$rollback_order_source" ]] \
+  || record_failure "adopt verifies backup before moving installed source link"
+
+reset_adopt_fixture
+staged_reporting_source=$(new_adopt_source adopt-staged-reporting)
+: > "$apfs_state/fail_link_move"
+: > "$apfs_state/fail_staged_link_cleanup"
+printf 'adopt_staged_identity_swap\n' \
+  > "$apfs_state/transition_adopt_reporting_before_staged_classification"
+if staged_reporting_output=$(run_vaultlock adopt --yes \
+    "$staged_reporting_source" 2>&1); then
+  record_failure "adopt staged ownership reporting fixture exits nonzero"
+else
+  check_contains "adopt reports unverified staged path by ownership" \
+    'unverified staged path retained' "$staged_reporting_output"
+fi
+
+reset_adopt_fixture
+xattr_escape_source=$(new_adopt_source adopt-xattr-escapes)
+xattr_escape_file=$xattr_escape_source/subdirectory/file
+xattr_newline_name=$'vaultlock.newline\nname'
+xattr_backslash_name='vaultlock.backslash\cname'
+/usr/bin/xattr -w "$xattr_newline_name" newline-value "$xattr_escape_file"
+/usr/bin/xattr -w "$xattr_backslash_name" backslash-value "$xattr_escape_file"
+if xattr_escape_output=$(run_vaultlock adopt --yes \
+    "$xattr_escape_source" 2>&1); then
+  :
+else
+  record_failure "adopt preserves escaped xattr names: $xattr_escape_output"
+fi
+check "adopt newline xattr oracle" newline-value \
+  "$(/usr/bin/xattr -p "$xattr_newline_name" \
+    "$mount_point/adopt-xattr-escapes/subdirectory/file")"
+check "adopt backslash xattr oracle" backslash-value \
+  "$(/usr/bin/xattr -p "$xattr_backslash_name" \
+    "$mount_point/adopt-xattr-escapes/subdirectory/file")"
+
+reset_operation_lock_fixture
 
 exit "$fail"
