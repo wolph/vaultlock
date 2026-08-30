@@ -37,6 +37,7 @@ PLAN_OPERATION_TEXT=()
 PLAN_HOOK_PATHS=()
 PLAN_HOOK_PHASES=()
 PLAN_HOOK_SCOPES=()
+PLAN_HOOK_DIRECTORIES=()
 PLAN_CONTEXT_UUID=""
 PLAN_CONTEXT_DEVICE=""
 PLAN_CONTEXT_DEADLINE=""
@@ -583,53 +584,72 @@ plan_reset() {
   PLAN_HOOK_PATHS=()
   PLAN_HOOK_PHASES=()
   PLAN_HOOK_SCOPES=()
+  PLAN_HOOK_DIRECTORIES=()
   PLAN_TARGET_TEXT=""
   PLAN_REQUEST_TEXT=""
+}
+
+plan_append_internal() { # operation_id text hook_path phase scope directory
+  PLAN_OPERATION_IDS+=("$1")
+  PLAN_OPERATION_TEXT+=("$2")
+  PLAN_HOOK_PATHS+=("$3")
+  PLAN_HOOK_PHASES+=("$4")
+  PLAN_HOOK_SCOPES+=("$5")
+  PLAN_HOOK_DIRECTORIES+=("$6")
+}
+
+validate_plan_hook_coordinates() { # phase scope
+  case "$1" in
+    pre-lock|post-lock|pre-unlock|post-unlock) ;;
+    *) die "unknown hook phase: $1" ;;
+  esac
+  case "$2" in
+    global|vault) ;;
+    *) die "unknown hook scope: $2" ;;
+  esac
 }
 
 plan_add() { # operation_id public_description
   local operation_id=$1 public_description=$2
 
+  [[ "$operation_id" != "hook" ]] \
+    || die "hook operations require plan_add_hook"
+  [[ "$operation_id" != "deferred_hook_discovery" ]] \
+    || die "deferred hook discovery requires plan_add_deferred_hook"
+
   case "$operation_id" in
     repair_verify_plaintext|repair_unlock_apfs|repair_mount|verify_mount_identity|\
-hooks_disabled|hook|deferred_hook_discovery|tm_exclude|\
+hooks_disabled|tm_exclude|\
 tm_delete_vault_snapshots|unmount_vault|stage_recovery|rotate_apfs_recovery|\
 keychain_update|\
 tle_encrypt|tle_verify_future|persist_locked_recovery|remove_plaintext|\
 tm_delete_data_snapshots|apfs_lock|verify_locked_postconditions|tle_decrypt|\
 verify_decrypted_hash|apfs_unlock|persist_plaintext|persist_unlocked_state|\
-verify_secure_target)
+verify_secure_target|verify_unlocked_target)
       ;;
     *)
       die "unknown plan operation ID: $operation_id"
       ;;
   esac
 
-  PLAN_OPERATION_IDS+=("$operation_id")
-  PLAN_OPERATION_TEXT+=("$public_description")
-  PLAN_HOOK_PATHS+=("")
-  PLAN_HOOK_PHASES+=("")
-  PLAN_HOOK_SCOPES+=("")
+  plan_append_internal "$operation_id" "$public_description" "" "" "" ""
 }
 
 plan_add_hook() { # phase scope path
-  local phase=$1 scope=$2 path=$3 index
+  local phase=$1 scope=$2 path=$3
 
-  case "$phase" in
-    pre-lock|post-lock|pre-unlock|post-unlock) ;;
-    *) die "unknown hook phase: $phase" ;;
-  esac
-  case "$scope" in
-    global|vault) ;;
-    *) die "unknown hook scope: $scope" ;;
-  esac
+  validate_plan_hook_coordinates "$phase" "$scope"
   [[ -n "$path" ]] || die "hook plan path is empty"
+  plan_append_internal hook "Run hook" "$path" "$phase" "$scope" ""
+}
 
-  plan_add hook "Run hook"
-  index=$((${#PLAN_OPERATION_IDS[@]} - 1))
-  PLAN_HOOK_PATHS[index]=$path
-  PLAN_HOOK_PHASES[index]=$phase
-  PLAN_HOOK_SCOPES[index]=$scope
+plan_add_deferred_hook() { # phase scope directory
+  local phase=$1 scope=$2 directory=$3
+
+  validate_plan_hook_coordinates "$phase" "$scope"
+  [[ -n "$directory" ]] || die "deferred hook directory is empty"
+  plan_append_internal deferred_hook_discovery "Deferred hook discovery" \
+    "" "$phase" "$scope" "$directory"
 }
 
 build_hook_argv() { # phase scope uuid device deadline epoch round locked
@@ -677,6 +697,15 @@ render_hook_plan_item() { # index
   printf '\n'
 }
 
+render_deferred_hook_plan_item() { # index
+  local index=$1 phase scope directory
+  phase=${PLAN_HOOK_PHASES[$index]}
+  scope=${PLAN_HOOK_SCOPES[$index]}
+  directory=${PLAN_HOOK_DIRECTORIES[$index]}
+  printf 'Defer %s %s hook discovery in %q until the expected vault is mounted and verified\n' \
+    "$phase" "$scope" "$directory"
+}
+
 render_confirmation_requirement() { # command
   local command=$1
 
@@ -703,11 +732,11 @@ render_plan() { # command
   printf 'Actions:\n'
   for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
     printf '  %d. ' "$((index + 1))"
-    if [[ "${PLAN_OPERATION_IDS[$index]}" == "hook" ]]; then
-      render_hook_plan_item "$index"
-    else
-      printf '%s\n' "${PLAN_OPERATION_TEXT[$index]}"
-    fi
+    case "${PLAN_OPERATION_IDS[$index]}" in
+      hook) render_hook_plan_item "$index" ;;
+      deferred_hook_discovery) render_deferred_hook_plan_item "$index" ;;
+      *) printf '%s\n' "${PLAN_OPERATION_TEXT[$index]}" ;;
+    esac
   done
   render_confirmation_requirement "$command"
 }
@@ -830,6 +859,7 @@ run_hook_directory() { # mode phase scope dir uuid device deadline epoch round l
     for ((index=0; index<${#DISCOVERED_HOOK_PATHS[@]}; index++)); do
     hook=${DISCOVERED_HOOK_PATHS[$index]}
     hook_scope=${DISCOVERED_HOOK_SCOPES[$index]}
+    [[ -f "$hook" && -x "$hook" ]] || continue
     if run_hook_file "$mode" "$phase" "$hook_scope" "$hook" "$uuid" "$device" \
         "$deadline" "$deadline_epoch" "$round" "$locked"; then
       continue
@@ -850,6 +880,8 @@ run_pre_lock_hooks() { # uuid device deadline epoch round locked
     discover_hooks_reset
     discover_hook_file "$legacy" global
     for ((index=0; index<${#DISCOVERED_HOOK_PATHS[@]}; index++)); do
+      [[ -f "${DISCOVERED_HOOK_PATHS[$index]}" \
+          && -x "${DISCOVERED_HOOK_PATHS[$index]}" ]] || continue
       run_hook_file pre pre-lock "${DISCOVERED_HOOK_SCOPES[$index]}" \
         "${DISCOVERED_HOOK_PATHS[$index]}" "$uuid" "$device" \
         "$deadline" "$epoch" "$round" "$locked" || return
@@ -987,10 +1019,8 @@ plan_discovered_hook_directory() { # phase scope directory
   done
 }
 
-plan_deferred_hook_directory() { # directory
-  local directory=$1
-  plan_add deferred_hook_discovery \
-    "Defer discovery of $directory until the expected vault is mounted and verified"
+plan_deferred_hook_directory() { # phase scope directory
+  plan_add_deferred_hook "$1" "$2" "$3"
 }
 
 require_plan_snapshot() {
@@ -1017,7 +1047,8 @@ plan_lock_hooks() {
     plan_discovered_hook_directory pre-lock vault \
       "$MOUNT_POINT/.vaultlock/hooks/pre-lock.d"
   else
-    plan_deferred_hook_directory "$MOUNT_POINT/.vaultlock/hooks/pre-lock.d"
+    plan_deferred_hook_directory pre-lock vault \
+      "$MOUNT_POINT/.vaultlock/hooks/pre-lock.d"
   fi
 }
 
@@ -1108,7 +1139,11 @@ build_lock_plan() {
   if [[ "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
     if [[ "$RUNTIME_ASSESSMENT" == "securely locked" ]]; then
       PLAN_TARGET_TEXT="already securely locked until $SNAPSHOT_DEADLINE"
-      PLAN_REQUEST_TEXT="Existing drand round: target $SNAPSHOT_ROUND, current $(current_round)"
+      PLAN_REQUEST_TEXT="$PLAN_REQUEST_TEXT"$'\n'\
+"Existing locked deadline preserved: $SNAPSHOT_DEADLINE, existing drand round $SNAPSHOT_ROUND"
+      if [[ "$OPTION_HOOKS" == "false" ]]; then
+        plan_add hooks_disabled "Hooks disabled by --no-hooks"
+      fi
       plan_add verify_secure_target \
         "Verify the existing locked state, recovery files, and APFS postconditions"
       return 0
@@ -1135,7 +1170,8 @@ plan_post_unlock_hooks() {
     plan_discovered_hook_directory post-unlock vault \
       "$MOUNT_POINT/.vaultlock/hooks/post-unlock.d"
   else
-    plan_deferred_hook_directory "$MOUNT_POINT/.vaultlock/hooks/post-unlock.d"
+    plan_deferred_hook_directory post-unlock vault \
+      "$MOUNT_POINT/.vaultlock/hooks/post-unlock.d"
   fi
   plan_discovered_hook_directory post-unlock global \
     "$STATE_DIR/hooks/post-unlock.d"
@@ -1173,6 +1209,8 @@ plan_unlocked_repair() {
       "Verify the existing plaintext recovery material against its stored hash for repair"
     plan_add repair_unlock_apfs \
       "Unlock the expected APFS volume with the verified existing recovery material for repair"
+    plan_add repair_mount \
+      "Mount the expected APFS volume at $MOUNT_POINT for repair"
     plan_add verify_mount_identity \
       "Verify the mounted UUID and device before continuing"
   elif [[ "$SNAPSHOT_APFS_LOCKED" == "false" \
@@ -1206,6 +1244,13 @@ build_unlock_plan() {
   fi
 
   plan_unlocked_repair
+  plan_add verify_unlocked_target \
+    "Verify the unlocked and mounted target state"
+  if [[ "$OPTION_HOOKS" == "false" ]]; then
+    plan_add hooks_disabled "Hooks disabled by --no-hooks"
+  else
+    plan_post_unlock_hooks
+  fi
 }
 
 run_dry_run_plan() { # command
@@ -1458,6 +1503,16 @@ case "${1:-}" in
       || die_usage "usage: vaultlock __plan_operation <operation_id>"
     plan_reset
     plan_add "$2" "test operation"
+    ;;
+  __plan_deferred)
+    [[ $# -eq 4 ]] \
+      || die_usage "usage: vaultlock __plan_deferred <phase> <scope> <directory>"
+    plan_reset
+    plan_add_deferred_hook "$2" "$3" "$4"
+    printf 'id=%s\nphase=%s\nscope=%s\ndirectory=%q\nrendered=' \
+      "${PLAN_OPERATION_IDS[0]}" "${PLAN_HOOK_PHASES[0]}" \
+      "${PLAN_HOOK_SCOPES[0]}" "${PLAN_HOOK_DIRECTORIES[0]}"
+    render_deferred_hook_plan_item 0
     ;;
   __deadline)
     now=${2:?usage: vaultlock __deadline <now_epoch> <expression>}

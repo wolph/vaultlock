@@ -291,6 +291,12 @@ check_line() { # description expected output
   fi
 }
 
+check_count() { # description expected needle output
+  local description=$1 expected=$2 needle=$3 output=$4 actual
+  actual=$(grep -Foc -- "$needle" <<< "$output" || true)
+  check "$description" "$expected" "$actual"
+}
+
 record_failure() { # description
   printf 'FAIL %s\n' "$1"
   fail=1
@@ -743,19 +749,78 @@ else
   record_failure "yes must bypass confirmation device"
 fi
 
-snapshot_tree() { # source destination
-  local source=$1 destination=$2
-  mkdir -p "$destination"
-  /bin/cp -R "$source/." "$destination"
+tree_manifest() { # root
+  local root=$1 path relative path_type mode target hash attribute attributes
+  local sort_key
+  local -i index insert_at
+  local LC_ALL=C
+  local -a paths
+
+  paths=()
+  while IFS= read -r -d '' path; do
+    paths+=("$path")
+  done < <(/usr/bin/find "$root" -print0)
+  for ((index=1; index<${#paths[@]}; index++)); do
+    sort_key=${paths[$index]}
+    insert_at=$((index - 1))
+    while (( insert_at >= 0 )) && [[ "${paths[$insert_at]}" > "$sort_key" ]]; do
+      paths[insert_at + 1]=${paths[$insert_at]}
+      insert_at=$((insert_at - 1))
+    done
+    paths[insert_at + 1]=$sort_key
+  done
+
+  for path in "${paths[@]}"; do
+    if [[ "$path" == "$root" ]]; then
+      relative=.
+    else
+      relative=${path#"$root"/}
+    fi
+    target=""
+    hash=""
+    if [[ -L "$path" ]]; then
+      path_type="symlink"
+      target=$(/usr/bin/readlink "$path")
+    elif [[ -f "$path" ]]; then
+      path_type="file"
+      hash=$(/usr/bin/shasum -a 256 "$path" | /usr/bin/cut -d' ' -f1)
+    elif [[ -d "$path" ]]; then
+      path_type="directory"
+    else
+      path_type="other"
+    fi
+    mode=$(/usr/bin/stat -f '%Lp' "$path")
+    attributes=""
+    while IFS= read -r attribute; do
+      [[ -n "$attribute" ]] || continue
+      attributes="$attributes$(printf '%q' "$attribute")="
+      attributes="$attributes$(/usr/bin/xattr -px "$attribute" "$path" \
+        | /usr/bin/tr -d '[:space:]');"
+    done < <(/usr/bin/xattr "$path" 2>/dev/null | LC_ALL=C /usr/bin/sort)
+    printf '%q|type=%s|mode=%s|target=%q|sha256=%s|xattrs=%s\n' \
+      "$relative" "$path_type" "$mode" "$target" "$hash" "$attributes"
+  done
 }
 
-check_tree_unchanged() { # description before after
-  local description=$1 before=$2 after=$3
-  if diff -ruN "$before" "$after" >/dev/null; then
+check_tree_unchanged() { # description before root
+  local description=$1 before=$2 root=$3 after
+  after=$(tree_manifest "$root")
+  if [[ "$after" == "$before" ]]; then
     printf 'ok   %s\n' "$description"
   else
     printf 'FAIL %s\n' "$description"
-    diff -ruN "$before" "$after" || true
+    printf 'before:\n%s\nafter:\n%s\n' "$before" "$after"
+    fail=1
+  fi
+}
+
+check_manifest_changed() { # description before root
+  local description=$1 before=$2 root=$3 after
+  after=$(tree_manifest "$root")
+  if [[ "$after" != "$before" ]]; then
+    printf 'ok   %s\n' "$description"
+  else
+    printf 'FAIL %s: manifest did not change\n' "$description"
     fail=1
   fi
 }
@@ -774,15 +839,27 @@ fake_passphrase='FAKE-PASSPHRASE-DO-NOT-PRINT'
 fake_hash='FAKE-HASH-DO-NOT-PRINT'
 fake_ciphertext='FAKE-CIPHERTEXT-DO-NOT-PRINT'
 
+manifest_probe="$test_root/manifest-probe"
+mkdir -p "$manifest_probe/empty"
+: > "$manifest_probe/file"
+ln -s file "$manifest_probe/link"
+chmod 600 "$manifest_probe/file"
+manifest_before=$(tree_manifest "$manifest_probe")
+chmod 640 "$manifest_probe/file"
+check_manifest_changed "tree manifest detects chmod" \
+  "$manifest_before" "$manifest_probe"
+manifest_before=$(tree_manifest "$manifest_probe")
+mkdir "$manifest_probe/new-empty"
+check_manifest_changed "tree manifest detects empty directory creation" \
+  "$manifest_before" "$manifest_probe"
+
 write_json_state false null null null UUID-123
 write_apfs_state true false UUID-123 disk9s1
 printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
 printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
 printf '%s\n' "$fake_ciphertext" > "$state_dir/passphrase.tle"
-lock_state_before="$test_root/lock-state-before"
-lock_apfs_before="$test_root/lock-apfs-before"
-snapshot_tree "$state_dir" "$lock_state_before"
-snapshot_tree "$apfs_state" "$lock_apfs_before"
+lock_state_before=$(tree_manifest "$state_dir")
+lock_apfs_before=$(tree_manifest "$apfs_state")
 : > "$action_log"
 : > "$mutation_log"
 : > "$hook_log"
@@ -837,6 +914,10 @@ check_tree_unchanged "lock dry-run leaves APFS fixture unchanged" \
 check_secret_absent "lock dry-run hides passphrase" "$lock_plan" "$fake_passphrase"
 check_secret_absent "lock dry-run hides hash" "$lock_plan" "$fake_hash"
 check_secret_absent "lock dry-run hides ciphertext" "$lock_plan" "$fake_ciphertext"
+lock_hook_plan=$(run_vaultlock lock --dry-run 2:00 +2d)
+check_contains "lock dry-run types deferred pre-lock hook metadata" \
+  "Defer pre-lock vault hook discovery in $(printf '%q' "$mount_point/.vaultlock/hooks/pre-lock.d") until the expected vault is mounted and verified" \
+  "$lock_hook_plan"
 
 write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
 write_apfs_state true false UUID-123 disk9s1
@@ -848,10 +929,8 @@ cp "$TEST_SELF" "$state_dir/hooks/pre-unlock.d/10-pre hook"
 cp "$TEST_SELF" "$state_dir/hooks/post-unlock.d/20-post hook"
 chmod +x "$state_dir/hooks/pre-unlock.d/10-pre hook" \
   "$state_dir/hooks/post-unlock.d/20-post hook"
-unlock_state_before="$test_root/unlock-state-before"
-unlock_apfs_before="$test_root/unlock-apfs-before"
-snapshot_tree "$state_dir" "$unlock_state_before"
-snapshot_tree "$apfs_state" "$unlock_apfs_before"
+unlock_state_before=$(tree_manifest "$state_dir")
+unlock_apfs_before=$(tree_manifest "$apfs_state")
 : > "$action_log"
 : > "$mutation_log"
 : > "$hook_log"
@@ -866,7 +945,8 @@ check_line "unlock dry-run names target" \
 check_contains "unlock dry-run lists pre-unlock hook" \
   "10-pre\\ hook --phase pre-unlock --scope global" "$unlock_plan"
 check_contains "unlock dry-run defers unavailable local hooks" \
-  "Defer discovery of $mount_point/.vaultlock/hooks/post-unlock.d until the expected vault is mounted and verified" "$unlock_plan"
+  "Defer post-unlock vault hook discovery in $(printf '%q' "$mount_point/.vaultlock/hooks/post-unlock.d") until the expected vault is mounted and verified" \
+  "$unlock_plan"
 check_contains "unlock dry-run lists global post hook after deferred item" \
   "20-post\\ hook --phase post-unlock --scope global" "$unlock_plan"
 unlock_order=$(printf '%s\n' "$unlock_plan" \
@@ -886,7 +966,7 @@ expected_unlock_order=$(cat <<EOF
   6. Write the verified plaintext recovery file durably
   7. Update the keychain with the verified recovery material
   8. Durably record the unlocked state
-  9. Defer discovery of $mount_point/.vaultlock/hooks/post-unlock.d until the expected vault is mounted and verified
+  9. Defer post-unlock vault hook discovery in $(printf '%q' "$mount_point/.vaultlock/hooks/post-unlock.d") until the expected vault is mounted and verified
   10. Run hook $quoted_post_hook --phase post-unlock --scope global --volume vault --mount-point $quoted_mount_point --volume-uuid UUID-123 --device disk9s1 --state-dir $quoted_state_dir --state-file $quoted_state_file --deadline 2099-01-02T03:04:00+0100 --deadline-epoch 4070999040 --round 792731235 --locked false
 EOF
 )
@@ -905,5 +985,93 @@ check_tree_unchanged "unlock dry-run leaves APFS fixture unchanged" \
 check_secret_absent "unlock dry-run hides hash" "$unlock_plan" "$fake_hash"
 check_secret_absent "unlock dry-run hides ciphertext" "$unlock_plan" "$fake_ciphertext"
 check_secret_absent "unlock dry-run hides passphrase" "$unlock_plan" "$fake_passphrase"
+
+write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+rm -f "$apfs_state/mount_point" "$state_dir/passphrase.txt"
+printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
+printf '%s\n' "$fake_ciphertext" > "$state_dir/passphrase.tle"
+secure_lock_plan=$(run_vaultlock lock --dry-run --no-hooks 1h)
+check_count "secure lock dry-run disables hooks exactly once" 1 \
+  'Hooks disabled by --no-hooks' "$secure_lock_plan"
+check_contains "secure lock retains requested deadline" \
+  'Requested deadline: ' "$secure_lock_plan"
+check_contains "secure lock retains requested round" \
+  'Resolved drand round: target ' "$secure_lock_plan"
+check_contains "secure lock preserves existing deadline" \
+  'Existing locked deadline preserved: 2099-01-02T03:04:00+0100' \
+  "$secure_lock_plan"
+check_contains "secure lock preserves existing round" \
+  'existing drand round 792731235' "$secure_lock_plan"
+
+write_json_state false null null null UUID-123
+write_apfs_state true false UUID-123 disk9s1
+printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
+printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
+rm -f "$state_dir/passphrase.tle" "$apfs_state/mount_point"
+repair_unlock_plan=$(run_vaultlock unlock --dry-run)
+repair_unlock_order=$(printf '%s\n' "$repair_unlock_plan" \
+  | grep -E 'Verify the existing plaintext|Unlock the expected APFS|Mount the expected APFS|Verify the mounted UUID|Verify the unlocked and mounted|Defer post-unlock|post-unlock.d/20-post' \
+  || true)
+quoted_post_hook=$(printf '%q' "$state_dir/hooks/post-unlock.d/20-post hook")
+expected_repair_unlock_order=$(cat <<EOF
+  1. Verify the existing plaintext recovery material against its stored hash for repair
+  2. Unlock the expected APFS volume with the verified existing recovery material for repair
+  3. Mount the expected APFS volume at $mount_point for repair
+  4. Verify the mounted UUID and device before continuing
+  5. Verify the unlocked and mounted target state
+  6. Defer post-unlock vault hook discovery in $(printf '%q' "$mount_point/.vaultlock/hooks/post-unlock.d") until the expected vault is mounted and verified
+  7. Run hook $quoted_post_hook --phase post-unlock --scope global --volume vault --mount-point $quoted_mount_point --volume-uuid UUID-123 --device disk9s1 --state-dir $quoted_state_dir --state-file $quoted_state_file --deadline null --deadline-epoch null --round null --locked false
+EOF
+)
+check "recorded-unlocked repair plans target and post hooks in order" \
+  "$expected_repair_unlock_order" "$repair_unlock_order"
+
+repair_unlock_no_hooks=$(run_vaultlock unlock --dry-run --no-hooks)
+check_count "recorded-unlocked repair disables hooks exactly once" 1 \
+  'Hooks disabled by --no-hooks' "$repair_unlock_no_hooks"
+repair_no_hooks_order=$(printf '%s\n' "$repair_unlock_no_hooks" \
+  | grep -E 'Verify the existing plaintext|Unlock the expected APFS|Mount the expected APFS|Verify the mounted UUID|Verify the unlocked and mounted|Hooks disabled' \
+  || true)
+expected_repair_no_hooks_order=$(cat <<EOF
+  1. Verify the existing plaintext recovery material against its stored hash for repair
+  2. Unlock the expected APFS volume with the verified existing recovery material for repair
+  3. Mount the expected APFS volume at $mount_point for repair
+  4. Verify the mounted UUID and device before continuing
+  5. Verify the unlocked and mounted target state
+  6. Hooks disabled by --no-hooks
+EOF
+)
+check "recorded-unlocked repair plans disabled hooks after target" \
+  "$expected_repair_no_hooks_order" "$repair_no_hooks_order"
+
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
+rm -f "$state_dir/passphrase.sha256" "$state_dir/passphrase.tle"
+usable_unlock_plan=$(run_vaultlock unlock --dry-run --no-hooks)
+check_count "usable unlock dry-run disables hooks exactly once" 1 \
+  'Hooks disabled by --no-hooks' "$usable_unlock_plan"
+check_contains "usable unlock verifies target" \
+  'Verify the unlocked and mounted target state' "$usable_unlock_plan"
+
+write_json_state false null null null UUID-123
+write_apfs_state false false UUID-123 disk9s1
+printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
+rm -f "$state_dir/passphrase.sha256" "$state_dir/passphrase.tle"
+unmounted_unlock_plan=$(run_vaultlock unlock --dry-run --no-hooks)
+check_count "unmounted unlock repair disables hooks exactly once" 1 \
+  'Hooks disabled by --no-hooks' "$unmounted_unlock_plan"
+check_contains "unmounted unlock repair verifies target" \
+  'Verify the unlocked and mounted target state' "$unmounted_unlock_plan"
+
+write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+rm -f "$apfs_state/mount_point" "$state_dir/passphrase.txt"
+printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
+printf '%s\n' "$fake_ciphertext" > "$state_dir/passphrase.tle"
+locked_unlock_no_hooks=$(run_vaultlock unlock --dry-run --no-hooks)
+check_count "recorded-locked unlock disables hooks exactly once" 1 \
+  'Hooks disabled by --no-hooks' "$locked_unlock_no_hooks"
 
 exit "$fail"

@@ -27,6 +27,9 @@ if [[ "${VAULTLOCK_HOOK_FIXTURE:-0}" == "1" ]]; then
     printf '|<%s>' "$fixture_arg" >> "$VAULTLOCK_TEST_LOG"
   done
   printf '\n' >> "$VAULTLOCK_TEST_LOG"
+  if [[ "$fixture_name" == "10-disable-next" ]]; then
+    chmod -x "$(dirname "$0")/20-disabled"
+  fi
   [[ "$fixture_name" != *fail* ]] || exit 7
   exit 0
 fi
@@ -286,6 +289,17 @@ run_hooks "$post_state" "$post_mount" post-lock UUID-123 disk9s1 \
 check "post-lock is global only" "10-global" "$(cut -d'|' -f1 "$hook_log")"
 check_contains "post-lock receives locked state" '|<--locked>|<true>' "$(cat "$hook_log")"
 
+race_state="$hook_test_root/race state"
+race_mount="$hook_test_root/race mount"
+mkdir -p "$race_state" "$race_mount"
+install_hook "$race_state/hooks/post-lock.d/10-disable-next"
+install_hook "$race_state/hooks/post-lock.d/20-disabled"
+: > "$hook_log"
+run_hooks "$race_state" "$race_mount" post-lock UUID-123 disk9s1 \
+  2026-08-31T02:00:00+0200 1788134400 314159 true >/dev/null
+check "hook disabled after discovery is skipped" \
+  "10-disable-next" "$(cut -d'|' -f1 "$hook_log")"
+
 install_hook "$post_state/hooks/pre-unlock.d/10-global"
 install_hook "$post_mount/.vaultlock/hooks/pre-unlock.d/10-local-never"
 : > "$hook_log"
@@ -462,6 +476,37 @@ elif [[ "$output" == "vaultlock: unknown plan operation ID: definitely-unknown" 
   printf 'ok   plan rejects unknown operation ID\n'
 else
   printf 'FAIL plan rejects unknown operation ID: got [%s]\n' "$output"
+  fail=1
+fi
+
+if output=$("$VL" __plan_operation hook 2>&1); then
+  printf 'FAIL generic plan append rejects hook ID: command succeeded\n'
+  fail=1
+elif [[ "$output" == "vaultlock: hook operations require plan_add_hook" ]]; then
+  printf 'ok   generic plan append rejects hook ID\n'
+else
+  printf 'FAIL generic plan append rejects hook ID: got [%s]\n' "$output"
+  fail=1
+fi
+
+deferred_path=$'/Volumes/vault/hooks\nFORGED PLAN LINE'
+quoted_deferred_path=$(printf '%q' "$deferred_path")
+if deferred_output=$("$VL" __plan_deferred post-unlock vault "$deferred_path" 2>&1); then
+  check_contains "deferred metadata records operation ID" \
+    'id=deferred_hook_discovery' "$deferred_output"
+  check_contains "deferred metadata records phase" \
+    'phase=post-unlock' "$deferred_output"
+  check_contains "deferred metadata records scope" \
+    'scope=vault' "$deferred_output"
+  check_contains "deferred metadata quotes directory" \
+    "directory=$quoted_deferred_path" "$deferred_output"
+  check_contains "deferred rendering quotes directory" \
+    "Defer post-unlock vault hook discovery in $quoted_deferred_path until" \
+    "$deferred_output"
+  check "deferred control character cannot forge a line" 0 \
+    "$(grep -Fxc 'FORGED PLAN LINE' <<< "$deferred_output" || true)"
+else
+  printf 'FAIL typed deferred metadata helper: got [%s]\n' "$deferred_output"
   fail=1
 fi
 
