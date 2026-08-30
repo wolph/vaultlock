@@ -109,8 +109,12 @@ confirm_plan() {
   [[ "$OPTION_YES" == "false" ]] || return 0
   [[ -r "$CONFIRM_DEVICE" && -w "$CONFIRM_DEVICE" ]] \
     || die "confirmation requires a terminal, rerun with --yes"
-  printf 'Proceed? [y/N] ' >"$CONFIRM_DEVICE"
-  IFS= read -r response <"$CONFIRM_DEVICE" || response=""
+  if ! { exec 9<>"$CONFIRM_DEVICE"; } 2>/dev/null; then
+    die "confirmation requires a terminal, rerun with --yes"
+  fi
+  printf 'Proceed? [y/N] ' >&9
+  IFS= read -r response <&9 || response=""
+  exec 9>&-
   confirmation_accepts "$response" || die "cancelled, no changes made"
 }
 

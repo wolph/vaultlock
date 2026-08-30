@@ -237,6 +237,18 @@ run_vaultlock() {
     /bin/bash "$VL" "$@"
 }
 
+run_detached() {
+  /usr/bin/perl -MPOSIX=setsid -e '
+    defined(my $pid = fork) or die "fork failed: $!\n";
+    if ($pid) {
+      waitpid($pid, 0);
+      exit($? >> 8);
+    }
+    setsid() >= 0 or die "setsid failed: $!\n";
+    exec @ARGV or die "exec failed: $!\n";
+  ' "$@"
+}
+
 reject_options() { # description command argv
   local description=$1 command=$2 status
   shift 2
@@ -359,6 +371,17 @@ if HOME="$test_home" PATH="$fake_bin" \
 else
   check_contains "non-interactive confirmation hint" "rerun with --yes" \
     "$(< "$test_root/confirm-error")"
+fi
+
+if (
+    unset VAULTLOCK_CONFIRM_DEVICE
+    PATH="$fake_bin" run_detached \
+      /bin/bash "$VL" __confirm_plan false false
+  ) >"$test_root/detached-output" 2>"$test_root/detached-error"; then
+  record_failure "detached confirmation without a terminal must fail"
+else
+  check_contains "detached confirmation hint" "rerun with --yes" \
+    "$(< "$test_root/detached-error")"
 fi
 
 if HOME="$test_home" PATH="$fake_bin" \
