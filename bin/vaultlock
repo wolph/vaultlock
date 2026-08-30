@@ -698,8 +698,9 @@ private_path_acl_is_absent() { # path
   [[ "$listing" != *$'\n'* ]]
 }
 
-private_directory_is_valid() { # path identity mode
+private_directory_is_valid() { # path identity mode [link_count]
   local path=$1 expected_identity=$2 expected_mode=$3 metadata
+  local expected_links=${4:-}
   local device inode mode owner link_count
   [[ -d "$path" && ! -L "$path" ]] || return 1
   metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- "$path" 2>/dev/null) \
@@ -707,8 +708,17 @@ private_directory_is_valid() { # path identity mode
   IFS=: read -r device inode mode owner link_count <<< "$metadata"
   [[ "$device:$inode" == "$expected_identity" \
       && "$mode" == "$expected_mode" && "$owner" == "$UID" \
-      && "$link_count" =~ ^[1-9][0-9]*$ ]] || return 1
+      && "$link_count" =~ ^[1-9][0-9]*$ \
+      && ( -z "$expected_links" || "$link_count" == "$expected_links" ) ]] \
+    || return 1
   private_path_acl_is_absent "$path"
+}
+
+private_directory_is_empty() { # path
+  local path=$1 entry
+  entry=$("$BSD_FIND" -P "$path" -mindepth 1 -maxdepth 1 -print -quit \
+    2>/dev/null) || return 1
+  [[ -z "$entry" ]]
 }
 
 private_file_is_valid() { # path identity mode link_count
@@ -2925,6 +2935,40 @@ build_hardlink_map() { # root expected_device map identities...
   private_file_is_valid "$map" "$map_identity" 600 1
 }
 
+hardlink_metadata_set_is_valid() { # workspace identity links map identities...
+  local workspace=$1 workspace_identity=$2 workspace_links=$3 map=$4
+  local map_identity=$5 raw_identity=$6 sorted_identity=$7
+  local grouped_identity=$8 workspace_device=${workspace_identity%%:*}
+  private_directory_is_valid "$workspace" "$workspace_identity" 700 \
+    "$workspace_links" \
+    && [[ "${map_identity%%:*}" == "$workspace_device" \
+      && "${raw_identity%%:*}" == "$workspace_device" \
+      && "${sorted_identity%%:*}" == "$workspace_device" \
+      && "${grouped_identity%%:*}" == "$workspace_device" ]] \
+    && private_file_is_valid "$map" "$map_identity" 600 1 \
+    && private_file_is_valid "$map.raw" "$raw_identity" 600 1 \
+    && private_file_is_valid "$map.sorted" "$sorted_identity" 600 1 \
+    && private_file_is_valid "$map.grouped" "$grouped_identity" 600 1
+}
+
+create_hardlink_metadata_file() { # workspace identity links path
+  local workspace=$1 workspace_identity=$2 workspace_links=$3 path=$4
+  local identity workspace_device=${workspace_identity%%:*}
+  local links_after=$((workspace_links + 1))
+  private_directory_is_valid "$workspace" "$workspace_identity" 700 \
+    "$workspace_links" || return 1
+  [[ ! -e "$path" && ! -L "$path" ]] || return 1
+  (umask 077; : > "$path") || return 1
+  identity=$(operation_path_identity "$path") || return 1
+  [[ "${identity%%:*}" == "$workspace_device" ]] || return 1
+  "$CHMOD_COMMAND" -N "$path" || return 1
+  "$CHMOD_COMMAND" 600 "$path" || return 1
+  private_directory_is_valid "$workspace" "$workspace_identity" 700 \
+    "$links_after" || return 1
+  private_file_is_valid "$path" "$identity" 600 1 || return 1
+  printf '%s\n' "$identity"
+}
+
 tree_manifest_stream_with_map() { # root expected_device map map_identity
   local root=$1 expected_device=$2 hardlink_map=$3 map_identity=$4
   local path relative type
@@ -3015,63 +3059,138 @@ remove_verified_private_file() { # path identity
     && [[ ! -e "$path" && ! -L "$path" ]]
 }
 
-remove_verified_hardlink_metadata() { # path identity
-  local path=$1 identity=$2
-  if ! remove_verified_private_file "$path" "$identity"; then
-    printf 'vaultlock: hard-link metadata retained at %s\n' "$path" >&2
-    return 1
+remove_verified_hardlink_metadata() { # workspace identity links path file_identity
+  local workspace=$1 workspace_identity=$2 workspace_links=$3 path=$4
+  local identity=$5 workspace_device=${workspace_identity%%:*}
+  local links_after=$((workspace_links - 1))
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    return 0
   fi
+  [[ -n "$workspace_identity" && -n "$workspace_links" && -n "$identity" \
+      && "${identity%%:*}" == "$workspace_device" ]] \
+    && private_directory_is_valid "$workspace" "$workspace_identity" 700 \
+      "$workspace_links" \
+    && remove_verified_private_file "$path" "$identity" \
+    && private_directory_is_valid "$workspace" "$workspace_identity" 700 \
+      "$links_after" \
+    && return 0
+  printf 'vaultlock: hard-link metadata retained at %s\n' "$path" >&2
+  return 1
 }
 
-remove_verified_hardlink_metadata_set() { # map identities...
-  local map=$1 map_identity=$2 raw_identity=$3 sorted_identity=$4
-  local grouped_identity=$5 status=0
-  remove_verified_hardlink_metadata "$map" "$map_identity" || status=1
-  remove_verified_hardlink_metadata "$map.raw" "$raw_identity" || status=1
-  remove_verified_hardlink_metadata "$map.sorted" "$sorted_identity" \
-    || status=1
-  remove_verified_hardlink_metadata "$map.grouped" "$grouped_identity" \
-    || status=1
+remove_verified_hardlink_metadata_set() { # workspace identities map identities...
+  local workspace=$1 workspace_identity=$2 workspace_links=$3 map=$4
+  local map_identity=$5 raw_identity=$6 sorted_identity=$7
+  local grouped_identity=$8 status=0
+  if [[ -e "$map" || -L "$map" ]]; then
+    if remove_verified_hardlink_metadata "$workspace" "$workspace_identity" \
+        "$workspace_links" "$map" "$map_identity"; then
+      workspace_links=$((workspace_links - 1))
+    else
+      status=1
+    fi
+  fi
+  if [[ -e "$map.raw" || -L "$map.raw" ]]; then
+    if remove_verified_hardlink_metadata "$workspace" "$workspace_identity" \
+        "$workspace_links" "$map.raw" "$raw_identity"; then
+      workspace_links=$((workspace_links - 1))
+    else
+      status=1
+    fi
+  fi
+  if [[ -e "$map.sorted" || -L "$map.sorted" ]]; then
+    if remove_verified_hardlink_metadata "$workspace" "$workspace_identity" \
+        "$workspace_links" "$map.sorted" "$sorted_identity"; then
+      workspace_links=$((workspace_links - 1))
+    else
+      status=1
+    fi
+  fi
+  if [[ -e "$map.grouped" || -L "$map.grouped" ]]; then
+    if remove_verified_hardlink_metadata "$workspace" "$workspace_identity" \
+        "$workspace_links" "$map.grouped" "$grouped_identity"; then
+      workspace_links=$((workspace_links - 1))
+    else
+      status=1
+    fi
+  fi
+  remove_verified_hardlink_workspace "$workspace" "$workspace_identity" \
+    "$workspace_links" || status=1
   return "$status"
 }
 
+remove_verified_hardlink_workspace() { # workspace identity links
+  local workspace=$1 identity=$2 links=$3
+  if [[ ! -e "$workspace" && ! -L "$workspace" ]]; then
+    return 0
+  fi
+  [[ -n "$identity" && -n "$links" ]] \
+    && private_directory_is_valid "$workspace" "$identity" 700 "$links" \
+    && private_directory_is_empty "$workspace" \
+    && "$RMDIR_COMMAND" -- "$workspace" \
+    && [[ ! -e "$workspace" && ! -L "$workspace" ]] \
+    && return 0
+  printf 'vaultlock: hard-link metadata workspace retained at %s\n' \
+    "$workspace" >&2
+  return 1
+}
+
 tree_manifest_stream() { # root expected_device
-  local root=$1 expected_device=$2 hardlink_map status=1
+  local root=$1 expected_device=$2 workspace hardlink_map status=1
+  local workspace_identity="" workspace_links="" workspace_metadata
+  local workspace_device workspace_inode workspace_mode workspace_owner
   local map_identity="" raw_identity="" sorted_identity=""
   local grouped_identity=""
-  hardlink_map=$("$MKTEMP_COMMAND" \
+  workspace=$("$MKTEMP_COMMAND" -d \
     "${TMPDIR:-/tmp}/vaultlock-hardlinks.XXXXXX") || return 1
-  if map_identity=$(operation_path_identity "$hardlink_map") \
-      && "$CHMOD_COMMAND" -N "$hardlink_map" \
-      && "$CHMOD_COMMAND" 600 "$hardlink_map" \
-      && private_file_is_valid "$hardlink_map" "$map_identity" 600 1 \
-      && : > "$hardlink_map.raw" \
-      && raw_identity=$(operation_path_identity "$hardlink_map.raw") \
-      && "$CHMOD_COMMAND" -N "$hardlink_map.raw" \
-      && "$CHMOD_COMMAND" 600 "$hardlink_map.raw" \
-      && private_file_is_valid "$hardlink_map.raw" "$raw_identity" 600 1 \
-      && : > "$hardlink_map.sorted" \
-      && sorted_identity=$(operation_path_identity "$hardlink_map.sorted") \
-      && "$CHMOD_COMMAND" -N "$hardlink_map.sorted" \
-      && "$CHMOD_COMMAND" 600 "$hardlink_map.sorted" \
-      && private_file_is_valid "$hardlink_map.sorted" \
-        "$sorted_identity" 600 1 \
-      && : > "$hardlink_map.grouped" \
-      && grouped_identity=$(operation_path_identity "$hardlink_map.grouped") \
-      && "$CHMOD_COMMAND" -N "$hardlink_map.grouped" \
-      && "$CHMOD_COMMAND" 600 "$hardlink_map.grouped" \
-      && private_file_is_valid "$hardlink_map.grouped" \
-        "$grouped_identity" 600 1; then
+  hardlink_map=$workspace/map
+  if workspace_identity=$(operation_path_identity "$workspace") \
+      && "$CHMOD_COMMAND" -N "$workspace" \
+      && "$CHMOD_COMMAND" 700 "$workspace" \
+      && workspace_metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- \
+        "$workspace" 2>/dev/null) \
+      && IFS=: read -r workspace_device workspace_inode workspace_mode \
+        workspace_owner workspace_links <<< "$workspace_metadata" \
+      && [[ "$workspace_device:$workspace_inode" == "$workspace_identity" \
+        && "$workspace_mode" == 700 && "$workspace_owner" == "$UID" \
+        && "$workspace_links" =~ ^[1-9][0-9]*$ ]] \
+      && private_directory_is_valid "$workspace" "$workspace_identity" 700 \
+        "$workspace_links" \
+      && private_directory_is_empty "$workspace" \
+      && map_identity=$(create_hardlink_metadata_file "$workspace" \
+        "$workspace_identity" "$workspace_links" "$hardlink_map") \
+      && workspace_links=$((workspace_links + 1)) \
+      && raw_identity=$(create_hardlink_metadata_file "$workspace" \
+        "$workspace_identity" "$workspace_links" "$hardlink_map.raw") \
+      && workspace_links=$((workspace_links + 1)) \
+      && sorted_identity=$(create_hardlink_metadata_file "$workspace" \
+        "$workspace_identity" "$workspace_links" "$hardlink_map.sorted") \
+      && workspace_links=$((workspace_links + 1)) \
+      && grouped_identity=$(create_hardlink_metadata_file "$workspace" \
+        "$workspace_identity" "$workspace_links" "$hardlink_map.grouped") \
+      && workspace_links=$((workspace_links + 1)) \
+      && hardlink_metadata_set_is_valid "$workspace" "$workspace_identity" \
+        "$workspace_links" "$hardlink_map" "$map_identity" "$raw_identity" \
+        "$sorted_identity" "$grouped_identity"; then
     if build_hardlink_map "$root" "$expected_device" "$hardlink_map" \
         "$map_identity" "$raw_identity" "$sorted_identity" \
         "$grouped_identity" \
+        && hardlink_metadata_set_is_valid "$workspace" \
+          "$workspace_identity" "$workspace_links" "$hardlink_map" \
+          "$map_identity" "$raw_identity" "$sorted_identity" \
+          "$grouped_identity" \
         && tree_manifest_stream_with_map "$root" "$expected_device" \
-          "$hardlink_map" "$map_identity"; then
+          "$hardlink_map" "$map_identity" \
+        && hardlink_metadata_set_is_valid "$workspace" \
+          "$workspace_identity" "$workspace_links" "$hardlink_map" \
+          "$map_identity" "$raw_identity" "$sorted_identity" \
+          "$grouped_identity"; then
       status=0
     fi
   fi
-  remove_verified_hardlink_metadata_set "$hardlink_map" "$map_identity" \
-    "$raw_identity" "$sorted_identity" "$grouped_identity" || status=1
+  remove_verified_hardlink_metadata_set "$workspace" "$workspace_identity" \
+    "$workspace_links" "$hardlink_map" "$map_identity" "$raw_identity" \
+    "$sorted_identity" "$grouped_identity" || status=1
   return "$status"
 }
 

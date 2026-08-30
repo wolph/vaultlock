@@ -942,8 +942,7 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           "$VAULTLOCK_TEST_APFS_STATE/tamper_hardlink_metadata_acl")
         fixture_hardlink_match=false
         case "$fixture_hardlink_artifact:$fixture_chmod_path" in
-          map:*vaultlock-hardlinks.*.raw|map:*vaultlock-hardlinks.*.sorted|map:*vaultlock-hardlinks.*.grouped) ;;
-          map:*) fixture_hardlink_match=true ;;
+          map:*/vaultlock-hardlinks.*/map) fixture_hardlink_match=true ;;
           raw:*.raw|sorted:*.sorted|grouped:*.grouped)
             fixture_hardlink_match=true
             ;;
@@ -965,6 +964,22 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       ;;
   mktemp)
     fixture_mktemp_path=$(/usr/bin/mktemp "$@") || exit 1
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/preplace_hardlink_metadata_symlink" \
+        && "$fixture_mktemp_path" == */vaultlock-hardlinks.* ]]; then
+      fixture_hardlink_preplaced_kind=$(< \
+        "$VAULTLOCK_TEST_APFS_STATE/preplace_hardlink_metadata_symlink")
+      fixture_hardlink_preplaced_target=$(< \
+        "$VAULTLOCK_TEST_APFS_STATE/hardlink_metadata_symlink_target")
+      if [[ -d "$fixture_mktemp_path" ]]; then
+        fixture_hardlink_preplaced_path=$fixture_mktemp_path/$fixture_hardlink_preplaced_kind
+      else
+        fixture_hardlink_preplaced_path=$fixture_mktemp_path.$fixture_hardlink_preplaced_kind
+      fi
+      /bin/ln -s "$fixture_hardlink_preplaced_target" \
+        "$fixture_hardlink_preplaced_path" || exit 1
+      printf '%s\n' "$fixture_hardlink_preplaced_path" \
+        > "$VAULTLOCK_TEST_APFS_STATE/hardlink_metadata_preplaced_path"
+    fi
     if [[ -f "$VAULTLOCK_TEST_APFS_STATE/inherit_recovery_acl" \
       && "$fixture_mktemp_path" == "$VAULTLOCK_STATE_DIR/.passphrase."* ]]; then
       /bin/chmod +a 'everyone allow read' "$fixture_mktemp_path" || exit 1
@@ -2474,6 +2489,9 @@ reset_adopt_fixture() {
     "$apfs_state/inherit_adopt_quarantine_acl" \
     "$apfs_state/tamper_hardlink_metadata_acl" \
     "$apfs_state/tampered_hardlink_metadata_path" \
+    "$apfs_state/preplace_hardlink_metadata_symlink" \
+    "$apfs_state/hardlink_metadata_symlink_target" \
+    "$apfs_state/hardlink_metadata_preplaced_path" \
     "$apfs_state/tampered_current_snapshot_path" \
     "$apfs_state/count_directory_traversals" \
     "$apfs_state/directory_traversal_count" \
@@ -2713,8 +2731,11 @@ for hardlink_metadata_artifact in map raw sorted grouped; do
       [[ "$hardlink_metadata_acl_count" -ge 1 ]] \
         || record_failure \
           "adopt retains ACL-tampered $hardlink_metadata_artifact hardlink metadata"
+      hardlink_metadata_workspace=${hardlink_metadata_retained%/*}
       /bin/chmod -N "$hardlink_metadata_retained"
       /bin/rm -f -- "$hardlink_metadata_retained"
+      [[ "$hardlink_metadata_workspace" == */vaultlock-hardlinks.* ]] \
+        && /bin/rmdir "$hardlink_metadata_workspace" 2>/dev/null || true
     else
       record_failure \
         "adopt retains ACL-tampered $hardlink_metadata_artifact hardlink metadata"
@@ -2723,6 +2744,42 @@ for hardlink_metadata_artifact in map raw sorted grouped; do
     record_failure \
       "adopt retains ACL-tampered $hardlink_metadata_artifact hardlink metadata"
   fi
+done
+
+for hardlink_preplaced_artifact in raw sorted grouped; do
+  reset_adopt_fixture
+  hardlink_preplaced_source=$(new_adopt_source \
+    "hardlink-preplaced-$hardlink_preplaced_artifact")
+  hardlink_preplaced_victim=$test_root/hardlink-preplaced-victim-$hardlink_preplaced_artifact
+  printf 'victim content for %s\n' "$hardlink_preplaced_artifact" \
+    > "$hardlink_preplaced_victim"
+  /bin/chmod 640 "$hardlink_preplaced_victim"
+  hardlink_preplaced_content=$(< "$hardlink_preplaced_victim")
+  hardlink_preplaced_mode=$(/usr/bin/stat -f '%Lp' \
+    "$hardlink_preplaced_victim")
+  printf '%s\n' "$hardlink_preplaced_artifact" \
+    > "$apfs_state/preplace_hardlink_metadata_symlink"
+  printf '%s\n' "$hardlink_preplaced_victim" \
+    > "$apfs_state/hardlink_metadata_symlink_target"
+  expect_adopt_precopy_manifest_refusal \
+    "adopt rejects preplaced $hardlink_preplaced_artifact metadata symlink" \
+    - "$hardlink_preplaced_source"
+  check "preplaced $hardlink_preplaced_artifact symlink preserves victim content" \
+    "$hardlink_preplaced_content" "$(< "$hardlink_preplaced_victim")"
+  check "preplaced $hardlink_preplaced_artifact symlink preserves victim mode" \
+    "$hardlink_preplaced_mode" \
+    "$(/usr/bin/stat -f '%Lp' "$hardlink_preplaced_victim")"
+  if [[ -f "$apfs_state/hardlink_metadata_preplaced_path" ]]; then
+    hardlink_preplaced_path=$(< \
+      "$apfs_state/hardlink_metadata_preplaced_path")
+    if [[ -L "$hardlink_preplaced_path" ]]; then
+      hardlink_preplaced_parent=${hardlink_preplaced_path%/*}
+      /bin/rm -f -- "$hardlink_preplaced_path"
+      [[ "$hardlink_preplaced_parent" == */vaultlock-hardlinks.* ]] \
+        && /bin/rmdir "$hardlink_preplaced_parent" 2>/dev/null || true
+    fi
+  fi
+  /bin/rm -f -- "$hardlink_preplaced_victim"
 done
 
 reset_adopt_fixture
