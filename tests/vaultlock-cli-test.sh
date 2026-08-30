@@ -751,7 +751,7 @@ fi
 
 tree_manifest() { # root
   local root=$1 path relative path_type mode target hash attribute attributes
-  local sort_key
+  local sort_key stat_metadata acl
   local -i index insert_at
   local LC_ALL=C
   local -a paths
@@ -790,6 +790,9 @@ tree_manifest() { # root
       path_type="other"
     fi
     mode=$(/usr/bin/stat -f '%Lp' "$path")
+    stat_metadata=$(/usr/bin/stat -f \
+      'uid=%u|gid=%g|mtime=%m|flags=%Sf' "$path")
+    acl=$(/bin/ls -ldeb "$path" 2>/dev/null | /usr/bin/sed -n '2,$p')
     attributes=""
     while IFS= read -r attribute; do
       [[ -n "$attribute" ]] || continue
@@ -797,8 +800,9 @@ tree_manifest() { # root
       attributes="$attributes$(/usr/bin/xattr -px "$attribute" "$path" \
         | /usr/bin/tr -d '[:space:]');"
     done < <(/usr/bin/xattr "$path" 2>/dev/null | LC_ALL=C /usr/bin/sort)
-    printf '%q|type=%s|mode=%s|target=%q|sha256=%s|xattrs=%s\n' \
-      "$relative" "$path_type" "$mode" "$target" "$hash" "$attributes"
+    printf '%q|type=%s|mode=%s|%s|target=%q|sha256=%s|acl=%q|xattrs=%s\n' \
+      "$relative" "$path_type" "$mode" "$stat_metadata" "$target" \
+      "$hash" "$acl" "$attributes"
   done
 }
 
@@ -849,9 +853,20 @@ chmod 640 "$manifest_probe/file"
 check_manifest_changed "tree manifest detects chmod" \
   "$manifest_before" "$manifest_probe"
 manifest_before=$(tree_manifest "$manifest_probe")
+/usr/bin/touch -t 202001020304 "$manifest_probe/file"
+check_manifest_changed "tree manifest detects touch" \
+  "$manifest_before" "$manifest_probe"
+manifest_before=$(tree_manifest "$manifest_probe")
 mkdir "$manifest_probe/new-empty"
 check_manifest_changed "tree manifest detects empty directory creation" \
   "$manifest_before" "$manifest_probe"
+manifest_metadata=$(tree_manifest "$manifest_probe")
+check_contains "tree manifest records uid" '|uid=' "$manifest_metadata"
+check_contains "tree manifest records gid" '|gid=' "$manifest_metadata"
+check_contains "tree manifest records mtime" '|mtime=' "$manifest_metadata"
+check_contains "tree manifest records file flags" '|flags=' "$manifest_metadata"
+check_contains "tree manifest records ACL representation" \
+  '|acl=' "$manifest_metadata"
 
 write_json_state false null null null UUID-123
 write_apfs_state true false UUID-123 disk9s1
@@ -1050,20 +1065,30 @@ write_apfs_state false true UUID-123 disk9s1
 printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
 rm -f "$state_dir/passphrase.sha256" "$state_dir/passphrase.tle"
 usable_unlock_plan=$(run_vaultlock unlock --dry-run --no-hooks)
-check_count "usable unlock dry-run disables hooks exactly once" 1 \
+check_count "usable unlock no-hooks adds no disabled item without a hook phase" 0 \
   'Hooks disabled by --no-hooks' "$usable_unlock_plan"
 check_contains "usable unlock verifies target" \
   'Verify the unlocked and mounted target state' "$usable_unlock_plan"
+usable_unlock_hooks_plan=$(run_vaultlock unlock --dry-run)
+check_count "usable unlock plans no hook execution" 0 \
+  'Run hook ' "$usable_unlock_hooks_plan"
+check_count "usable unlock plans no deferred hook discovery" 0 \
+  'hook discovery' "$usable_unlock_hooks_plan"
 
 write_json_state false null null null UUID-123
 write_apfs_state false false UUID-123 disk9s1
 printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
 rm -f "$state_dir/passphrase.sha256" "$state_dir/passphrase.tle"
 unmounted_unlock_plan=$(run_vaultlock unlock --dry-run --no-hooks)
-check_count "unmounted unlock repair disables hooks exactly once" 1 \
+check_count "unmounted unlock no-hooks adds no disabled item without a hook phase" 0 \
   'Hooks disabled by --no-hooks' "$unmounted_unlock_plan"
 check_contains "unmounted unlock repair verifies target" \
   'Verify the unlocked and mounted target state' "$unmounted_unlock_plan"
+unmounted_unlock_hooks_plan=$(run_vaultlock unlock --dry-run)
+check_count "unmounted unlock repair plans no hook execution" 0 \
+  'Run hook ' "$unmounted_unlock_hooks_plan"
+check_count "unmounted unlock repair plans no deferred hook discovery" 0 \
+  'hook discovery' "$unmounted_unlock_hooks_plan"
 
 write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
 write_apfs_state true false UUID-123 disk9s1
