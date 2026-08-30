@@ -1065,7 +1065,7 @@ write_apfs_state false true UUID-123 disk9s1
 printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
 rm -f "$state_dir/passphrase.sha256" "$state_dir/passphrase.tle"
 usable_unlock_plan=$(run_vaultlock unlock --dry-run --no-hooks)
-check_count "usable unlock no-hooks adds no disabled item without a hook phase" 0 \
+check_count "usable unlock no-hooks reports disabled hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$usable_unlock_plan"
 check_contains "usable unlock verifies target" \
   'Verify the unlocked and mounted target state' "$usable_unlock_plan"
@@ -1080,7 +1080,7 @@ write_apfs_state false false UUID-123 disk9s1
 printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
 rm -f "$state_dir/passphrase.sha256" "$state_dir/passphrase.tle"
 unmounted_unlock_plan=$(run_vaultlock unlock --dry-run --no-hooks)
-check_count "unmounted unlock no-hooks adds no disabled item without a hook phase" 0 \
+check_count "unmounted unlock no-hooks reports disabled hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$unmounted_unlock_plan"
 check_contains "unmounted unlock repair verifies target" \
   'Verify the unlocked and mounted target state' "$unmounted_unlock_plan"

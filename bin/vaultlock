@@ -1246,12 +1246,10 @@ build_unlock_plan() {
   plan_unlocked_repair
   plan_add verify_unlocked_target \
     "Verify the unlocked and mounted target state"
-  if [[ "$SNAPSHOT_APFS_LOCKED" == "true" ]]; then
-    if [[ "$OPTION_HOOKS" == "false" ]]; then
-      plan_add hooks_disabled "Hooks disabled by --no-hooks"
-    else
-      plan_post_unlock_hooks
-    fi
+  if [[ "$OPTION_HOOKS" == "false" ]]; then
+    plan_add hooks_disabled "Hooks disabled by --no-hooks"
+  elif [[ "$SNAPSHOT_APFS_LOCKED" == "true" ]]; then
+    plan_post_unlock_hooks
   fi
 }
 
