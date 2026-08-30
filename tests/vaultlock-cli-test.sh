@@ -451,12 +451,16 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         /bin/kill -s "$fixture_ditto_signal" "$PPID"
         exit 0
       fi
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/hold_ditto" ]]; then
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/hold_ditto" \
+          && ! -f "$VAULTLOCK_TEST_APFS_STATE/held_ditto_pid" ]]; then
+        printf '%s\n' "$PPID" \
+          > "$VAULTLOCK_TEST_APFS_STATE/held_ditto_pid"
         : > "$VAULTLOCK_TEST_APFS_STATE/ditto_entered"
         while [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/release_ditto" ]]; do
           /bin/sleep 0.01
         done
-        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/hold_ditto"
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/hold_ditto" \
+          "$VAULTLOCK_TEST_APFS_STATE/held_ditto_pid"
       fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_ditto" ]]; then
         /bin/mkdir -p "$fixture_ditto_destination"
@@ -786,6 +790,15 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       exit 1
       fi
       /bin/ln "$@"
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_adopt_staged_link_creation" \
+          && "$fixture_ln_destination" == *.vaultlock-link ]]; then
+        fixture_creation_signal=$(< \
+          "$VAULTLOCK_TEST_APFS_STATE/signal_adopt_staged_link_creation")
+        /bin/rm -f \
+          "$VAULTLOCK_TEST_APFS_STATE/signal_adopt_staged_link_creation"
+        /bin/kill -s "$fixture_creation_signal" \
+          "$VAULTLOCK_TEST_PROCESS_PID"
+      fi
       if [[ "$fixture_ln_destination" == "$VAULTLOCK_STATE_DIR/state.json" ]]; then
         : > "$VAULTLOCK_TEST_APFS_STATE/state_link_installed"
       fi
@@ -811,6 +824,15 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         exit 1
       fi
       /bin/rm "$@" || exit 1
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_operation_owner_unlink" \
+          && "$fixture_rm_path" == "$HOME/.vaultlock-operation.lock/owner" ]]; then
+        fixture_release_signal=$(< \
+          "$VAULTLOCK_TEST_APFS_STATE/signal_operation_owner_unlink")
+        /bin/rm -f \
+          "$VAULTLOCK_TEST_APFS_STATE/signal_operation_owner_unlink"
+        /bin/kill -s "$fixture_release_signal" \
+          "$VAULTLOCK_TEST_PROCESS_PID"
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/modify_recovery_after_state" \
           && " $* " == *"/.state."* ]]; then
         printf 'post-state recovery modification\n' \
@@ -852,6 +874,15 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           "$VAULTLOCK_TEST_APFS_STATE/insert_directory_after_file_cleanup"
       fi
       /bin/rmdir "$@"
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_operation_directory_remove" \
+          && "$fixture_rmdir_path" == "$HOME/.vaultlock-operation.lock" ]]; then
+        fixture_release_signal=$(< \
+          "$VAULTLOCK_TEST_APFS_STATE/signal_operation_directory_remove")
+        /bin/rm -f \
+          "$VAULTLOCK_TEST_APFS_STATE/signal_operation_directory_remove"
+        /bin/kill -s "$fixture_release_signal" \
+          "$VAULTLOCK_TEST_PROCESS_PID"
+      fi
       ;;
     mkdir)
       /bin/mkdir "$@" || exit 1
@@ -863,6 +894,15 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           "$VAULTLOCK_TEST_APFS_STATE/signal_operation_lock_mkdir")
         /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/signal_operation_lock_mkdir"
         /bin/kill -s "$fixture_mkdir_signal" "$PPID"
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_adopt_reservation_creation" \
+          && "$fixture_mkdir_path" == *.vaultlock-backup ]]; then
+        fixture_creation_signal=$(< \
+          "$VAULTLOCK_TEST_APFS_STATE/signal_adopt_reservation_creation")
+        /bin/rm -f \
+          "$VAULTLOCK_TEST_APFS_STATE/signal_adopt_reservation_creation"
+        /bin/kill -s "$fixture_creation_signal" \
+          "$VAULTLOCK_TEST_PROCESS_PID"
       fi
       ;;
     chmod)
@@ -901,7 +941,16 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         && $# -eq 4 ]] || exit 64
       [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/ps_ambiguous" ]] || exit 2
       [[ "${2:-}" != "999999" ]] || exit 1
-      printf 'Sun Aug 30 10:00:00 2026\n'
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/ps_timezone_sensitive" ]]; then
+        case "${TZ:-}" in
+          UTC0) printf 'Sun Aug 30 10:00:00 2026\n' ;;
+          Pacific/Honolulu) printf 'Sat Aug 29 20:00:00 2026\n' ;;
+          Europe/Amsterdam) printf 'Sun Aug 30 12:00:00 2026\n' ;;
+          *) printf 'Sun Aug 30 10:00:00 2026\n' ;;
+        esac
+      else
+        printf 'Sun Aug 30 10:00:00 2026\n'
+      fi
       ;;
     openssl)
       [[ "$*" == "rand -hex 32" ]] || exit 64
@@ -940,6 +989,12 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         init_state_create)
           printf '{"introduced":"plan drift"}\n' \
             > "$VAULTLOCK_STATE_DIR/state.json"
+          ;;
+        adopt_state_dir_move_into_source)
+          /bin/mv "$VAULTLOCK_STATE_DIR" \
+            "$fixture_subject/.vaultlock"
+          /bin/ln -s "$fixture_subject/.vaultlock" \
+            "$VAULTLOCK_STATE_DIR"
           ;;
       owner_identity_swap)
         /bin/mv "$fixture_subject" "$fixture_subject.pre-transition"
@@ -1343,13 +1398,19 @@ reset_operation_lock_fixture() {
   /bin/rm -f "$apfs_state/token_generated" \
     "$apfs_state/token_generated_twice" \
     "$apfs_state/ps_ambiguous" \
+    "$apfs_state/ps_timezone_sensitive" \
     "$apfs_state/signal_ditto" \
     "$apfs_state/signal_operation_lock_mkdir" \
     "$apfs_state/signal_operation_owner_mktemp" \
+    "$apfs_state/signal_operation_owner_unlink" \
+    "$apfs_state/signal_operation_directory_remove" \
+    "$apfs_state/signal_adopt_staged_link_creation" \
+    "$apfs_state/signal_adopt_reservation_creation" \
     "$apfs_state/fail_operation_lock_identity_once" \
     "$apfs_state/fail_operation_lock_owner_install" \
     "$apfs_state/fail_operation_lock_release" \
     "$apfs_state/hold_ditto" \
+    "$apfs_state/held_ditto_pid" \
     "$apfs_state/ditto_entered" \
     "$apfs_state/release_ditto" \
     "$apfs_state"/transition_*
@@ -2362,6 +2423,8 @@ reset_adopt_fixture() {
     "$apfs_state/fail_rollback_move" "$apfs_state/fail_cleanup" \
     "$apfs_state/copy_complete" \
     "$apfs_state/signal_adopt_backup_manifest" \
+    "$apfs_state/signal_adopt_staged_link_creation" \
+    "$apfs_state/signal_adopt_reservation_creation" \
     "$apfs_state/gnu_path_tool_called"
   write_json_state false null null null UUID-INIT
   write_apfs_state false true UUID-INIT disk8s1
@@ -4197,6 +4260,170 @@ for adopt_signal_case in \
     "${adopt_transaction_source:?}.vaultlock-backup" \
     "${adopt_transaction_source:?}.vaultlock-link" \
     "${mount_point:?}/adopt-signal-$adopt_signal_name"
+done
+
+# Final review regressions: reserved paths, timezone identity, and signal gaps.
+reset_operation_lock_fixture
+reset_adopt_fixture
+/bin/ln -s "$test_home" "$test_root/home-alias"
+for reserved_adopt_case in \
+    "state-dir:$state_dir" \
+    "home-parent:$test_home" \
+    "canonical-alias:$test_root/home-alias/.vaultlock"; do
+  reserved_adopt_name=${reserved_adopt_case%%:*}
+  reserved_adopt_path=${reserved_adopt_case#*:}
+  if reserved_adopt_output=$(run_vaultlock adopt --dry-run \
+      "$reserved_adopt_path" 2>&1); then
+    record_failure "adopt rejects reserved $reserved_adopt_name source"
+  else
+    check_contains "adopt reserved $reserved_adopt_name reports cause" \
+      'contains reserved vaultlock control path' "$reserved_adopt_output"
+  fi
+done
+/bin/rm -f "$test_root/home-alias"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+reserved_drift_source=$(new_adopt_source adopt-reserved-post-lock-drift)
+: > "$apfs_state/fail_ditto"
+printf 'adopt_state_dir_move_into_source\n' \
+  > "$apfs_state/transition_plan_revalidation_before_inspection"
+if reserved_drift_output=$(run_vaultlock adopt --yes \
+    "$reserved_drift_source" 2>&1); then
+  record_failure "adopt rejects reserved relationship drift after operation lock"
+else
+  check_contains "adopt reserved relationship drift reports cause" \
+    'contains reserved vaultlock control path' "$reserved_drift_output"
+fi
+check_count "adopt reserved relationship drift reaches no copy" 0 \
+  'ditto ' "$mutation_log"
+if [[ -L "$state_dir" && -d "$reserved_drift_source/.vaultlock" ]]; then
+  /bin/rm -f "$state_dir"
+  /bin/mv "$reserved_drift_source/.vaultlock" "$state_dir"
+fi
+/bin/rm -rf -- "${reserved_drift_source:?}" \
+  "${mount_point:?}/adopt-reserved-post-lock-drift"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+timezone_owner_source=$(new_adopt_source adopt-timezone-owner)
+timezone_contender_source=$(new_adopt_source adopt-timezone-contender)
+: > "$apfs_state/ps_timezone_sensitive"
+: > "$apfs_state/hold_ditto"
+TZ=Pacific/Honolulu start_vaultlock_background \
+  "$test_root/timezone-owner-output" adopt --yes "$timezone_owner_source"
+timezone_owner_pid=$BACKGROUND_VAULTLOCK_PID
+if ! wait_for_fixture "$apfs_state/ditto_entered"; then
+  record_failure "timezone owner reaches held operation"
+fi
+if timezone_contender_output=$(TZ=Europe/Amsterdam run_vaultlock adopt --yes \
+    "$timezone_contender_source" 2>&1); then
+  record_failure "different-TZ contender respects live cooperative owner"
+else
+  check_contains "different-TZ contender reports live owner" \
+    'operation lock is held by live pid' "$timezone_contender_output"
+fi
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "different-TZ contender preserves live operation lock"
+: > "$apfs_state/release_ditto"
+if wait "$timezone_owner_pid"; then
+  :
+else
+  record_failure "timezone owner completes after release"
+fi
+/bin/rm -rf -- "${timezone_owner_source:?}" \
+  "${timezone_contender_source:?}" \
+  "${mount_point:?}/adopt-timezone-owner" \
+  "${mount_point:?}/adopt-timezone-contender"
+
+for deferral_boundary in begin end; do
+  for deferral_signal_case in HUP:129 INT:130 TERM:143; do
+    reset_operation_lock_fixture
+    reset_init_fixture
+    deferral_signal=${deferral_signal_case%%:*}
+    deferral_status=${deferral_signal_case##*:}
+    printf 'signal_%s\n' "$deferral_signal" \
+      > "$apfs_state/transition_operation_signal_deferral_${deferral_boundary}_window"
+    if deferral_output=$(run_vaultlock init --yes 2>&1); then
+      deferral_actual=0
+    else
+      deferral_actual=$?
+    fi
+    : "$deferral_output"
+    check "operation deferral $deferral_boundary preserves $deferral_signal status" \
+      "$deferral_status" "$deferral_actual"
+    [[ ! -e "$operation_lock_dir" && ! -L "$operation_lock_dir" ]] \
+      || record_failure \
+        "operation deferral $deferral_boundary cleans lock after $deferral_signal"
+  done
+done
+
+for preparation_signal_case in staged-link:HUP:129 reservation:TERM:143; do
+  reset_operation_lock_fixture
+  reset_adopt_fixture
+  preparation_name=${preparation_signal_case%%:*}
+  preparation_rest=${preparation_signal_case#*:}
+  preparation_signal=${preparation_rest%%:*}
+  preparation_status=${preparation_rest##*:}
+  preparation_source=$(new_adopt_source \
+    "adopt-preparation-$preparation_name")
+  if [[ "$preparation_name" == staged-link ]]; then
+    preparation_marker=signal_adopt_staged_link_creation
+  else
+    preparation_marker=signal_adopt_reservation_creation
+  fi
+  printf '%s\n' "$preparation_signal" \
+    > "$apfs_state/$preparation_marker"
+  if preparation_output=$(run_vaultlock adopt --yes \
+      "$preparation_source" 2>&1); then
+    preparation_actual=0
+  else
+    preparation_actual=$?
+  fi
+  check "adopt $preparation_name signal preserves $preparation_signal status" \
+    "$preparation_status" "$preparation_actual"
+  check_contains "adopt $preparation_name signal reports interruption" \
+    "adopt interrupted by $preparation_signal" "$preparation_output"
+  [[ -d "$preparation_source" && ! -L "$preparation_source" ]] \
+    || record_failure "adopt $preparation_name signal preserves source"
+  [[ ! -e "$preparation_source.vaultlock-link" \
+      && ! -L "$preparation_source.vaultlock-link" \
+      && ! -e "$preparation_source.vaultlock-backup" \
+      && ! -L "$preparation_source.vaultlock-backup" ]] \
+    || record_failure "adopt $preparation_name signal removes owned blockers"
+  [[ ! -e "$operation_lock_dir" && ! -L "$operation_lock_dir" ]] \
+    || record_failure "adopt $preparation_name signal releases operation lock"
+  /bin/rm -rf -- "${preparation_source:?}" \
+    "${preparation_source:?}.vaultlock-link" \
+    "${preparation_source:?}.vaultlock-backup" \
+    "${mount_point:?}/adopt-preparation-$preparation_name"
+done
+
+for release_boundary in owner-unlink directory-remove; do
+  for release_signal_case in HUP:129 INT:130 TERM:143; do
+    reset_operation_lock_fixture
+    reset_init_fixture
+    release_signal=${release_signal_case%%:*}
+    release_status=${release_signal_case##*:}
+    if [[ "$release_boundary" == owner-unlink ]]; then
+      release_marker=signal_operation_owner_unlink
+    else
+      release_marker=signal_operation_directory_remove
+    fi
+    printf '%s\n' "$release_signal" > "$apfs_state/$release_marker"
+    if release_output=$(run_vaultlock init --yes 2>&1); then
+      release_actual=0
+    else
+      release_actual=$?
+    fi
+    check "operation release $release_boundary preserves $release_signal status" \
+      "$release_status" "$release_actual"
+    check_contains "operation release $release_boundary reports $release_signal" \
+      "operation interrupted by $release_signal" "$release_output"
+    [[ ! -e "$operation_lock_dir" && ! -L "$operation_lock_dir" ]] \
+      || record_failure \
+        "operation release $release_boundary completes after $release_signal"
+  done
 done
 
 reset_operation_lock_fixture

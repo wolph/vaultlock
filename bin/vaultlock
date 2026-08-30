@@ -140,6 +140,11 @@ ADOPT_BACKUP_QUARANTINE_IDENTITY=""
 ADOPT_DIRECTORY_SKELETON=""
 ADOPT_DIRECTORY_SKELETON_IDENTITY=""
 ADOPT_DIRECTORY_SKELETON_DIGEST=""
+ADOPT_RESERVED_STATE_DIR=""
+ADOPT_RESERVED_STATE_DIR_IDENTITY=""
+ADOPT_RESERVED_STATE_FILE=""
+ADOPT_RESERVED_STATE_FILE_IDENTITY=""
+ADOPT_RESERVED_OPERATION_LOCK=""
 ADOPT_TRANSACTION_PHASE=none
 
 DISCOVERED_HOOK_PATHS=()
@@ -700,7 +705,7 @@ valid_process_start_identity() { # value
   local value=$1 normalized
   [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\t'* ]] \
     || return 1
-  normalized=$(LC_ALL=C /bin/date -j -f '%a %b %e %T %Y' "$value" \
+  normalized=$(TZ=UTC0 LC_ALL=C /bin/date -j -f '%a %b %e %T %Y' "$value" \
     '+%a %b %e %T %Y' 2>/dev/null) || return 1
   [[ "$normalized" == "$value" ]]
 }
@@ -764,7 +769,8 @@ revalidate_inspected_operation_lock() {
 
 probe_process_start() { # pid
   local output status
-  if output=$(LC_ALL=C "$PS_COMMAND" -p "$1" -o lstart= 2>/dev/null); then
+  if output=$(TZ=UTC0 LC_ALL=C \
+      "$PS_COMMAND" -p "$1" -o lstart= 2>/dev/null); then
     status=0
   else
     status=$?
@@ -946,6 +952,8 @@ operation_cleanup_dispatcher() { # signal
   trap - EXIT HUP INT TERM
   if [[ "$signal" != EXIT && "$ADOPT_TRANSACTION_PHASE" != none ]]; then
     cleanup_adopt_transaction_after_signal "$signal"
+  elif [[ "$signal" != EXIT ]]; then
+    printf 'vaultlock: operation interrupted by %s\n' "$signal" >&2
   fi
   if [[ "$OPERATION_LOCK_ACTIVE" == true ]]; then
     if ! release_owned_operation_lock; then
@@ -980,13 +988,17 @@ operation_signal_handler() { # signal
 }
 
 begin_operation_signal_deferral() {
-  OPERATION_SIGNAL_DEFERRED=true
   OPERATION_PENDING_SIGNAL=""
+  run_named_transition operation_signal_deferral_begin_window \
+    "$OPERATION_LOCK_DIR"
+  OPERATION_SIGNAL_DEFERRED=true
 }
 
 end_operation_signal_deferral() {
-  local pending=$OPERATION_PENDING_SIGNAL
   OPERATION_SIGNAL_DEFERRED=false
+  run_named_transition operation_signal_deferral_end_window \
+    "$OPERATION_LOCK_DIR"
+  local pending=$OPERATION_PENDING_SIGNAL
   OPERATION_PENDING_SIGNAL=""
   [[ -z "$pending" ]] || operation_cleanup_dispatcher "$pending"
 }
@@ -1138,12 +1150,16 @@ acquire_operation_lock() { # command
 }
 
 finish_operation_lock() {
-  trap - EXIT HUP INT TERM
-  if ! release_owned_operation_lock; then
+  local release_failed=false
+  begin_operation_signal_deferral
+  release_owned_operation_lock || release_failed=true
+  if [[ "$release_failed" == true ]]; then
     printf 'vaultlock: operation lock retained: %s\n' \
       "$OPERATION_LOCK_DIR" >&2
-    return 1
   fi
+  end_operation_signal_deferral
+  trap - EXIT HUP INT TERM
+  [[ "$release_failed" == false ]]
 }
 
 plan_add_coordination_start() {
@@ -1334,6 +1350,16 @@ freeze_planned_command_snapshot() { # command
       append_frozen_plan_field typed_operand_count 1
       append_frozen_plan_field state_dir_identity "$state_dir_identity"
       append_frozen_plan_field state_file_identity "$state_file_identity"
+      append_frozen_plan_field adopt_reserved_state_dir \
+        "$ADOPT_RESERVED_STATE_DIR"
+      append_frozen_plan_field adopt_reserved_state_dir_identity \
+        "$ADOPT_RESERVED_STATE_DIR_IDENTITY"
+      append_frozen_plan_field adopt_reserved_state_file \
+        "$ADOPT_RESERVED_STATE_FILE"
+      append_frozen_plan_field adopt_reserved_state_file_identity \
+        "$ADOPT_RESERVED_STATE_FILE_IDENTITY"
+      append_frozen_plan_field adopt_reserved_operation_lock \
+        "$ADOPT_RESERVED_OPERATION_LOCK"
       append_frozen_plan_field typed_operand_0_name source
       append_frozen_plan_field typed_operand_0_value "$ADOPT_SOURCE"
       append_frozen_plan_field adopt_source_identity "$ADOPT_SOURCE_IDENTITY"
@@ -1380,6 +1406,16 @@ capture_candidate_planned_command_snapshot() { # command
       append_candidate_plan_field typed_operand_count 1
       append_candidate_plan_field state_dir_identity "$state_dir_identity"
       append_candidate_plan_field state_file_identity "$state_file_identity"
+      append_candidate_plan_field adopt_reserved_state_dir \
+        "$ADOPT_RESERVED_STATE_DIR"
+      append_candidate_plan_field adopt_reserved_state_dir_identity \
+        "$ADOPT_RESERVED_STATE_DIR_IDENTITY"
+      append_candidate_plan_field adopt_reserved_state_file \
+        "$ADOPT_RESERVED_STATE_FILE"
+      append_candidate_plan_field adopt_reserved_state_file_identity \
+        "$ADOPT_RESERVED_STATE_FILE_IDENTITY"
+      append_candidate_plan_field adopt_reserved_operation_lock \
+        "$ADOPT_RESERVED_OPERATION_LOCK"
       append_candidate_plan_field typed_operand_0_name source
       append_candidate_plan_field typed_operand_0_value "$ADOPT_SOURCE"
       append_candidate_plan_field adopt_source_identity "$ADOPT_SOURCE_IDENTITY"
@@ -2473,6 +2509,61 @@ path_has_control_character() {
 path_identity() { "$BSD_STAT" -f '%d:%i' -- "$1" 2>/dev/null; }
 path_mode() { "$BSD_STAT" -f '%Lp' -- "$1" 2>/dev/null; }
 
+canonical_path_without_following_leaf() { # path
+  local path=$1 parent leaf canonical_parent
+  parent=$(/usr/bin/dirname -- "$path") || return 1
+  leaf=$(/usr/bin/basename -- "$path") || return 1
+  canonical_parent=$(cd -P -- "$parent" 2>/dev/null && pwd -P) \
+    || return 1
+  printf '%s/%s\n' "${canonical_parent%/}" "$leaf"
+}
+
+capture_adopt_reserved_control_paths() {
+  ADOPT_RESERVED_STATE_DIR=$(cd -P -- "$STATE_DIR" 2>/dev/null && pwd -P) \
+    || die "cannot canonicalize reserved state directory"
+  ADOPT_RESERVED_STATE_FILE=$ADOPT_RESERVED_STATE_DIR/${state_file##*/}
+  ADOPT_RESERVED_OPERATION_LOCK=$(canonical_path_without_following_leaf \
+    "$OPERATION_LOCK_DIR") \
+    || die "cannot canonicalize reserved operation lock path"
+}
+
+verify_adopt_reserved_control_identities() {
+  local canonical_identity operation_identity resolved_operation_lock
+  ADOPT_RESERVED_STATE_DIR_IDENTITY=$(path_identity "$STATE_DIR") \
+    || die "cannot capture reserved state directory identity"
+  canonical_identity=$(path_identity "$ADOPT_RESERVED_STATE_DIR") \
+    || die "cannot verify canonical state directory identity"
+  [[ "$canonical_identity" == "$ADOPT_RESERVED_STATE_DIR_IDENTITY" ]] \
+    || die "reserved state directory identity changed during canonicalization"
+  ADOPT_RESERVED_STATE_FILE_IDENTITY=$(path_identity "$state_file") \
+    || die "cannot capture reserved state file identity"
+  canonical_identity=$(path_identity "$ADOPT_RESERVED_STATE_FILE") \
+    || die "cannot verify canonical state file identity"
+  [[ "$canonical_identity" == "$ADOPT_RESERVED_STATE_FILE_IDENTITY" ]] \
+    || die "reserved state file identity changed during canonicalization"
+  if [[ "$OPERATION_LOCK_ACTIVE" == true ]]; then
+    resolved_operation_lock=$(cd -P -- "$OPERATION_LOCK_DIR" 2>/dev/null \
+      && pwd -P) || die "cannot resolve owned operation lock path"
+    operation_identity=$(path_identity "$OPERATION_LOCK_DIR") \
+      || die "cannot verify owned operation lock identity"
+    [[ "$resolved_operation_lock" == "$ADOPT_RESERVED_OPERATION_LOCK" \
+        && "$operation_identity" == "$OPERATION_LOCK_DIR_IDENTITY" ]] \
+      || die "owned operation lock path changed during adopt inspection"
+  fi
+}
+
+adopt_source_contains_reserved_control_path() {
+  local reserved
+  for reserved in "$ADOPT_RESERVED_STATE_DIR" \
+      "$ADOPT_RESERVED_STATE_FILE" "$ADOPT_RESERVED_OPERATION_LOCK"; do
+    if [[ "$reserved" == "$ADOPT_SOURCE" \
+        || "$reserved" == "$ADOPT_SOURCE"/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 assert_path_identity() { # path expected description
   local actual
   actual=$(path_identity "$1") || die "$3 identity is unavailable"
@@ -2501,6 +2592,10 @@ inspect_adopt_state() {
   ADOPT_SOURCE="$parent/$leaf"
   [[ ! -L "$ADOPT_SOURCE" && -d "$ADOPT_SOURCE" ]] \
     || die "$ADOPT_SOURCE is not a real directory"
+  capture_adopt_reserved_control_paths
+  adopt_source_contains_reserved_control_path \
+    && die "$ADOPT_SOURCE contains reserved vaultlock control path"
+  verify_adopt_reserved_control_identities
   canonical_mount=$(cd -P -- "$MOUNT_POINT" 2>/dev/null && pwd -P) \
     || die "cannot resolve expected mount point"
   [[ "$ADOPT_SOURCE" != "$canonical_mount" \
@@ -3203,10 +3298,40 @@ rollback_adopt_source() {
 cleanup_adopt_transaction_after_signal() { # signal
   local signal=$1 detail="" rollback_status=1
   case "$ADOPT_TRANSACTION_PHASE" in
+    preparing)
+      if adopt_original_tree_at "$ADOPT_SOURCE"; then
+        detail="original source remains at $ADOPT_SOURCE_DISPLAY"
+      else
+        detail="original source could not be verified at $ADOPT_SOURCE_DISPLAY"
+      fi
+      if [[ -e "$ADOPT_STAGED_LINK" || -L "$ADOPT_STAGED_LINK" ]]; then
+        if cleanup_staged_link; then
+          detail="$detail, owned staged link removed"
+        else
+          detail="$detail, staged path retained at $ADOPT_STAGED_LINK"
+        fi
+      fi
+      if [[ -e "$ADOPT_BACKUP_RESERVATION" \
+          || -L "$ADOPT_BACKUP_RESERVATION" ]]; then
+        if remove_empty_adopt_backup_reservation; then
+          detail="$detail, owned backup reservation removed"
+        else
+          detail="$detail, backup reservation retained at $ADOPT_BACKUP_RESERVATION"
+        fi
+      fi
+      ;;
     staging)
       if adopt_original_tree_at "$ADOPT_SOURCE"; then
         cleanup_staged_link || true
         detail="original source remains at $ADOPT_SOURCE_DISPLAY"
+        if [[ -e "$ADOPT_BACKUP_RESERVATION" \
+            || -L "$ADOPT_BACKUP_RESERVATION" ]]; then
+          if remove_empty_adopt_backup_reservation; then
+            detail="$detail, owned backup reservation removed"
+          else
+            detail="$detail, backup reservation retained at $ADOPT_BACKUP_RESERVATION"
+          fi
+        fi
       else
         detail="adopt staging state could not be verified"
       fi
@@ -3523,47 +3648,77 @@ execute_adopt_replace_source() {
   [[ ! -e "$ADOPT_STAGED_LINK" && ! -L "$ADOPT_STAGED_LINK" \
       && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
     || die "adopt staging paths already exist"
-  ln -s -- "$ADOPT_DESTINATION" "$ADOPT_STAGED_LINK" \
-    || die "cannot stage replacement symlink, source remains unchanged"
-  ADOPT_STAGED_LINK_IDENTITY=$(path_identity "$ADOPT_STAGED_LINK") \
-    || die "cannot capture staged link identity, staged link retained at $ADOPT_STAGED_LINK"
+  ADOPT_TRANSACTION_PHASE=preparing
+  begin_operation_signal_deferral
+  ln -s -- "$ADOPT_DESTINATION" "$ADOPT_STAGED_LINK" || {
+    dispatch_deferred_operation_signal
+    die "cannot stage replacement symlink, source remains unchanged"
+  }
+  ADOPT_STAGED_LINK_IDENTITY=$(path_identity "$ADOPT_STAGED_LINK") || {
+    dispatch_deferred_operation_signal
+    die "cannot capture staged link identity, staged link retained at $ADOPT_STAGED_LINK"
+  }
   ADOPT_STAGED_LINK_TARGET=$(/usr/bin/readlink -- "$ADOPT_STAGED_LINK" \
-    2>/dev/null) \
-    || die "cannot capture staged link target, staged link retained at $ADOPT_STAGED_LINK"
-  [[ "$ADOPT_STAGED_LINK_TARGET" == "$ADOPT_DESTINATION" ]] \
-    || die "staged link target changed, staged link retained at $ADOPT_STAGED_LINK"
-  adopt_staged_link_owned_at "$ADOPT_STAGED_LINK" \
-    || die "staged link identity changed, staged link retained at $ADOPT_STAGED_LINK"
+    2>/dev/null) || {
+    dispatch_deferred_operation_signal
+    die "cannot capture staged link target, staged link retained at $ADOPT_STAGED_LINK"
+  }
+  [[ "$ADOPT_STAGED_LINK_TARGET" == "$ADOPT_DESTINATION" ]] || {
+    dispatch_deferred_operation_signal
+    die "staged link target changed, staged link retained at $ADOPT_STAGED_LINK"
+  }
+  adopt_staged_link_owned_at "$ADOPT_STAGED_LINK" || {
+    dispatch_deferred_operation_signal
+    die "staged link identity changed, staged link retained at $ADOPT_STAGED_LINK"
+  }
+  run_named_transition adopt_after_staged_link_created "$ADOPT_STAGED_LINK"
+  dispatch_deferred_operation_signal
   assert_adopt_source_manifest \
     "source manifest changed before backup move, staged link retained at $ADOPT_STAGED_LINK"
+  dispatch_deferred_operation_signal
   assert_adopt_destination_manifest \
     "destination manifest changed before backup move, staged link retained at $ADOPT_STAGED_LINK"
+  dispatch_deferred_operation_signal
   verify_adopt_mount_identity
+  dispatch_deferred_operation_signal
   backup_candidate=$ADOPT_BACKUP
   run_named_transition adopt_before_backup_move "$backup_candidate"
+  dispatch_deferred_operation_signal
   if [[ -e "$backup_candidate" || -L "$backup_candidate" ]]; then
     cleanup_staged_link \
       || die "source backup path changed before move, source remains unchanged, staged link retained at $ADOPT_STAGED_LINK"
     die "source backup path changed before move, source remains unchanged"
   fi
   if ! "$MKDIR_COMMAND" -m 700 -- "$backup_candidate" 2>/dev/null; then
+    dispatch_deferred_operation_signal
     cleanup_staged_link \
       || die "cannot reserve source backup path, source remains unchanged, staged link retained at $ADOPT_STAGED_LINK"
     die "cannot reserve source backup path, source remains unchanged"
   fi
   ADOPT_BACKUP_RESERVATION=$backup_candidate
   ADOPT_BACKUP_RESERVATION_IDENTITY=$(path_identity \
-    "$ADOPT_BACKUP_RESERVATION") \
-    || die "cannot verify source backup reservation, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+    "$ADOPT_BACKUP_RESERVATION") || {
+    dispatch_deferred_operation_signal
+    die "cannot verify source backup reservation, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  }
   ADOPT_BACKUP_RESERVATION_DEVICE=$(
     "$BSD_STAT" -f '%d' -- "$ADOPT_BACKUP_RESERVATION" 2>/dev/null
-  ) || die "cannot verify source backup reservation device, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
-  adopt_backup_reservation_matches \
-    || die "source backup reservation changed, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  ) || {
+    dispatch_deferred_operation_signal
+    die "cannot verify source backup reservation device, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  }
   ADOPT_BACKUP=$ADOPT_BACKUP_RESERVATION/${ADOPT_SOURCE##*/}
-  [[ ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
-    || die "source backup reservation is not empty, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
-  begin_operation_signal_deferral
+  adopt_backup_reservation_matches || {
+    dispatch_deferred_operation_signal
+    die "source backup reservation changed, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  }
+  [[ ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || {
+    dispatch_deferred_operation_signal
+    die "source backup reservation is not empty, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  }
+  run_named_transition adopt_after_backup_reservation_created \
+    "$ADOPT_BACKUP_RESERVATION"
+  dispatch_deferred_operation_signal
   ADOPT_TRANSACTION_PHASE=staging
   if "$MV_COMMAND" -hn -- "$ADOPT_SOURCE" "$ADOPT_BACKUP_RESERVATION"; then
     move_status=0
@@ -3576,7 +3731,8 @@ execute_adopt_replace_source() {
     :
   elif [[ -d "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" \
     && "$(path_identity "$ADOPT_SOURCE")" == "$ADOPT_SOURCE_IDENTITY" \
-    && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]]; then
+      && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]]; then
+    dispatch_deferred_operation_signal
     remove_empty_adopt_backup_reservation || \
       die "cannot stage source backup, source remains unchanged, backup reservation retained at $ADOPT_BACKUP_RESERVATION"
     cleanup_staged_link \
@@ -3585,6 +3741,7 @@ execute_adopt_replace_source() {
     end_operation_signal_deferral
     die "cannot stage source backup, source remains unchanged"
   else
+    dispatch_deferred_operation_signal
     die "source backup move ended in an ambiguous state (status $move_status), inspect $ADOPT_SOURCE and $ADOPT_BACKUP_RESERVATION"
   fi
   ADOPT_BACKUP_IDENTITY=$ADOPT_SOURCE_IDENTITY
