@@ -507,7 +507,22 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     stat)
       fixture_stat_path=""
       for fixture_argument in "$@"; do fixture_stat_path=$fixture_argument; done
-      if [[ ( -f "$VAULTLOCK_TEST_APFS_STATE/normalize_copy_directory_metadata" \
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_operation_lock_identity_once" \
+          && "$fixture_stat_path" == "$HOME/.vaultlock-operation.lock" \
+          && " $* " == *" %d:%i "* ]]; then
+        /bin/rm -f \
+          "$VAULTLOCK_TEST_APFS_STATE/fail_operation_lock_identity_once"
+        exit 1
+      elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_adopt_backup_manifest" \
+          && "$fixture_stat_path" == *.vaultlock-backup/* \
+          && " $* " == *" %d:%i:%Lp:%u:%g:%z:%.9Fm:%.9FB:%f:%r:%l "* ]]; then
+        fixture_manifest_signal=$(< \
+          "$VAULTLOCK_TEST_APFS_STATE/signal_adopt_backup_manifest")
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/signal_adopt_backup_manifest"
+        /bin/kill -s "$fixture_manifest_signal" \
+          "$VAULTLOCK_TEST_PROCESS_PID"
+        /usr/bin/stat "$@"
+      elif [[ ( -f "$VAULTLOCK_TEST_APFS_STATE/normalize_copy_directory_metadata" \
           || -f "$VAULTLOCK_TEST_APFS_STATE/drop_copy_birthtime" ) \
         && "$fixture_stat_path" == "$VAULTLOCK_MOUNT_POINT"/* \
         && -d "$fixture_stat_path" \
@@ -630,7 +645,9 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         printf '997:997\n'
       elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_restored_identity" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/rollback_moved" \
-          && "$fixture_stat_path" != "$VAULTLOCK_MOUNT_POINT"/* ]]; then
+          && "$fixture_stat_path" != "$VAULTLOCK_MOUNT_POINT"/* \
+          && "$fixture_stat_path" != "$HOME/.vaultlock-operation.lock" \
+          && "$fixture_stat_path" != "$HOME/.vaultlock-operation.lock/owner" ]]; then
         printf '996:996\n'
       elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/named_source_identity_swap" \
           && "$fixture_stat_path" \
@@ -836,11 +853,27 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       fi
       /bin/rmdir "$@"
       ;;
-    mkdir) /bin/mkdir "$@" ;;
+    mkdir)
+      /bin/mkdir "$@" || exit 1
+      fixture_mkdir_path=""
+      for fixture_argument in "$@"; do fixture_mkdir_path=$fixture_argument; done
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_operation_lock_mkdir" \
+          && "$fixture_mkdir_path" == "$HOME/.vaultlock-operation.lock" ]]; then
+        fixture_mkdir_signal=$(< \
+          "$VAULTLOCK_TEST_APFS_STATE/signal_operation_lock_mkdir")
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/signal_operation_lock_mkdir"
+        /bin/kill -s "$fixture_mkdir_signal" "$PPID"
+      fi
+      ;;
     chmod)
       fixture_chmod_mode=${1:-}
       fixture_chmod_path=""
       for fixture_argument in "$@"; do fixture_chmod_path=$fixture_argument; done
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_recovery_acl_removal" \
+          && "$fixture_chmod_mode" == "-N" \
+          && "$fixture_chmod_path" == "$VAULTLOCK_STATE_DIR"/.passphrase.* ]]; then
+        exit 1
+      fi
       /bin/chmod "$@"
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/quarantine_made_nonprivate" \
           && "$fixture_chmod_mode" == "700" \
@@ -852,6 +885,10 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       ;;
   mktemp)
     fixture_mktemp_path=$(/usr/bin/mktemp "$@") || exit 1
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/inherit_recovery_acl" \
+      && "$fixture_mktemp_path" == "$VAULTLOCK_STATE_DIR/.passphrase."* ]]; then
+      /bin/chmod +a 'everyone allow read' "$fixture_mktemp_path" || exit 1
+    fi
     printf '%s\n' "$fixture_mktemp_path"
     if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_operation_owner_mktemp" \
       && "$fixture_mktemp_path" == "$HOME/.vaultlock-operation.lock/.owner."* ]]; then
@@ -885,6 +922,10 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       [[ -f "$fixture_transition_marker" ]] || exit 0
       fixture_transition_action=$(< "$fixture_transition_marker")
       case "$fixture_transition_action" in
+      signal_HUP|signal_INT|signal_TERM)
+        fixture_transition_signal=${fixture_transition_action#signal_}
+        /bin/kill -s "$fixture_transition_signal" "$PPID"
+        ;;
         adopt_source_identity_swap)
           printf '%s\n' "$fixture_subject" \
             > "$VAULTLOCK_TEST_APFS_STATE/named_source_identity_swap"
@@ -1303,7 +1344,9 @@ reset_operation_lock_fixture() {
     "$apfs_state/token_generated_twice" \
     "$apfs_state/ps_ambiguous" \
     "$apfs_state/signal_ditto" \
+    "$apfs_state/signal_operation_lock_mkdir" \
     "$apfs_state/signal_operation_owner_mktemp" \
+    "$apfs_state/fail_operation_lock_identity_once" \
     "$apfs_state/fail_operation_lock_owner_install" \
     "$apfs_state/fail_operation_lock_release" \
     "$apfs_state/hold_ditto" \
@@ -2318,6 +2361,7 @@ reset_adopt_fixture() {
     "$apfs_state/fail_backup_move" "$apfs_state/fail_link_move" \
     "$apfs_state/fail_rollback_move" "$apfs_state/fail_cleanup" \
     "$apfs_state/copy_complete" \
+    "$apfs_state/signal_adopt_backup_manifest" \
     "$apfs_state/gnu_path_tool_called"
   write_json_state false null null null UUID-INIT
   write_apfs_state false true UUID-INIT disk8s1
@@ -2847,6 +2891,7 @@ reset_init_fixture() {
     "$apfs_state/mount_point_type" "$apfs_state/plist_mode" \
     "$apfs_state/keychain_marker" "$apfs_state/fail_keychain" \
     "$apfs_state/fail_add_volume" "$apfs_state/fail_final_uuid"
+  /bin/chmod -N "$state_dir"
   rm -f "$apfs_state/fail_diskutil_info" "$apfs_state/fail_apfs_list" \
     "$apfs_state/echo_security_error" \
     "$apfs_state/race_passphrase_symlink" \
@@ -2881,6 +2926,8 @@ reset_init_fixture() {
     "$apfs_state/cleanup_original_identity" \
     "$apfs_state/cleanup_replacement_identity" \
     "$apfs_state/security_output_artifact_seen" \
+    "$apfs_state/inherit_recovery_acl" \
+    "$apfs_state/fail_recovery_acl_removal" \
     "$apfs_state/swap_identity_after_add" \
     "$apfs_state/unsupported_add_volume_plist"
   : > "$action_log"
@@ -3977,6 +4024,180 @@ check "adopt two-trailing-newline xattr oracle" two-value \
 check "adopt mixed-backslash-trailing-newline xattr oracle" mixed-value \
   "$(/usr/bin/xattr -p "$xattr_mixed_trailing_name" \
   "$mount_point/adopt-xattr-trailing-newlines/subdirectory/file")"
+
+# Re-review regressions: lock creation, process starts, ACLs, and adopt signals.
+reset_operation_lock_fixture
+reset_init_fixture
+printf 'HUP\n' > "$apfs_state/signal_operation_lock_mkdir"
+if lock_mkdir_signal_output=$(run_vaultlock init --yes 2>&1); then
+  lock_mkdir_signal_status=0
+else
+  lock_mkdir_signal_status=$?
+fi
+: "$lock_mkdir_signal_output"
+check "init lock-directory signal preserves HUP status" 129 \
+  "$lock_mkdir_signal_status"
+[[ ! -e "$operation_lock_dir" && ! -L "$operation_lock_dir" ]] \
+  || record_failure "init lock-directory signal removes identified partial lock"
+
+reset_operation_lock_fixture
+reset_init_fixture
+: > "$apfs_state/fail_operation_lock_identity_once"
+if lock_identity_failure_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init lock identity capture failure exits nonzero"
+else
+  check_contains "init lock identity capture failure reports cause" \
+    'cannot capture partial operation lock identity' \
+    "$lock_identity_failure_output"
+fi
+[[ ! -e "$operation_lock_dir" && ! -L "$operation_lock_dir" ]] \
+  || record_failure "init lock identity capture failure removes identified directory"
+
+for valid_process_start in 'Tue Feb 29 12:34:56 2028' \
+    'Sun Aug  9 10:00:00 2026'; do
+  if run_vaultlock __process_start_valid "$valid_process_start" \
+      >/dev/null 2>&1; then
+    valid_process_start_status=0
+  else
+    valid_process_start_status=$?
+  fi
+  check "process start accepts normalized [$valid_process_start]" 0 \
+    "$valid_process_start_status"
+done
+
+invalid_process_starts=(
+  'Xxx Yyy 99 99:99:99 9999'
+  'Mon Feb 30 10:00:00 2026'
+  'Sun Aug 30 24:00:00 2026'
+  'Sun Aug 30 10:60:00 2026'
+  'Sun Aug 30 10:00:60 2026'
+  $'Sun\tAug 30 10:00:00 2026'
+)
+for invalid_process_start in "${invalid_process_starts[@]}"; do
+  if run_vaultlock __process_start_valid "$invalid_process_start" \
+      >/dev/null 2>&1; then
+    invalid_process_start_status=0
+  else
+    invalid_process_start_status=$?
+  fi
+  check "process start rejects malformed [$invalid_process_start]" 1 \
+    "$invalid_process_start_status"
+done
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+calendar_malformed_source=$(new_adopt_source operation-lock-calendar-malformed)
+create_operation_lock 999999 'Mon Feb 30 10:00:00 2026' adopt \
+  "$fake_operation_token"
+if calendar_malformed_output=$(run_vaultlock adopt --yes \
+    "$calendar_malformed_source" 2>&1); then
+  record_failure "adopt rejects impossible calendar in operation owner"
+else
+  check_contains "adopt impossible calendar fails closed" \
+    'malformed operation lock owner' "$calendar_malformed_output"
+fi
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "adopt preserves impossible-calendar operation lock"
+
+reset_operation_lock_fixture
+reset_init_fixture
+/bin/chmod +a \
+  'everyone allow read,file_inherit,directory_inherit' "$state_dir"
+if inherited_state_acl_output=$(run_vaultlock init --yes 2>&1); then
+  :
+else
+  record_failure "init removes inherited state ACL: $inherited_state_acl_output"
+fi
+state_acl_count=$(/bin/ls -ldeB "$state_dir" \
+  | /usr/bin/sed -n '2,$p' | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+recovery_acl_count=$(/bin/ls -ldeB "$state_dir/passphrase.txt" \
+  | /usr/bin/sed -n '2,$p' | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+check "init removes state directory ACL" 0 "$state_acl_count"
+check "init removes inherited final recovery ACL" 0 "$recovery_acl_count"
+
+reset_operation_lock_fixture
+reset_init_fixture
+: > "$apfs_state/inherit_recovery_acl"
+if inherited_recovery_acl_output=$(run_vaultlock init --yes 2>&1); then
+  :
+else
+  record_failure \
+    "init removes recovery staging ACL: $inherited_recovery_acl_output"
+fi
+recovery_acl_count=$(/bin/ls -ldeB "$state_dir/passphrase.txt" \
+  | /usr/bin/sed -n '2,$p' | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+check "init removes recovery staging ACL before installation" 0 \
+  "$recovery_acl_count"
+
+reset_operation_lock_fixture
+reset_init_fixture
+: > "$apfs_state/inherit_recovery_acl"
+: > "$apfs_state/fail_recovery_acl_removal"
+if recovery_acl_failure_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init recovery ACL removal failure exits nonzero"
+else
+  check_contains "init recovery ACL removal failure reports cause" \
+    'cannot remove recovery staging ACL' "$recovery_acl_failure_output"
+fi
+check_count "init recovery ACL failure reaches no keychain or APFS mutation" 0 \
+  'diskutil apfs addVolume' "$recovery_acl_failure_output$(< "$mutation_log")"
+check_count "init recovery ACL failure leaks no generated secret" 0 \
+  'Task6SecretOnlyInStdinChannel' \
+  "$recovery_acl_failure_output$(< "$action_log")$(< "$mutation_log")$(< "$hook_log")"
+
+for adopt_signal_case in \
+    after-backup:HUP:129:transition \
+    during-manifest:TERM:143:manifest \
+    after-link:INT:130:transition; do
+  reset_operation_lock_fixture
+  reset_adopt_fixture
+  adopt_signal_name=${adopt_signal_case%%:*}
+  adopt_signal_rest=${adopt_signal_case#*:}
+  adopt_signal_name_value=${adopt_signal_rest%%:*}
+  adopt_signal_rest=${adopt_signal_rest#*:}
+  adopt_signal_expected=${adopt_signal_rest%%:*}
+  adopt_signal_fixture=${adopt_signal_rest##*:}
+  adopt_transaction_source=$(new_adopt_source \
+    "adopt-signal-$adopt_signal_name")
+  case "$adopt_signal_name" in
+    after-backup)
+      printf 'signal_%s\n' "$adopt_signal_name_value" \
+        > "$apfs_state/transition_adopt_after_backup_move"
+      ;;
+    during-manifest)
+      printf '%s\n' "$adopt_signal_name_value" \
+        > "$apfs_state/signal_adopt_backup_manifest"
+      ;;
+    after-link)
+      printf 'signal_%s\n' "$adopt_signal_name_value" \
+        > "$apfs_state/transition_adopt_after_installed_link_verified"
+      ;;
+  esac
+  : "$adopt_signal_fixture"
+  if adopt_transaction_signal_output=$(run_vaultlock adopt --yes \
+      "$adopt_transaction_source" 2>&1); then
+    adopt_transaction_signal_status=0
+  else
+    adopt_transaction_signal_status=$?
+  fi
+  check "adopt $adopt_signal_name preserves $adopt_signal_name_value status" \
+    "$adopt_signal_expected" "$adopt_transaction_signal_status"
+  check_contains "adopt $adopt_signal_name reports interruption" \
+    "adopt interrupted by $adopt_signal_name_value" \
+    "$adopt_transaction_signal_output"
+  check_contains "adopt $adopt_signal_name reports restored source" \
+    'original source restored at' "$adopt_transaction_signal_output"
+  [[ -d "$adopt_transaction_source" \
+      && ! -L "$adopt_transaction_source" \
+      && -f "$adopt_transaction_source/subdirectory/file" ]] \
+    || record_failure "adopt $adopt_signal_name restores original source"
+  [[ ! -e "$operation_lock_dir" && ! -L "$operation_lock_dir" ]] \
+    || record_failure "adopt $adopt_signal_name releases operation lock"
+  /bin/rm -rf -- "${adopt_transaction_source:?}" \
+    "${adopt_transaction_source:?}.vaultlock-backup" \
+    "${adopt_transaction_source:?}.vaultlock-link" \
+    "${mount_point:?}/adopt-signal-$adopt_signal_name"
+done
 
 reset_operation_lock_fixture
 

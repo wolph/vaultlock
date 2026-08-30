@@ -38,6 +38,7 @@ RMDIR_COMMAND=/bin/rmdir
 CHMOD_COMMAND=/bin/chmod
 TRANSITION_COMMAND=""
 if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]]; then
+  export VAULTLOCK_TEST_PROCESS_PID=$$
   BSD_FIND=${VAULTLOCK_TEST_BSD_FIND:-$BSD_FIND}
   BSD_LS=${VAULTLOCK_TEST_BSD_LS:-$BSD_LS}
   BSD_STAT=${VAULTLOCK_TEST_BSD_STAT:-$BSD_STAT}
@@ -91,6 +92,8 @@ OPERATION_LOCK_PARTIAL=false
 OPERATION_LOCK_TEMP=""
 OPERATION_LOCK_TEMP_IDENTITY=""
 OPERATION_LOCK_TEMP_DIGEST=""
+OPERATION_SIGNAL_DEFERRED=false
+OPERATION_PENDING_SIGNAL=""
 INSPECTED_LOCK_DIR_IDENTITY=""
 INSPECTED_LOCK_OWNER_IDENTITY=""
 INSPECTED_LOCK_OWNER_DIGEST=""
@@ -103,6 +106,7 @@ INIT_PASSPHRASE=""
 INIT_RECOVERY_PATH=""
 INIT_RECOVERY_IDENTITY=""
 INIT_STATE_DIR_IDENTITY=""
+INIT_STATE_DIR_LINK_COUNT=""
 INIT_STATE_IDENTITY=""
 INIT_STATE_DIGEST=""
 INIT_STATE_CLEANUP_DETAIL=""
@@ -136,6 +140,7 @@ ADOPT_BACKUP_QUARANTINE_IDENTITY=""
 ADOPT_DIRECTORY_SKELETON=""
 ADOPT_DIRECTORY_SKELETON_IDENTITY=""
 ADOPT_DIRECTORY_SKELETON_DIGEST=""
+ADOPT_TRANSACTION_PHASE=none
 
 DISCOVERED_HOOK_PATHS=()
 DISCOVERED_HOOK_SCOPES=()
@@ -688,7 +693,16 @@ operation_owner_digest() { # path
 }
 
 operation_path_identity() { # path
-  /usr/bin/stat -f '%d:%i' -- "$1" 2>/dev/null
+  "$BSD_STAT" -f '%d:%i' -- "$1" 2>/dev/null
+}
+
+valid_process_start_identity() { # value
+  local value=$1 normalized
+  [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\t'* ]] \
+    || return 1
+  normalized=$(LC_ALL=C /bin/date -j -f '%a %b %e %T %Y' "$value" \
+    '+%a %b %e %T %Y' 2>/dev/null) || return 1
+  [[ "$normalized" == "$value" ]]
 }
 
 inspect_operation_lock() {
@@ -696,7 +710,7 @@ inspect_operation_lock() {
   [[ -d "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" ]] \
     || return 1
   directory_metadata=$(
-    /usr/bin/stat -f '%d:%i:%Lp:%u' -- "$OPERATION_LOCK_DIR" 2>/dev/null
+    "$BSD_STAT" -f '%d:%i:%Lp:%u' -- "$OPERATION_LOCK_DIR" 2>/dev/null
   ) || return 1
   IFS=: read -r directory_device directory_inode directory_mode directory_uid \
     <<< "$directory_metadata"
@@ -705,7 +719,7 @@ inspect_operation_lock() {
   [[ -f "$OPERATION_LOCK_DIR/owner" \
     && ! -L "$OPERATION_LOCK_DIR/owner" ]] || return 1
   owner_metadata=$(
-    /usr/bin/stat -f '%d:%i:%Lp:%u:%l' -- "$OPERATION_LOCK_DIR/owner" \
+    "$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- "$OPERATION_LOCK_DIR/owner" \
       2>/dev/null
   ) || return 1
   IFS=: read -r owner_device owner_inode owner_mode owner_uid owner_nlink \
@@ -720,12 +734,12 @@ inspect_operation_lock() {
     IFS= read -r line5
     ! IFS= read -r extra
   } < "$OPERATION_LOCK_DIR/owner" || return 1
-    [[ "$line1" == "version=1" \
+  [[ "$line1" == "version=1" \
     && "$line2" =~ ^pid=([1-9][0-9]*)$ \
     && "$line3" == start=* \
-    && "${line3#start=}" =~ ^[A-Z][a-z]{2}[[:space:]]+[A-Z][a-z]{2}[[:space:]]+[0-9]{1,2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+[0-9]{4}$ \
     && "$line4" =~ ^command=(init|adopt|lock|unlock)$ \
     && "$line5" =~ ^token=([0-9a-f]{64})$ ]] || return 1
+  valid_process_start_identity "${line3#start=}" || return 1
   INSPECTED_LOCK_DIR_IDENTITY=$directory_device:$directory_inode
   INSPECTED_LOCK_OWNER_IDENTITY=$owner_device:$owner_inode
   INSPECTED_LOCK_OWNER_DIGEST=$(operation_owner_digest \
@@ -762,8 +776,8 @@ probe_process_start() { # pid
     PROCESS_PROBE_START=""
     return 0
   fi
-  if [[ "$status" -eq 0 && "$output" != *$'\n'* \
-    && "$output" =~ ^[A-Z][a-z]{2}[[:space:]]+[A-Z][a-z]{2}[[:space:]]+[0-9]{1,2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+[0-9]{4}$ ]]; then
+  if [[ "$status" -eq 0 ]] \
+      && valid_process_start_identity "$output"; then
     PROCESS_PROBE_KIND=present
     PROCESS_PROBE_START=$output
     return 0
@@ -809,7 +823,7 @@ partial_operation_lock_directory_matches() {
     && -n "$OPERATION_LOCK_DIR_IDENTITY" \
     && -d "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" ]] \
     || return 1
-  metadata=$(/usr/bin/stat -f '%d:%i:%Lp:%u' -- \
+  metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u' -- \
     "$OPERATION_LOCK_DIR" 2>/dev/null) || return 1
   IFS=: read -r directory_device directory_inode directory_mode directory_uid \
     <<< "$metadata"
@@ -822,7 +836,7 @@ partial_operation_lock_file_matches() { # path identity digest
   local file_device file_inode file_mode file_uid file_nlink actual_digest
   [[ -n "$path" && -n "$expected_identity" \
     && -f "$path" && ! -L "$path" ]] || return 1
-  metadata=$(/usr/bin/stat -f '%d:%i:%Lp:%u:%l' -- "$path" 2>/dev/null) \
+  metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- "$path" 2>/dev/null) \
     || return 1
   IFS=: read -r file_device file_inode file_mode file_uid file_nlink \
     <<< "$metadata"
@@ -930,6 +944,9 @@ release_owned_operation_lock() {
 operation_cleanup_dispatcher() { # signal
   local signal=$1 status=$? release_failed=false
   trap - EXIT HUP INT TERM
+  if [[ "$signal" != EXIT && "$ADOPT_TRANSACTION_PHASE" != none ]]; then
+    cleanup_adopt_transaction_after_signal "$signal"
+  fi
   if [[ "$OPERATION_LOCK_ACTIVE" == true ]]; then
     if ! release_owned_operation_lock; then
       release_failed=true
@@ -953,11 +970,37 @@ operation_cleanup_dispatcher() { # signal
   exit "$status"
 }
 
+operation_signal_handler() { # signal
+  if [[ "$OPERATION_SIGNAL_DEFERRED" == true ]]; then
+    [[ -n "$OPERATION_PENDING_SIGNAL" ]] \
+      || OPERATION_PENDING_SIGNAL=$1
+    return 0
+  fi
+  operation_cleanup_dispatcher "$1"
+}
+
+begin_operation_signal_deferral() {
+  OPERATION_SIGNAL_DEFERRED=true
+  OPERATION_PENDING_SIGNAL=""
+}
+
+end_operation_signal_deferral() {
+  local pending=$OPERATION_PENDING_SIGNAL
+  OPERATION_SIGNAL_DEFERRED=false
+  OPERATION_PENDING_SIGNAL=""
+  [[ -z "$pending" ]] || operation_cleanup_dispatcher "$pending"
+}
+
+dispatch_deferred_operation_signal() {
+  local pending=$OPERATION_PENDING_SIGNAL
+  [[ -z "$pending" ]] || operation_cleanup_dispatcher "$pending"
+}
+
 install_operation_cleanup_traps() {
   trap 'operation_cleanup_dispatcher EXIT' EXIT
-  trap 'operation_cleanup_dispatcher HUP' HUP
-  trap 'operation_cleanup_dispatcher INT' INT
-  trap 'operation_cleanup_dispatcher TERM' TERM
+  trap 'operation_signal_handler HUP' HUP
+  trap 'operation_signal_handler INT' INT
+  trap 'operation_signal_handler TERM' TERM
 }
 
 create_owned_operation_lock() {
@@ -1051,19 +1094,35 @@ quarantine_inspected_stale_operation_lock() {
 }
 
 acquire_operation_lock() { # command
-  local attempt
+  local attempt captured_identity cleanup_identity cleanup_failed=false
   OPERATION_LOCK_COMMAND=$1
   install_operation_cleanup_traps
   OPERATION_LOCK_TOKEN=$(generate_operation_token) \
     || die "cannot generate operation lock token"
   for attempt in 1 2; do
+    begin_operation_signal_deferral
     if "$MKDIR_COMMAND" -m 700 -- "$OPERATION_LOCK_DIR" 2>/dev/null; then
-      OPERATION_LOCK_DIR_IDENTITY=$(operation_path_identity "$OPERATION_LOCK_DIR") \
-        || die "cannot capture partial operation lock identity"
       OPERATION_LOCK_PARTIAL=true
+      if captured_identity=$(operation_path_identity "$OPERATION_LOCK_DIR"); then
+        OPERATION_LOCK_DIR_IDENTITY=$captured_identity
+        end_operation_signal_deferral
+      else
+        if cleanup_identity=$(operation_path_identity "$OPERATION_LOCK_DIR"); then
+          OPERATION_LOCK_DIR_IDENTITY=$cleanup_identity
+          cleanup_partial_operation_lock || cleanup_failed=true
+        else
+          cleanup_failed=true
+        fi
+        end_operation_signal_deferral
+        if [[ "$cleanup_failed" == true ]]; then
+          die "cannot capture partial operation lock identity, operation lock retained at $OPERATION_LOCK_DIR"
+        fi
+        die "cannot capture partial operation lock identity, partial operation lock removed"
+      fi
       create_owned_operation_lock
       return 0
     fi
+    end_operation_signal_deferral
     [[ "$attempt" -eq 1 ]] \
       || die "cannot acquire cooperative operation lock at $OPERATION_LOCK_DIR"
     inspect_operation_lock || die "malformed operation lock owner"
@@ -1913,30 +1972,56 @@ keychain_store_passphrase() { # passphrase
     | security -i >/dev/null 2>&1
 }
 
-require_init_state_dir_identity() {
-  local actual_identity
-  actual_identity=$(path_identity "$STATE_DIR") \
-    || die "state directory identity is unavailable"
-  [[ "$actual_identity" == "$INIT_STATE_DIR_IDENTITY" \
+init_path_acl_is_absent() { # path
+  local listing
+  listing=$(LC_ALL=C "$BSD_LS" -ldeB -- "$1" 2>/dev/null) || return 1
+  [[ "$listing" != *$'\n'* ]]
+}
+
+init_path_metadata() { # path
+  "$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- "$1" 2>/dev/null
+}
+
+init_state_dir_is_valid() {
+  local metadata device inode mode owner link_count
+  metadata=$(init_path_metadata "$STATE_DIR") || return 1
+  IFS=: read -r device inode mode owner link_count <<< "$metadata"
+  [[ "$device:$inode" == "$INIT_STATE_DIR_IDENTITY" \
+      && "$mode" == 700 && "$owner" == "$UID" \
+      && "$INIT_STATE_DIR_LINK_COUNT" =~ ^[1-9][0-9]*$ \
+      && "$link_count" =~ ^[1-9][0-9]*$ \
       && -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
-    || die "state directory identity changed during init"
+    || return 1
+  (( link_count >= INIT_STATE_DIR_LINK_COUNT )) || return 1
+  init_path_acl_is_absent "$STATE_DIR"
+}
+
+require_init_state_dir_identity() {
+  init_state_dir_is_valid \
+    || die "state directory metadata changed during init"
 }
 
 installed_init_recovery_is_valid() {
-  local state_dir_identity actual_identity final_identity actual_content
-  state_dir_identity=$(path_identity "$STATE_DIR") || return 1
-  [[ "$state_dir_identity" == "$INIT_STATE_DIR_IDENTITY" \
-      && -d "$STATE_DIR" && ! -L "$STATE_DIR" \
+  local metadata device inode mode owner link_count actual_content
+  init_state_dir_is_valid || return 1
+  metadata=$(init_path_metadata "$INIT_RECOVERY_PATH") || return 1
+  IFS=: read -r device inode mode owner link_count <<< "$metadata"
+  [[ "$device:$inode" == "$INIT_RECOVERY_IDENTITY" \
+      && "$mode" == 600 && "$owner" == "$UID" \
+      && "$link_count" == 1 \
       && -f "$INIT_RECOVERY_PATH" && ! -L "$INIT_RECOVERY_PATH" ]] \
     || return 1
-  actual_identity=$(path_identity "$INIT_RECOVERY_PATH") || return 1
+  init_path_acl_is_absent "$INIT_RECOVERY_PATH" || return 1
   actual_content=$(cat -- "$INIT_RECOVERY_PATH" && printf '\034') \
     || return 1
-  final_identity=$(path_identity "$INIT_RECOVERY_PATH") || return 1
+  metadata=$(init_path_metadata "$INIT_RECOVERY_PATH") || return 1
+  IFS=: read -r device inode mode owner link_count <<< "$metadata"
   [[ -n "$INIT_RECOVERY_IDENTITY" \
-      && "$actual_identity" == "$INIT_RECOVERY_IDENTITY" \
-      && "$final_identity" == "$INIT_RECOVERY_IDENTITY" \
-      && "$actual_content" == "$INIT_PASSPHRASE"$'\034' ]]
+      && "$device:$inode" == "$INIT_RECOVERY_IDENTITY" \
+      && "$mode" == 600 && "$owner" == "$UID" \
+      && "$link_count" == 1 \
+      && "$actual_content" == "$INIT_PASSPHRASE"$'\034' ]] \
+    && init_path_acl_is_absent "$INIT_RECOVERY_PATH"
 }
 
 verify_installed_init_recovery() { # phase
@@ -1946,45 +2031,79 @@ verify_installed_init_recovery() { # phase
 }
 
 execute_init_prepare_state() {
+  local metadata device inode mode owner link_count
   local recovery_identity installed_identity
   if [[ ! -e "$STATE_DIR" && ! -L "$STATE_DIR" ]]; then
     mkdir -m 700 "$STATE_DIR" || die "cannot create protected state directory"
   fi
   [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
     || die "state directory is not a real directory: $STATE_DIR"
-  chmod 700 "$STATE_DIR"
-  INIT_STATE_DIR_IDENTITY=$(path_identity "$STATE_DIR") \
+  "$CHMOD_COMMAND" -N "$STATE_DIR" \
+    || die "cannot remove state directory ACL"
+  "$CHMOD_COMMAND" 700 "$STATE_DIR" \
+    || die "cannot protect state directory"
+  metadata=$(init_path_metadata "$STATE_DIR") \
     || die "cannot capture state directory identity"
+  IFS=: read -r device inode mode owner link_count <<< "$metadata"
+  [[ "$mode" == 700 && "$owner" == "$UID" \
+      && "$link_count" =~ ^[1-9][0-9]*$ \
+      && -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
+    || die "state directory metadata is unsafe"
+  init_path_acl_is_absent "$STATE_DIR" \
+    || die "state directory ACL remains after removal"
+  INIT_STATE_DIR_IDENTITY=$device:$inode
+  INIT_STATE_DIR_LINK_COUNT=$link_count
   require_init_state_dir_identity
   umask 077
   INIT_RECOVERY_PATH=$(mktemp "$STATE_DIR/.passphrase.XXXXXX") \
     || die "cannot create protected recovery staging file"
-  chmod 600 "$INIT_RECOVERY_PATH" \
+  "$CHMOD_COMMAND" -N "$INIT_RECOVERY_PATH" \
+    || die "cannot remove recovery staging ACL"
+  "$CHMOD_COMMAND" 600 "$INIT_RECOVERY_PATH" \
     || die "cannot protect recovery staging file"
-  recovery_identity=$(path_identity "$INIT_RECOVERY_PATH") \
+  metadata=$(init_path_metadata "$INIT_RECOVERY_PATH") \
     || die "cannot capture recovery staging identity"
+  IFS=: read -r device inode mode owner link_count <<< "$metadata"
+  [[ "$mode" == 600 && "$owner" == "$UID" && "$link_count" == 1 \
+      && -f "$INIT_RECOVERY_PATH" && ! -L "$INIT_RECOVERY_PATH" ]] \
+    || die "recovery staging metadata is unsafe"
+  init_path_acl_is_absent "$INIT_RECOVERY_PATH" \
+    || die "recovery staging ACL remains after removal"
+  recovery_identity=$device:$inode
   INIT_PASSPHRASE=$(head -c 32 /dev/urandom | base64 | tr -d '\n') \
     || die "recovery material generation failed"
   safe_base64_token "$INIT_PASSPHRASE" \
     || die "recovery material generation returned invalid base64"
   printf '%s' "$INIT_PASSPHRASE" > "$INIT_RECOVERY_PATH" \
     || die "cannot write protected recovery material"
-  installed_identity=$(path_identity "$INIT_RECOVERY_PATH") \
+  metadata=$(init_path_metadata "$INIT_RECOVERY_PATH") \
     || die "recovery staging identity is unavailable after generation"
-  [[ "$installed_identity" == "$recovery_identity" ]] \
+  IFS=: read -r device inode mode owner link_count <<< "$metadata"
+  installed_identity=$device:$inode
+  [[ "$installed_identity" == "$recovery_identity" \
+      && "$mode" == 600 && "$owner" == "$UID" && "$link_count" == 1 ]] \
     || die "recovery staging identity changed during initialization"
+  init_path_acl_is_absent "$INIT_RECOVERY_PATH" \
+    || die "recovery staging ACL changed during initialization"
   require_init_state_dir_identity
   if ! ln -- "$INIT_RECOVERY_PATH" "$STATE_DIR/passphrase.txt"; then
     die "recovery path appeared during initialization, protected material remains at $INIT_RECOVERY_PATH"
   fi
-  installed_identity=$(path_identity "$STATE_DIR/passphrase.txt") \
+  metadata=$(init_path_metadata "$STATE_DIR/passphrase.txt") \
     || die "installed recovery identity is unavailable"
-  [[ "$installed_identity" == "$recovery_identity" ]] \
+  IFS=: read -r device inode mode owner link_count <<< "$metadata"
+  installed_identity=$device:$inode
+  [[ "$installed_identity" == "$recovery_identity" \
+      && "$mode" == 600 && "$owner" == "$UID" && "$link_count" == 2 ]] \
     || die "installed recovery identity mismatch"
+  init_path_acl_is_absent "$STATE_DIR/passphrase.txt" \
+    || die "installed recovery ACL is unsafe"
   INIT_RECOVERY_IDENTITY=$installed_identity
   rm -f -- "$INIT_RECOVERY_PATH" \
     || die "cannot remove recovery staging name"
   INIT_RECOVERY_PATH="$STATE_DIR/passphrase.txt"
+  installed_init_recovery_is_valid \
+    || die "installed recovery material changed before volume creation"
 }
 
 created_device_from_add_output() { # output
@@ -3081,6 +3200,59 @@ rollback_adopt_source() {
   cleanup_staged_link
 }
 
+cleanup_adopt_transaction_after_signal() { # signal
+  local signal=$1 detail="" rollback_status=1
+  case "$ADOPT_TRANSACTION_PHASE" in
+    staging)
+      if adopt_original_tree_at "$ADOPT_SOURCE"; then
+        cleanup_staged_link || true
+        detail="original source remains at $ADOPT_SOURCE_DISPLAY"
+      else
+        detail="adopt staging state could not be verified"
+      fi
+      ;;
+    backup|installed)
+      if rollback_adopt_source; then
+        rollback_status=0
+        detail="original source restored at $ADOPT_SOURCE_DISPLAY"
+      fi
+      if [[ "$rollback_status" -ne 0 ]]; then
+        if adopt_original_tree_at "$ADOPT_BACKUP" \
+            && adopt_backup_reservation_matches; then
+          detail="verified backup retained at $ADOPT_BACKUP"
+        elif adopt_original_tree_at "$ADOPT_SOURCE"; then
+          detail="original source verified at $ADOPT_SOURCE_DISPLAY"
+        elif adopt_link_matches && adopt_destination_manifest_matches; then
+          detail="installed replacement verified at $ADOPT_SOURCE_DISPLAY"
+        else
+          detail="adopt transaction could not be verified, inspect $ADOPT_SOURCE_DISPLAY and $ADOPT_BACKUP_RESERVATION"
+        fi
+      fi
+      ;;
+    quarantined)
+      if adopt_quarantined_backup_matches; then
+        detail="verified backup retained at $ADOPT_BACKUP_QUARANTINE/backup"
+      elif adopt_link_matches && adopt_destination_manifest_matches; then
+        detail="installed replacement verified at $ADOPT_SOURCE_DISPLAY, inspect $ADOPT_BACKUP_QUARANTINE"
+      else
+        detail="adopt quarantine could not be verified, inspect $ADOPT_BACKUP_QUARANTINE"
+      fi
+      ;;
+    complete)
+      if adopt_link_matches && adopt_destination_manifest_matches; then
+        detail="installed replacement verified at $ADOPT_SOURCE_DISPLAY"
+      else
+        detail="completed adopt target could not be verified at $ADOPT_SOURCE_DISPLAY"
+      fi
+      ;;
+    *)
+      detail="adopt transaction phase is unknown"
+      ;;
+  esac
+  ADOPT_TRANSACTION_PHASE=none
+  printf 'vaultlock: adopt interrupted by %s: %s\n' "$signal" "$detail" >&2
+}
+
 abort_adopt_replacement_with_rollback() { # reason
   local detail rollback_status
   if rollback_adopt_source; then
@@ -3302,6 +3474,8 @@ quarantine_adopt_backup() {
   fi
   adopt_quarantined_backup_matches \
     || die "backup quarantine verification failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  ADOPT_TRANSACTION_PHASE=quarantined
+  dispatch_deferred_operation_signal
   remove_empty_adopt_backup_reservation \
     || die "backup reservation cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE, reservation retained at $ADOPT_BACKUP_RESERVATION"
   create_adopt_directory_skeleton
@@ -3389,6 +3563,8 @@ execute_adopt_replace_source() {
   ADOPT_BACKUP=$ADOPT_BACKUP_RESERVATION/${ADOPT_SOURCE##*/}
   [[ ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
     || die "source backup reservation is not empty, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  begin_operation_signal_deferral
+  ADOPT_TRANSACTION_PHASE=staging
   if "$MV_COMMAND" -hn -- "$ADOPT_SOURCE" "$ADOPT_BACKUP_RESERVATION"; then
     move_status=0
   else
@@ -3405,6 +3581,8 @@ execute_adopt_replace_source() {
       die "cannot stage source backup, source remains unchanged, backup reservation retained at $ADOPT_BACKUP_RESERVATION"
     cleanup_staged_link \
       || die "cannot stage source backup, source remains unchanged, staged link retained at $ADOPT_STAGED_LINK"
+    ADOPT_TRANSACTION_PHASE=none
+    end_operation_signal_deferral
     die "cannot stage source backup, source remains unchanged"
   else
     die "source backup move ended in an ambiguous state (status $move_status), inspect $ADOPT_SOURCE and $ADOPT_BACKUP_RESERVATION"
@@ -3412,7 +3590,11 @@ execute_adopt_replace_source() {
   ADOPT_BACKUP_IDENTITY=$ADOPT_SOURCE_IDENTITY
   ADOPT_BACKUP_DEVICE=$ADOPT_SOURCE_DEVICE
   ADOPT_BACKUP_TREE_DIGEST=$ADOPT_SOURCE_TREE_DIGEST
+  ADOPT_TRANSACTION_PHASE=backup
+  run_named_transition adopt_after_backup_move "$ADOPT_BACKUP"
+  dispatch_deferred_operation_signal
   backup_identity=$(path_identity "$ADOPT_BACKUP") || {
+    dispatch_deferred_operation_signal
     abort_adopt_replacement_with_rollback \
       "cannot verify staged source backup"
   }
@@ -3421,16 +3603,21 @@ execute_adopt_replace_source() {
       "staged source backup identity changed"
   }
   backup_device=$("$BSD_STAT" -f '%d' -- "$ADOPT_BACKUP" \
-    2>/dev/null) \
-    || abort_adopt_replacement_with_rollback \
+    2>/dev/null) || {
+    dispatch_deferred_operation_signal
+    abort_adopt_replacement_with_rollback \
       "cannot verify staged source backup device"
+  }
   [[ "$backup_device" == "$ADOPT_SOURCE_DEVICE" ]] \
     || abort_adopt_replacement_with_rollback \
       "staged source backup device changed"
   backup_digest=$(stable_tree_digest "$ADOPT_BACKUP" \
-    "$backup_identity" "$backup_device") \
-    || abort_adopt_replacement_with_rollback \
+    "$backup_identity" "$backup_device") || {
+    dispatch_deferred_operation_signal
+    abort_adopt_replacement_with_rollback \
       "cannot verify staged source backup manifest"
+  }
+  dispatch_deferred_operation_signal
   [[ "$backup_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] \
     || abort_adopt_replacement_with_rollback \
       "staged source backup manifest changed"
@@ -3453,6 +3640,9 @@ execute_adopt_replace_source() {
       || ! adopt_staged_link_owned_at "$ADOPT_SOURCE"; then
     abort_adopt_replacement_with_rollback "replacement verification failed"
   fi
+  ADOPT_TRANSACTION_PHASE=installed
+  run_named_transition adopt_after_installed_link_verified "$ADOPT_SOURCE"
+  dispatch_deferred_operation_signal
   ADOPT_BACKUP_IDENTITY=$(path_identity "$ADOPT_BACKUP") \
     || die "cannot verify backup before cleanup, backup retained at $ADOPT_BACKUP"
   [[ "$ADOPT_BACKUP_IDENTITY" == "$ADOPT_SOURCE_IDENTITY" \
@@ -3467,8 +3657,13 @@ execute_adopt_replace_source() {
     || die "destination changed before backup cleanup, backup retained at $ADOPT_BACKUP"
   adopt_mount_identity_matches \
     || die "mounted vault changed before backup cleanup, backup retained at $ADOPT_BACKUP"
+  dispatch_deferred_operation_signal
   quarantine_adopt_backup
+  dispatch_deferred_operation_signal
   delete_quarantined_adopt_backup
+  ADOPT_TRANSACTION_PHASE=complete
+  end_operation_signal_deferral
+  ADOPT_TRANSACTION_PHASE=none
 }
 
 verify_adopt_target() {
@@ -4054,6 +4249,11 @@ case "${1:-}" in
     else
       note false
     fi
+    ;;
+  __process_start_valid)
+    [[ $# -eq 2 ]] \
+      || die_usage "usage: vaultlock __process_start_valid <value>"
+    valid_process_start_identity "$2"
     ;;
   __keychain_store)
     [[ $# -eq 1 ]] || die_usage "usage: vaultlock __keychain_store"
