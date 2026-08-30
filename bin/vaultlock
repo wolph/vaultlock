@@ -47,6 +47,9 @@ PLAN_TARGET_TEXT=""
 PLAN_REQUEST_TEXT=""
 
 INIT_PASSPHRASE=""
+INIT_RECOVERY_PATH=""
+INIT_STATE_DIR_IDENTITY=""
+SNAPSHOT_INIT_ABSENT=false
 ADOPT_SOURCE=""
 ADOPT_DESTINATION=""
 ADOPT_SOURCE_IDENTITY=""
@@ -344,6 +347,8 @@ inspect_runtime_state() {
   local device_value mount_value mount_type
   local locked_valid=false mount_valid=true
 
+  SNAPSHOT_INIT_ABSENT=false
+
   SNAPSHOT_RECORDED_LOCKED=unknown
   SNAPSHOT_APFS_LOCKED=unknown
   SNAPSHOT_APFS_MOUNTED=unknown
@@ -540,7 +545,9 @@ classify_runtime_state() {
 render_runtime_summary() {
   local actual_mount=unknown plaintext=absent ciphertext=absent hash=absent
 
-  if [[ "$SNAPSHOT_STATE_VALID" == "true" ]]; then
+  if [[ "$SNAPSHOT_INIT_ABSENT" == "true" ]]; then
+    note "Recorded: absent (init preflight)"
+  elif [[ "$SNAPSHOT_STATE_VALID" == "true" ]]; then
     if [[ "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
       note "Recorded: locked until $SNAPSHOT_DEADLINE"
     else
@@ -550,7 +557,9 @@ render_runtime_summary() {
     note "Recorded: unknown ($SNAPSHOT_ERROR)"
   fi
 
-  if [[ "$SNAPSHOT_APFS_VALID" == "true" ]]; then
+  if [[ "$SNAPSHOT_INIT_ABSENT" == "true" ]]; then
+    note "APFS: absent (no volume named $VOLUME)"
+  elif [[ "$SNAPSHOT_APFS_VALID" == "true" ]]; then
     if [[ "$SNAPSHOT_APFS_LOCKED" == "true" ]]; then
       note "APFS: locked (UUID $SNAPSHOT_ACTUAL_UUID, device $SNAPSHOT_DEVICE)"
     else
@@ -954,6 +963,30 @@ require_mounted() {
         || die "expected vault is not mounted at $MOUNT_POINT"
 }
 
+inspect_init_volume_absence() {
+  local apfs_plist apfs_json conflict_count
+  apfs_plist=$(diskutil apfs list -plist "$CONTAINER" 2>/dev/null) \
+    || die "cannot inspect APFS volumes for init"
+  printf '%s' "$apfs_plist" | plutil -lint - >/dev/null 2>&1 \
+    || die "cannot inspect APFS volumes for init: malformed property list"
+  apfs_json=$(printf '%s' "$apfs_plist" \
+    | plutil -convert json -o - - 2>/dev/null) \
+    || die "cannot inspect APFS volumes for init: conversion failed"
+  conflict_count=$(printf '%s' "$apfs_json" | jq -er \
+      --arg volume "$VOLUME" --arg mount "$MOUNT_POINT" \
+      '[.. | objects | select(
+        ((.Name? == $volume or .VolumeName? == $volume)
+          and (.VolumeUUID? != null or .DeviceIdentifier? != null))
+        or .MountPoint? == $mount
+      )] | length' 2>/dev/null) \
+    || die "cannot inspect APFS volumes for init: invalid converted data"
+  [[ "$conflict_count" =~ ^[0-9]+$ ]] \
+    || die "cannot inspect APFS volumes for init: invalid conflict count"
+  if (( conflict_count > 0 )); then
+    die "volume $VOLUME already exists"
+  fi
+}
+
 inspect_init_absent_state() {
   SNAPSHOT_RECORDED_LOCKED=unknown
   SNAPSHOT_APFS_LOCKED=unknown
@@ -961,7 +994,7 @@ inspect_init_absent_state() {
   SNAPSHOT_EXPECTED_UUID=unknown
   SNAPSHOT_ACTUAL_UUID=unknown
   SNAPSHOT_DEVICE=unknown
-  SNAPSHOT_ACTUAL_MOUNT_POINT=unknown
+  SNAPSHOT_ACTUAL_MOUNT_POINT=""
   SNAPSHOT_DEADLINE=null
   SNAPSHOT_DEADLINE_EPOCH=null
   SNAPSHOT_ROUND=null
@@ -971,6 +1004,7 @@ inspect_init_absent_state() {
   SNAPSHOT_STATE_VALID=false
   SNAPSHOT_APFS_VALID=false
   SNAPSHOT_APFS_INSPECTED=false
+  SNAPSHOT_INIT_ABSENT=false
   SNAPSHOT_VALID=false
   SNAPSHOT_ERROR="state file is absent"
   RUNTIME_ASSESSMENT="not initialized"
@@ -992,9 +1026,9 @@ inspect_init_absent_state() {
       && ! -e "$STATE_DIR/passphrase.sha256" \
       && ! -L "$STATE_DIR/passphrase.sha256" ]] \
     || die "recovery artifacts already exist in $STATE_DIR"
-  if diskutil info -plist "$MOUNT_POINT" >/dev/null 2>&1; then
-    die "volume $VOLUME already exists at $MOUNT_POINT"
-  fi
+  inspect_init_volume_absence
+  SNAPSHOT_APFS_INSPECTED=true
+  SNAPSHOT_INIT_ABSENT=true
 }
 
 build_init_plan() {
@@ -1011,28 +1045,77 @@ safe_public_token() { [[ -n "$1" && "$1" =~ ^[A-Za-z0-9._@+-]+$ ]]; }
 safe_base64_token() { [[ -n "$1" && "$1" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; }
 
 keychain_store_passphrase() { # passphrase
-  local passphrase=$1
+  local passphrase=$1 security_output security_status=0
   safe_public_token "${USER:-}" || die "USER is missing or unsafe for keychain storage"
   safe_public_token "$KEYCHAIN_SERVICE" \
     || die "keychain service is unsafe for keychain storage"
   safe_base64_token "$passphrase" \
     || die "generated recovery material is not valid base64"
-  printf 'add-generic-password -a %s -s %s -w %s -U\n' \
-    "$USER" "$KEYCHAIN_SERVICE" "$passphrase" | security -i
+  require_init_state_dir_identity
+  security_output=$(mktemp "$STATE_DIR/.security-output.XXXXXX") \
+    || die "cannot create protected keychain output channel"
+  chmod 600 "$security_output" \
+    || die "cannot protect keychain output channel"
+  if printf 'add-generic-password -a %s -s %s -w %s -U\n' \
+      "$USER" "$KEYCHAIN_SERVICE" "$passphrase" \
+      | security -i > "$security_output" 2>&1; then
+    security_status=0
+  else
+    security_status=$?
+  fi
+  rm -f -- "$security_output" \
+    || die "cannot remove protected keychain output channel"
+  return "$security_status"
+}
+
+require_init_state_dir_identity() {
+  local actual_identity
+  actual_identity=$(path_identity "$STATE_DIR") \
+    || die "state directory identity is unavailable"
+  [[ "$actual_identity" == "$INIT_STATE_DIR_IDENTITY" \
+      && -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
+    || die "state directory identity changed during init"
 }
 
 execute_init_prepare_state() {
-  mkdir -p "$STATE_DIR"
+  local recovery_identity installed_identity
+  if [[ ! -e "$STATE_DIR" && ! -L "$STATE_DIR" ]]; then
+    mkdir -m 700 "$STATE_DIR" || die "cannot create protected state directory"
+  fi
+  [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
+    || die "state directory is not a real directory: $STATE_DIR"
   chmod 700 "$STATE_DIR"
+  INIT_STATE_DIR_IDENTITY=$(path_identity "$STATE_DIR") \
+    || die "cannot capture state directory identity"
+  require_init_state_dir_identity
   umask 077
+  INIT_RECOVERY_PATH=$(mktemp "$STATE_DIR/.passphrase.XXXXXX") \
+    || die "cannot create protected recovery staging file"
+  chmod 600 "$INIT_RECOVERY_PATH" \
+    || die "cannot protect recovery staging file"
+  recovery_identity=$(path_identity "$INIT_RECOVERY_PATH") \
+    || die "cannot capture recovery staging identity"
   INIT_PASSPHRASE=$(head -c 32 /dev/urandom | base64 | tr -d '\n') \
     || die "recovery material generation failed"
   safe_base64_token "$INIT_PASSPHRASE" \
     || die "recovery material generation returned invalid base64"
-  printf '%s' "$INIT_PASSPHRASE" > "$STATE_DIR/passphrase.txt" \
+  printf '%s' "$INIT_PASSPHRASE" > "$INIT_RECOVERY_PATH" \
     || die "cannot write protected recovery material"
-  chmod 600 "$STATE_DIR/passphrase.txt" \
-    || die "cannot protect recovery material"
+  installed_identity=$(path_identity "$INIT_RECOVERY_PATH") \
+    || die "recovery staging identity is unavailable after generation"
+  [[ "$installed_identity" == "$recovery_identity" ]] \
+    || die "recovery staging identity changed during initialization"
+  require_init_state_dir_identity
+  if ! ln -- "$INIT_RECOVERY_PATH" "$STATE_DIR/passphrase.txt"; then
+    die "recovery path appeared during initialization, protected material remains at $INIT_RECOVERY_PATH"
+  fi
+  installed_identity=$(path_identity "$STATE_DIR/passphrase.txt") \
+    || die "installed recovery identity is unavailable"
+  [[ "$installed_identity" == "$recovery_identity" ]] \
+    || die "installed recovery identity mismatch"
+  rm -f -- "$INIT_RECOVERY_PATH" \
+    || die "cannot remove recovery staging name"
+  INIT_RECOVERY_PATH="$STATE_DIR/passphrase.txt"
 }
 
 execute_init_create_volume() {
@@ -1067,21 +1150,37 @@ read_apfs_identity() { # target
 }
 
 execute_init_write_state() {
-  local identity uuid device temporary_state
+  local identity uuid device temporary_state temporary_identity installed_identity
   identity=$(read_apfs_identity "$MOUNT_POINT") \
     || die "cannot discover final APFS identity, protected recovery material remains at $STATE_DIR/passphrase.txt"
   IFS=$'\t' read -r uuid device <<< "$identity"
   PLAN_CONTEXT_UUID=$uuid
   PLAN_CONTEXT_DEVICE=$device
-  temporary_state="$state_file.tmp.$$"
+  require_init_state_dir_identity
+  temporary_state=$(mktemp "$STATE_DIR/.state.XXXXXX") \
+    || die "state staging path is unsafe, protected recovery material remains at $INIT_RECOVERY_PATH"
+  chmod 600 "$temporary_state" \
+    || die "cannot protect state staging file, recovery material remains at $INIT_RECOVERY_PATH"
+  temporary_identity=$(path_identity "$temporary_state") \
+    || die "cannot capture state staging identity, recovery material remains at $INIT_RECOVERY_PATH"
   jq -n --arg uuid "$uuid" --arg created "$(/bin/date -Iseconds)" \
     '{locked: false, volume_uuid: $uuid, created: $created, deadline: null, deadline_epoch: null, round: null}' \
     > "$temporary_state" \
     || die "initial state creation failed, protected recovery material remains at $STATE_DIR/passphrase.txt"
-  chmod 600 "$temporary_state" \
-    || die "cannot protect initial state, recovery material remains at $STATE_DIR/passphrase.txt"
-  mv "$temporary_state" "$state_file" \
-    || die "initial state installation failed, recovery material remains at $STATE_DIR/passphrase.txt"
+  installed_identity=$(path_identity "$temporary_state") \
+    || die "state staging identity is unavailable after write, recovery material remains at $INIT_RECOVERY_PATH"
+  [[ "$installed_identity" == "$temporary_identity" ]] \
+    || die "state staging path is unsafe, protected recovery material remains at $INIT_RECOVERY_PATH"
+  require_init_state_dir_identity
+  if ! ln -- "$temporary_state" "$state_file"; then
+    die "state staging path is unsafe, protected recovery material remains at $INIT_RECOVERY_PATH"
+  fi
+  installed_identity=$(path_identity "$state_file") \
+    || die "installed state identity is unavailable, recovery material remains at $INIT_RECOVERY_PATH"
+  [[ "$installed_identity" == "$temporary_identity" ]] \
+    || die "installed state identity mismatch, recovery material remains at $INIT_RECOVERY_PATH"
+  rm -f -- "$temporary_state" \
+    || die "cannot remove state staging name, recovery material remains at $INIT_RECOVERY_PATH"
 }
 
 verify_init_target() {
@@ -1133,6 +1232,12 @@ inspect_adopt_state() {
   ADOPT_DESTINATION="$MOUNT_POINT/$leaf"
   [[ ! -e "$ADOPT_DESTINATION" && ! -L "$ADOPT_DESTINATION" ]] \
     || die "$ADOPT_DESTINATION already exists"
+  ADOPT_STAGED_LINK="$ADOPT_SOURCE.vaultlock-link"
+  ADOPT_BACKUP="$ADOPT_SOURCE.vaultlock-backup"
+  [[ ! -e "$ADOPT_STAGED_LINK" && ! -L "$ADOPT_STAGED_LINK" ]] \
+    || die "adopt staging path already exists: $ADOPT_STAGED_LINK"
+  [[ ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
+    || die "adopt backup path already exists: $ADOPT_BACKUP"
   ADOPT_SOURCE_IDENTITY=$(path_identity "$ADOPT_SOURCE") \
     || die "cannot capture source identity"
   PLAN_CONTEXT_UUID=$SNAPSHOT_EXPECTED_UUID
@@ -1198,13 +1303,21 @@ cleanup_staged_link() {
 }
 
 rollback_adopt_source() {
-  local restored_identity
+  local backup_identity restored_identity
   if [[ -L "$ADOPT_SOURCE" ]]; then rm -f -- "$ADOPT_SOURCE" || return 1; fi
   [[ ! -e "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" ]] || return 1
   [[ -d "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
+  backup_identity=$(path_identity "$ADOPT_BACKUP") || return 1
+  [[ "$backup_identity" == "$ADOPT_SOURCE_IDENTITY" ]] || return 1
   mv -- "$ADOPT_BACKUP" "$ADOPT_SOURCE" || return 1
   restored_identity=$(path_identity "$ADOPT_SOURCE") || return 1
-  [[ "$restored_identity" == "$ADOPT_SOURCE_IDENTITY" ]] || return 1
+  if [[ "$restored_identity" != "$ADOPT_SOURCE_IDENTITY" ]]; then
+    if [[ -d "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" \
+        && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]]; then
+      mv -- "$ADOPT_SOURCE" "$ADOPT_BACKUP" || return 1
+    fi
+    return 1
+  fi
   cleanup_staged_link
 }
 
@@ -1217,8 +1330,6 @@ execute_adopt_replace_source() {
   [[ ! -L "$ADOPT_DESTINATION" && -d "$ADOPT_DESTINATION" ]] \
     || die "destination is no longer a real directory"
   verify_adopt_mount_identity
-  ADOPT_STAGED_LINK="$ADOPT_SOURCE.vaultlock-link.$$"
-  ADOPT_BACKUP="$ADOPT_SOURCE.vaultlock-backup.$$"
   [[ ! -e "$ADOPT_STAGED_LINK" && ! -L "$ADOPT_STAGED_LINK" \
       && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
     || die "adopt staging paths already exist"
@@ -1229,22 +1340,20 @@ execute_adopt_replace_source() {
     die "cannot stage source backup, source remains unchanged"
   }
   backup_identity=$(path_identity "$ADOPT_BACKUP") || {
-    rollback_adopt_source || true
-    die "cannot verify staged source backup"
+    die "cannot verify staged source backup, backup retained at $ADOPT_BACKUP"
   }
   [[ "$backup_identity" == "$ADOPT_SOURCE_IDENTITY" ]] || {
-    rollback_adopt_source || true
-    die "staged source backup identity changed"
+    die "staged source backup identity changed, backup retained at $ADOPT_BACKUP"
   }
   if ! mv -- "$ADOPT_STAGED_LINK" "$ADOPT_SOURCE"; then
     rollback_adopt_source \
-      || die "replacement failed and rollback failed, data remains at $ADOPT_BACKUP"
+      || die "replacement failed and rollback failed, data remains at $ADOPT_BACKUP, backup retained at $ADOPT_BACKUP"
     die "replacement failed, original source restored"
   fi
   link_target=$(readlink "$ADOPT_SOURCE" 2>/dev/null) || link_target=""
   if [[ ! -L "$ADOPT_SOURCE" || "$link_target" != "$ADOPT_DESTINATION" ]]; then
     rollback_adopt_source \
-      || die "replacement verification failed and rollback failed, data remains at $ADOPT_BACKUP"
+      || die "replacement verification failed and rollback failed, data remains at $ADOPT_BACKUP, backup retained at $ADOPT_BACKUP"
     die "replacement verification failed, original source restored"
   fi
   backup_identity=$(path_identity "$ADOPT_BACKUP") \
@@ -1584,6 +1693,9 @@ run_planned_command() { # command
     return 0
   fi
   confirm_plan
+  if [[ "$command" == "init" ]]; then
+    inspect_init_absent_state
+  fi
   execute_plan
   case "$command" in
     init)
