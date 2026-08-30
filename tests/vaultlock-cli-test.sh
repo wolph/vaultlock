@@ -26,7 +26,7 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         printf '%s\n' "diskutil $*" >> "$VAULTLOCK_TEST_MUTATION_LOG"
       fi
       ;;
-    security|tmutil|ditto|mv|ln|rm|mkdir|chmod|mktemp)
+    security|tmutil|ditto|mv|ln|rm|rmdir|mkdir|chmod|mktemp)
       printf '%s\n' "$fixture_command $*" >> "$VAULTLOCK_TEST_MUTATION_LOG"
       ;;
     tle)
@@ -54,6 +54,18 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     local fixture_name=$1 fixture_value=$2
     printf '%s\n' "$fixture_value" \
       > "$VAULTLOCK_TEST_APFS_STATE/$fixture_name"
+  }
+
+  fixture_replace_cleanup_state() { # target
+    local fixture_target=$1 fixture_replacement
+    fixture_replacement=${fixture_target%/*}/.cleanup-replacement
+    /usr/bin/stat -f '%d:%i' "$fixture_target" \
+      > "$VAULTLOCK_TEST_APFS_STATE/cleanup_original_identity"
+    printf '%s\n' '{"unowned":"cleanup replacement"}' \
+      > "$fixture_replacement"
+    /bin/mv -f "$fixture_replacement" "$fixture_target"
+    /usr/bin/stat -f '%d:%i' "$fixture_target" \
+      > "$VAULTLOCK_TEST_APFS_STATE/cleanup_replacement_identity"
   }
 
   fake_diskutil_info() {
@@ -137,6 +149,20 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           "<string>$device</string>"
       fi
       printf '%s\n' '</dict></plist>'
+      if [[ "$fixture_target" == "UUID-INIT" \
+          && -f "$VAULTLOCK_STATE_DIR/state.json" ]]; then
+        : > "$VAULTLOCK_TEST_APFS_STATE/final_info_complete"
+        if [[ -f "$VAULTLOCK_TEST_APFS_STATE/overwrite_state_after_final_info" ]]; then
+          /usr/bin/stat -f '%d:%i' "$VAULTLOCK_STATE_DIR/state.json" \
+            > "$VAULTLOCK_TEST_APFS_STATE/state_inode_before_rewrite"
+          printf '%s\n' \
+            '{"locked":false,"volume_uuid":"UUID-INIT","created":"rewritten","deadline":null,"deadline_epoch":null,"round":null}' \
+            > "$VAULTLOCK_STATE_DIR/state.json"
+          /usr/bin/stat -f '%d:%i' "$VAULTLOCK_STATE_DIR/state.json" \
+            > "$VAULTLOCK_TEST_APFS_STATE/state_inode_after_rewrite"
+          /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/overwrite_state_after_final_info"
+        fi
+      fi
       exit 0
     fi
 
@@ -425,7 +451,18 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     stat)
       fixture_stat_path=""
       for fixture_argument in "$@"; do fixture_stat_path=$fixture_argument; done
-      if [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/passphrase.txt" \
+      if [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/state.json" \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_before_quarantine_move" \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/final_info_complete" ]]; then
+        /usr/bin/stat "$@" || exit 1
+        fixture_state_stat_count=$(fixture_read cleanup_state_stat_count) \
+          || fixture_state_stat_count=0
+        fixture_state_stat_count=$((fixture_state_stat_count + 1))
+        fixture_write cleanup_state_stat_count "$fixture_state_stat_count"
+        if [[ $fixture_state_stat_count -ge 4 ]]; then
+          fixture_replace_cleanup_state "$VAULTLOCK_STATE_DIR/state.json"
+        fi
+      elif [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/passphrase.txt" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/recovery_boundary_race" ]]; then
         /usr/bin/stat "$@" || exit 1
         fixture_recovery_race=$(< "$VAULTLOCK_TEST_APFS_STATE/recovery_boundary_race")
@@ -516,6 +553,25 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       fi
       ;;
     mv)
+      fixture_mv_source=""
+      fixture_mv_destination=""
+      for fixture_argument in "$@"; do
+        fixture_mv_source=$fixture_mv_destination
+        fixture_mv_destination=$fixture_argument
+      done
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_before_quarantine_move" \
+          && "$fixture_mv_source" == "$VAULTLOCK_STATE_DIR/state.json" \
+          && "$fixture_mv_destination" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.*/state.json ]]; then
+        fixture_replace_cleanup_state "$VAULTLOCK_STATE_DIR/state.json"
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_before_quarantine_move"
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/make_quarantine_nonprivate_before_move" \
+          && "$fixture_mv_source" == "$VAULTLOCK_STATE_DIR/state.json" \
+          && "$fixture_mv_destination" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.*/state.json ]]; then
+        /bin/chmod 755 "${fixture_mv_destination%/*}"
+        : > "$VAULTLOCK_TEST_APFS_STATE/quarantine_made_nonprivate"
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/make_quarantine_nonprivate_before_move"
+      fi
       fixture_mv_count=0
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/mv_count" ]]; then
         fixture_mv_count=$(< "$VAULTLOCK_TEST_APFS_STATE/mv_count")
@@ -529,6 +585,11 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_rollback_move" \
           || $fixture_mv_count -lt 2 ]] || exit 1
       /bin/mv "$@" || exit 1
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move" \
+          && "$fixture_mv_destination" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.*/state.json ]]; then
+        fixture_replace_cleanup_state "$fixture_mv_destination"
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move"
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_restored_identity" \
           && $fixture_mv_count -ge 3 ]]; then
         : > "$VAULTLOCK_TEST_APFS_STATE/rollback_moved"
@@ -539,13 +600,24 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       /bin/ln "$@"
       ;;
     rm)
+      fixture_rm_path=""
+      for fixture_argument in "$@"; do fixture_rm_path=$fixture_argument; done
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_cleanup" \
           && " $* " == *" -rf "* ]]; then
         exit 1
       fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_init_state_cleanup" \
-          && " $* " == *"$VAULTLOCK_STATE_DIR/state.json"* ]]; then
+          && ( "$fixture_rm_path" == "$VAULTLOCK_STATE_DIR/state.json" \
+            || "$fixture_rm_path" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.*/state.json ) ]]; then
         exit 1
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move" \
+          && " $* " == *"$VAULTLOCK_STATE_DIR/state.json"* ]]; then
+        printf '%s\n' '{"unowned":"cleanup replacement"}' \
+          > "$VAULTLOCK_STATE_DIR/state.json"
+        /usr/bin/stat -f '%d:%i' "$VAULTLOCK_STATE_DIR/state.json" \
+          > "$VAULTLOCK_TEST_APFS_STATE/cleanup_replacement_identity"
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move"
       fi
       /bin/rm "$@" || exit 1
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/modify_recovery_after_state" \
@@ -578,8 +650,21 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/remove_state_after_state"
       fi
       ;;
+    rmdir) /bin/rmdir "$@" ;;
     mkdir) /bin/mkdir "$@" ;;
-    chmod) /bin/chmod "$@" ;;
+    chmod)
+      fixture_chmod_mode=${1:-}
+      fixture_chmod_path=""
+      for fixture_argument in "$@"; do fixture_chmod_path=$fixture_argument; done
+      /bin/chmod "$@"
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/quarantine_made_nonprivate" \
+          && "$fixture_chmod_mode" == "700" \
+          && "$fixture_chmod_path" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.* ]]; then
+        /usr/bin/stat -f '%Lp' "$fixture_chmod_path" \
+          > "$VAULTLOCK_TEST_APFS_STATE/quarantine_reprotected_mode"
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/quarantine_made_nonprivate"
+      fi
+      ;;
     mktemp) /usr/bin/mktemp "$@" ;;
     mount|tle|tmutil|curl)
       ;;
@@ -612,7 +697,7 @@ mkdir -p "$fake_bin" "$apfs_state" "$state_dir" "$mount_point"
 
 TEST_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 for fake_command in diskutil security sudo tle tmutil curl mount head base64 \
-  ditto dirname basename stat find wc readlink mv ln rm mkdir chmod \
+  ditto dirname basename stat find wc readlink mv ln rm rmdir mkdir chmod \
   mktemp \
   mount-fixture bash-version-fixture; do
   ln -s "$TEST_SELF" "$fake_bin/$fake_command"
@@ -1905,6 +1990,13 @@ mv "$confirm_device.saved" "$confirm_device"
   || record_failure "adopt noninteractive confirmation preserves source"
 
 reset_init_fixture() {
+  local stale_quarantine
+  for stale_quarantine in "$state_dir"/.state-quarantine.*; do
+    [[ -d "$stale_quarantine" && ! -L "$stale_quarantine" ]] || continue
+    rm -f "$stale_quarantine/state.json" \
+      "$stale_quarantine/.cleanup-replacement"
+    rmdir "$stale_quarantine"
+  done
   rm -f "$state_dir/state.json" "$state_dir"/state.json.tmp.* \
     "$state_dir"/.passphrase.* "$state_dir"/.state.* \
     "$state_dir"/.security-output.* \
@@ -1933,6 +2025,18 @@ reset_init_fixture() {
     "$apfs_state/swapped_state_identity" \
     "$apfs_state/remove_state_after_state" \
     "$apfs_state/fail_init_state_cleanup" \
+    "$apfs_state/overwrite_state_after_final_info" \
+    "$apfs_state/final_info_complete" \
+    "$apfs_state/state_inode_before_rewrite" \
+    "$apfs_state/state_inode_after_rewrite" \
+    "$apfs_state/swap_state_before_quarantine_move" \
+    "$apfs_state/swap_state_after_quarantine_move" \
+    "$apfs_state/make_quarantine_nonprivate_before_move" \
+    "$apfs_state/quarantine_made_nonprivate" \
+    "$apfs_state/quarantine_reprotected_mode" \
+    "$apfs_state/cleanup_state_stat_count" \
+    "$apfs_state/cleanup_original_identity" \
+    "$apfs_state/cleanup_replacement_identity" \
     "$apfs_state/security_output_artifact_seen" \
     "$apfs_state/swap_identity_after_add" \
     "$apfs_state/unsupported_add_volume_plist"
@@ -2189,10 +2293,39 @@ else
     'installed state removal failed after ownership was proven' \
     "$failed_state_cleanup_output"
 fi
-[[ -f "$state_dir/state.json" && ! -L "$state_dir/state.json" ]] \
+failed_cleanup_retained_state=$(find "$state_dir" -type f \
+  -path "$state_dir/.state-quarantine.*/state.json" -print -quit)
+[[ -n "$failed_cleanup_retained_state" \
+    && -f "$failed_cleanup_retained_state" \
+    && ! -L "$failed_cleanup_retained_state" ]] \
   || record_failure "init state cleanup failure retains owned state"
+check_contains "init state cleanup failure reports retained path" \
+  "$failed_cleanup_retained_state" "$failed_state_cleanup_output"
 check_count "init state cleanup failure does not report success" 0 \
   'Result: created encrypted volume' "$failed_state_cleanup_output"
+
+reset_init_fixture
+: > "$apfs_state/modify_recovery_after_state"
+: > "$apfs_state/make_quarantine_nonprivate_before_move"
+if nonprivate_quarantine_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init rejects nonprivate state quarantine"
+else
+  check_contains "init nonprivate quarantine preserves primary failure" \
+    'installed recovery material changed before final verification' \
+    "$nonprivate_quarantine_output"
+fi
+quarantine_reprotected_mode=""
+if [[ -f "$apfs_state/quarantine_reprotected_mode" ]]; then
+  quarantine_reprotected_mode=$(< "$apfs_state/quarantine_reprotected_mode")
+fi
+check "init nonprivate quarantine is reprotected before cleanup" 700 \
+  "$quarantine_reprotected_mode"
+nonprivate_quarantine_count=$(find "$state_dir" -type d \
+  -name '.state-quarantine.*' | wc -l | tr -d ' ')
+check "init nonprivate quarantine cleanup removes quarantine" 0 \
+  "$nonprivate_quarantine_count"
+[[ ! -e "$state_dir/state.json" && ! -L "$state_dir/state.json" ]] \
+  || record_failure "init nonprivate quarantine cleanup removes owned state"
 
 reset_init_fixture
 : > "$apfs_state/swap_identity_after_add"
@@ -2261,6 +2394,52 @@ check "init state inode swap preserves equivalent UUID content" UUID-INIT \
   "$(jq -r '.volume_uuid' "$state_dir/state.json")"
 check_count "init state inode swap does not report success" 0 \
   'Result: created encrypted volume' "$state_inode_swap_output"
+
+reset_init_fixture
+: > "$apfs_state/overwrite_state_after_final_info"
+if state_content_race_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init rejects in-place state rewrite after final APFS info"
+else
+  check_contains "init in-place state rewrite reports content change" \
+    'installed state content changed before final verification' \
+    "$state_content_race_output"
+fi
+check "init in-place rewrite preserves inode during race" \
+  "$(< "$apfs_state/state_inode_before_rewrite")" \
+  "$(< "$apfs_state/state_inode_after_rewrite")"
+[[ -f "$state_dir/state.json" && ! -L "$state_dir/state.json" ]] \
+  || record_failure "init in-place state rewrite retains changed state safely"
+check_contains "init in-place state rewrite reports retained path" \
+  "$state_dir/state.json" "$state_content_race_output"
+check_count "init in-place state rewrite does not report success" 0 \
+  'Result: created encrypted volume' "$state_content_race_output"
+
+for cleanup_swap_phase in before after; do
+  reset_init_fixture
+  : > "$apfs_state/swap_identity_after_state"
+  : > "$apfs_state/swap_state_${cleanup_swap_phase}_quarantine_move"
+  if cleanup_swap_output=$(run_vaultlock init --yes 2>&1); then
+    record_failure "init rejects state swap ${cleanup_swap_phase} quarantine move"
+  else
+    check_contains "init ${cleanup_swap_phase}-move swap reports retained path" \
+      "$state_dir/state.json" "$cleanup_swap_output"
+  fi
+  if [[ -f "$state_dir/state.json" && ! -L "$state_dir/state.json" ]]; then
+    check "init ${cleanup_swap_phase}-move swap preserves replacement content" \
+      '{"unowned":"cleanup replacement"}' \
+      "$(< "$state_dir/state.json")"
+    check "init ${cleanup_swap_phase}-move swap preserves replacement identity" \
+      "$(< "$apfs_state/cleanup_replacement_identity")" \
+      "$(/usr/bin/stat -f '%d:%i' "$state_dir/state.json")"
+    [[ "$(< "$apfs_state/cleanup_original_identity")" \
+        != "$(< "$apfs_state/cleanup_replacement_identity")" ]] \
+      || record_failure "init ${cleanup_swap_phase}-move fixture replaces inode"
+  else
+    record_failure "init ${cleanup_swap_phase}-move swap preserves replacement"
+  fi
+  check_count "init ${cleanup_swap_phase}-move swap does not report success" 0 \
+    'Result: created encrypted volume' "$cleanup_swap_output"
+done
 
 reset_init_fixture
 printf '{}\n' > "$state_dir/state.json"

@@ -51,6 +51,8 @@ INIT_RECOVERY_PATH=""
 INIT_RECOVERY_IDENTITY=""
 INIT_STATE_DIR_IDENTITY=""
 INIT_STATE_IDENTITY=""
+INIT_STATE_DIGEST=""
+INIT_STATE_CLEANUP_DETAIL=""
 INIT_CREATED_UUID=""
 INIT_CREATED_DEVICE=""
 SNAPSHOT_INIT_ABSENT=false
@@ -1266,8 +1268,30 @@ read_apfs_identity() { # target
   printf '%s\t%s\n' "$uuid" "$device"
 }
 
+state_path_digest() { # path
+  local output digest
+  output=$(/usr/bin/shasum -a 256 < "$1" 2>/dev/null) || return 1
+  digest=${output%% *}
+  [[ "$digest" =~ ^[0123456789abcdef]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
+validate_installed_init_state_path() { # path
+  local path=$1 first_identity digest final_identity
+  [[ -f "$path" && ! -L "$path" \
+      && -n "$INIT_STATE_IDENTITY" && -n "$INIT_STATE_DIGEST" ]] \
+    || return 2
+  first_identity=$(path_identity "$path") || return 2
+  [[ "$first_identity" == "$INIT_STATE_IDENTITY" ]] || return 2
+  digest=$(state_path_digest "$path") || return 3
+  [[ "$digest" == "$INIT_STATE_DIGEST" ]] || return 3
+  final_identity=$(path_identity "$path") || return 2
+  [[ "$final_identity" == "$INIT_STATE_IDENTITY" ]] || return 2
+}
+
 execute_init_write_state() {
   local identity uuid device temporary_state temporary_identity installed_identity
+  local final_identity
   verify_installed_init_recovery "state creation"
   identity=$(read_apfs_identity "$MOUNT_POINT") \
     || die "cannot discover final APFS identity, protected recovery material remains at $STATE_DIR/passphrase.txt"
@@ -1301,37 +1325,143 @@ execute_init_write_state() {
   [[ "$installed_identity" == "$temporary_identity" ]] \
     || die "installed state identity mismatch, recovery material remains at $INIT_RECOVERY_PATH"
   INIT_STATE_IDENTITY=$installed_identity
+  INIT_STATE_DIGEST=$(state_path_digest "$state_file") \
+    || die "installed state content is unreadable, recovery material remains at $INIT_RECOVERY_PATH"
+  final_identity=$(path_identity "$state_file") \
+    || die "installed state identity is unavailable after fingerprinting, recovery material remains at $INIT_RECOVERY_PATH"
+  [[ "$final_identity" == "$INIT_STATE_IDENTITY" ]] \
+    || die "installed state identity changed during fingerprinting, recovery material remains at $INIT_RECOVERY_PATH"
   rm -f -- "$temporary_state" \
     || die "cannot remove state staging name, recovery material remains at $INIT_RECOVERY_PATH"
 }
 
+ensure_init_quarantine_private() { # directory expected_identity
+  local directory=$1 expected_identity=$2 actual_identity actual_mode
+  actual_identity=$(path_identity "$directory") || return 1
+  [[ "$actual_identity" == "$expected_identity" \
+      && -d "$directory" && ! -L "$directory" ]] \
+    || return 1
+  actual_mode=$(path_mode "$directory") || return 1
+  if [[ "$actual_mode" != "700" ]]; then
+    chmod 700 "$directory" || return 1
+    actual_identity=$(path_identity "$directory") || return 1
+    actual_mode=$(path_mode "$directory") || return 1
+    [[ "$actual_identity" == "$expected_identity" \
+        && "$actual_mode" == "700" \
+        && -d "$directory" && ! -L "$directory" ]] \
+      || return 1
+  fi
+}
+
+restore_quarantined_init_state() { # directory expected_identity path
+  local directory=$1 expected_identity=$2 path=$3
+  local actual_identity moved_identity restored_identity
+  INIT_STATE_CLEANUP_DETAIL=$path
+  if [[ -e "$state_file" || -L "$state_file" ]]; then
+    INIT_STATE_CLEANUP_DETAIL="$path; unowned original-path entry retained at $state_file"
+    return 0
+  fi
+  [[ -f "$path" && ! -L "$path" ]] || return 0
+  actual_identity=$(path_identity "$directory") || return 0
+  [[ "$actual_identity" == "$expected_identity" \
+      && -d "$directory" && ! -L "$directory" ]] \
+    || return 0
+  moved_identity=$(path_identity "$path") || return 0
+  if ! mv -n -- "$path" "$state_file"; then
+    if [[ ! -e "$path" && ! -L "$path" \
+        && ( -e "$state_file" || -L "$state_file" ) ]]; then
+      INIT_STATE_CLEANUP_DETAIL=$state_file
+    elif [[ -e "$state_file" || -L "$state_file" ]]; then
+      INIT_STATE_CLEANUP_DETAIL="$path; unowned original-path entry retained at $state_file"
+    fi
+    return 0
+  fi
+  if [[ ! -e "$path" && ! -L "$path" \
+      && ( -e "$state_file" || -L "$state_file" ) ]]; then
+    INIT_STATE_CLEANUP_DETAIL=$state_file
+  elif [[ ( -e "$path" || -L "$path" ) \
+      && ( -e "$state_file" || -L "$state_file" ) ]]; then
+    INIT_STATE_CLEANUP_DETAIL="$path; unowned original-path entry retained at $state_file"
+    return 0
+  else
+    return 0
+  fi
+  if [[ ! -f "$state_file" || -L "$state_file" ]]; then
+    INIT_STATE_CLEANUP_DETAIL="unowned original-path entry retained at $state_file"
+    return 0
+  fi
+  restored_identity=$(path_identity "$state_file") || return 0
+  if [[ "$restored_identity" != "$moved_identity" ]]; then
+    INIT_STATE_CLEANUP_DETAIL="unowned original-path entry retained at $state_file"
+    return 0
+  fi
+  rmdir -- "$directory" 2>/dev/null \
+    || INIT_STATE_CLEANUP_DETAIL="$state_file; quarantine directory retained at $directory"
+}
+
 remove_owned_init_state() {
-  local actual_identity final_identity
-  local actual_state_dir_identity
+  local actual_state_dir_identity quarantine_dir quarantine_identity
+  local quarantine_path
+  INIT_STATE_CLEANUP_DETAIL=""
   if [[ ! -e "$state_file" && ! -L "$state_file" ]]; then
     return 0
   fi
-  actual_state_dir_identity=$(path_identity "$STATE_DIR") || return 2
+  actual_state_dir_identity=$(path_identity "$STATE_DIR") \
+    || { INIT_STATE_CLEANUP_DETAIL=$state_file; return 2; }
   [[ "$actual_state_dir_identity" == "$INIT_STATE_DIR_IDENTITY" \
       && -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
-    || return 2
-  [[ -f "$state_file" && ! -L "$state_file" \
-      && -n "$INIT_STATE_IDENTITY" ]] \
-    || return 2
-  actual_identity=$(path_identity "$state_file") \
-    || return 2
-  [[ "$actual_identity" == "$INIT_STATE_IDENTITY" ]] \
-    || return 2
-  final_identity=$(path_identity "$state_file") \
-    || return 2
-  [[ "$final_identity" == "$INIT_STATE_IDENTITY" ]] \
-    || return 2
-  if ! rm -f -- "$state_file"; then
-    [[ ! -e "$state_file" && ! -L "$state_file" ]] && return 0
+    || { INIT_STATE_CLEANUP_DETAIL=$state_file; return 2; }
+  if ! validate_installed_init_state_path "$state_file"; then
+    INIT_STATE_CLEANUP_DETAIL=$state_file
+    return 2
+  fi
+  quarantine_dir=$(mktemp -d "$STATE_DIR/.state-quarantine.XXXXXX") \
+    || { INIT_STATE_CLEANUP_DETAIL=$state_file; return 3; }
+  chmod 700 "$quarantine_dir" \
+    || { INIT_STATE_CLEANUP_DETAIL="$state_file; quarantine directory retained at $quarantine_dir"; return 3; }
+  quarantine_identity=$(path_identity "$quarantine_dir") \
+    || { INIT_STATE_CLEANUP_DETAIL="$state_file; quarantine directory retained at $quarantine_dir"; return 3; }
+  quarantine_path="$quarantine_dir/state.json"
+  [[ ! -e "$quarantine_path" && ! -L "$quarantine_path" ]] \
+    || { INIT_STATE_CLEANUP_DETAIL="$state_file; unexpected entry retained at $quarantine_path"; return 3; }
+  ensure_init_quarantine_private "$quarantine_dir" "$quarantine_identity" \
+    || { INIT_STATE_CLEANUP_DETAIL="$state_file; quarantine directory retained at $quarantine_dir"; return 3; }
+  if ! mv -- "$state_file" "$quarantine_path"; then
+    rmdir -- "$quarantine_dir" 2>/dev/null || true
+    INIT_STATE_CLEANUP_DETAIL=$state_file
     return 3
   fi
-  [[ ! -e "$state_file" && ! -L "$state_file" ]] \
-    || return 3
+  if ! ensure_init_quarantine_private \
+      "$quarantine_dir" "$quarantine_identity"; then
+    restore_quarantined_init_state \
+      "$quarantine_dir" "$quarantine_identity" "$quarantine_path"
+    return 2
+  fi
+  if validate_installed_init_state_path "$quarantine_path"; then
+    if ! ensure_init_quarantine_private \
+        "$quarantine_dir" "$quarantine_identity"; then
+      restore_quarantined_init_state \
+        "$quarantine_dir" "$quarantine_identity" "$quarantine_path"
+      return 2
+    fi
+    if ! rm -f -- "$quarantine_path"; then
+      if [[ ! -e "$quarantine_path" && ! -L "$quarantine_path" ]]; then
+        rmdir -- "$quarantine_dir" \
+          || { INIT_STATE_CLEANUP_DETAIL=$quarantine_dir; return 3; }
+        return 0
+      fi
+      INIT_STATE_CLEANUP_DETAIL=$quarantine_path
+      return 3
+    fi
+    [[ ! -e "$quarantine_path" && ! -L "$quarantine_path" ]] \
+      || { INIT_STATE_CLEANUP_DETAIL=$quarantine_path; return 3; }
+    rmdir -- "$quarantine_dir" \
+      || { INIT_STATE_CLEANUP_DETAIL=$quarantine_dir; return 3; }
+    return 0
+  fi
+  restore_quarantined_init_state \
+    "$quarantine_dir" "$quarantine_identity" "$quarantine_path"
+  return 2
 }
 
 die_after_init_state_cleanup() { # primary_error
@@ -1343,10 +1473,10 @@ die_after_init_state_cleanup() { # primary_error
   fi
   case "$cleanup_status" in
     2)
-      die "$primary_error; installed state retained because ownership could not be proven"
+      die "$primary_error; installed state retained because ownership could not be proven at $INIT_STATE_CLEANUP_DETAIL"
       ;;
     3)
-      die "$primary_error; installed state removal failed after ownership was proven"
+      die "$primary_error; installed state removal failed after ownership was proven; retained at $INIT_STATE_CLEANUP_DETAIL"
       ;;
     *)
       die "$primary_error; installed state cleanup failed unexpectedly"
@@ -1354,13 +1484,23 @@ die_after_init_state_cleanup() { # primary_error
   esac
 }
 
-init_state_identity_is_current() {
-  local actual_identity
-  [[ -f "$state_file" && ! -L "$state_file" \
-      && -n "$INIT_STATE_IDENTITY" ]] \
-    || return 1
-  actual_identity=$(path_identity "$state_file") || return 1
-  [[ "$actual_identity" == "$INIT_STATE_IDENTITY" ]]
+verify_installed_init_state_or_cleanup() {
+  local validation_status
+  if validate_installed_init_state_path "$state_file"; then
+    return 0
+  else
+    validation_status=$?
+  fi
+  case "$validation_status" in
+    3)
+      die_after_init_state_cleanup \
+        "installed state content changed before final verification"
+      ;;
+    *)
+      die_after_init_state_cleanup \
+        "installed state identity changed before final verification"
+      ;;
+  esac
 }
 
 verify_init_target() {
@@ -1368,20 +1508,17 @@ verify_init_target() {
     die_after_init_state_cleanup \
       "installed recovery material changed before final verification"
   fi
-  if ! init_state_identity_is_current; then
-    die_after_init_state_cleanup \
-      "installed state identity changed before final verification"
-  fi
+  verify_installed_init_state_or_cleanup
   inspect_runtime_state
   classify_runtime_state
+  verify_installed_init_state_or_cleanup
   if [[ "$RUNTIME_ASSESSMENT" == "usable" \
       && "$SNAPSHOT_EXPECTED_UUID" == "$INIT_CREATED_UUID" \
       && "$SNAPSHOT_ACTUAL_UUID" == "$INIT_CREATED_UUID" \
       && "$SNAPSHOT_DEVICE" == "$INIT_CREATED_DEVICE" \
       && "$PLAN_CONTEXT_UUID" == "$INIT_CREATED_UUID" \
       && "$PLAN_CONTEXT_DEVICE" == "$INIT_CREATED_DEVICE" ]] \
-      && installed_init_recovery_is_valid \
-      && init_state_identity_is_current; then
+      && installed_init_recovery_is_valid; then
     return 0
   fi
   die_after_init_state_cleanup \
@@ -1394,6 +1531,7 @@ path_has_control_character() {
   LC_ALL=C printf '%s' "$1" | grep -q '[[:cntrl:]]'
 }
 path_identity() { stat -f '%d:%i' -- "$1" 2>/dev/null; }
+path_mode() { stat -f '%Lp' -- "$1" 2>/dev/null; }
 
 assert_path_identity() { # path expected description
   local actual
