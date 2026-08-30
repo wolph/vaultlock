@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+# vaultlock - time-locked encrypted APFS volume via drand tlock.
+#
+# The volume passphrase is rotated to a random value at lock time and
+# tlock-encrypted to the drand round of the deadline. Before that round
+# exists, the decryption key material does not exist anywhere.
+#
+# Env overrides (for tests): VAULTLOCK_STATE_DIR, VAULTLOCK_VOLUME,
+# VAULTLOCK_CONTAINER, VAULTLOCK_MOUNT_POINT.
+# shellcheck disable=SC2034  # Constants are used by later tasks
+set -euo pipefail
+
+QUICKNET_CHAIN=52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971
+QUICKNET_GENESIS=1692803367
+QUICKNET_PERIOD=3
+DRAND_URL=https://api.drand.sh
+# Must match tle's real "not yet decryptable" wording (verified in Task 1).
+EARLY_RE='too early|not (yet )?available|future'
+
+STATE_DIR=${VAULTLOCK_STATE_DIR:-$HOME/.vaultlock}
+VOLUME=${VAULTLOCK_VOLUME:-vault}
+CONTAINER=${VAULTLOCK_CONTAINER:-disk3}
+MOUNT_POINT=${VAULTLOCK_MOUNT_POINT:-/Volumes/$VOLUME}
+KEYCHAIN_SERVICE="vaultlock-$VOLUME"
+state_file="$STATE_DIR/state.json"
+
+die() { printf 'vaultlock: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*"; }
+
+tle_bin() {
+  if command -v tle; then return 0; fi
+  local p
+  for p in "$HOME/bin/tle" "$HOME/go/bin/tle"; do
+    if [[ -x "$p" ]]; then printf '%s\n' "$p"; return 0; fi
+  done
+  return 1
+}
+
+# Smallest round whose beacon time (genesis + (r-1)*period) >= epoch.
+round_for_epoch() {
+  local epoch=$1
+  if (( epoch <= QUICKNET_GENESIS )); then printf '1\n'; return 0; fi
+  printf '%s\n' $(( (epoch - QUICKNET_GENESIS + QUICKNET_PERIOD - 1) / QUICKNET_PERIOD + 1 ))
+}
+
+current_round() { round_for_epoch "$(/bin/date +%s)"; }
+
+# Keep arithmetic operands small enough to avoid signed 64-bit overflow.
+safe_component() {
+  local value=$1
+  [[ "$value" =~ ^[0-9]+$ && ${#value} -le 9 ]]
+}
+
+safe_epoch() {
+  local value=$1
+  [[ "$value" =~ ^[0-9]+$ && ${#value} -le 18 ]]
+}
+
+normalize_clock() {
+  local value=$1
+  local -i hour minute
+  local clock_re='^([0-9]|[0-9][0-9]):([0-9][0-9])$'
+  [[ "$value" =~ $clock_re ]] || return 1
+  hour=$((10#${BASH_REMATCH[1]}))
+  minute=$((10#${BASH_REMATCH[2]}))
+  (( hour <= 23 && minute <= 59 )) || return 1
+  printf '%02d:%02d\n' "$hour" "$minute"
+}
+
+format_local_minute() {
+  /bin/date -j -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null
+}
+
+# Parse a canonical local minute without accepting date's normalization.
+parse_local_minute() {
+  local value=$1 epoch
+  epoch=$(/bin/date -j -f '%Y-%m-%d %H:%M:%S' "$value:00" +%s 2>/dev/null) \
+    || return 1
+  [[ "$(format_local_minute "$epoch")" == "$value" ]] || return 1
+  printf '%s\n' "$epoch"
+}
+
+local_date_for_epoch() {
+  /bin/date -j -r "$1" '+%Y-%m-%d' 2>/dev/null
+}
+
+add_local_days() {
+  local date_value=$1 days=$2
+  /bin/date -j "-v+${days}d" -f '%Y-%m-%d %H:%M:%S' \
+    "$date_value 12:00:00" '+%Y-%m-%d' 2>/dev/null
+}
+
+epoch_is_supported() {
+  /bin/date -j -r "$1" '+%Y-%m-%dT%H:%M:%S%z' >/dev/null 2>&1
+}
+
+resolve_duration() {
+  local expression=$1 now=$2 day_part hour_part minute_part
+  local duration_re='^([0-9]+d)?([0-9]+h)?([0-9]+m)?$'
+  local -i days=0 hours=0 minutes=0 total target
+
+  [[ -n "$expression" && "$expression" =~ $duration_re ]] || return 1
+  day_part=${BASH_REMATCH[1]%d}
+  hour_part=${BASH_REMATCH[2]%h}
+  minute_part=${BASH_REMATCH[3]%m}
+
+  if [[ -n "$day_part" ]]; then
+    safe_component "$day_part" || return 1
+    days=$((10#$day_part))
+  fi
+  if [[ -n "$hour_part" ]]; then
+    safe_component "$hour_part" || return 1
+    hours=$((10#$hour_part))
+  fi
+  if [[ -n "$minute_part" ]]; then
+    safe_component "$minute_part" || return 1
+    minutes=$((10#$minute_part))
+  fi
+
+  total=$(( days * 86400 + hours * 3600 + minutes * 60 ))
+  (( total > 0 )) || return 1
+  target=$(( now + total ))
+  (( target > now )) || return 1
+  epoch_is_supported "$target" || return 1
+  printf '%s\n' "$target"
+}
+
+resolve_clock() {
+  local raw_clock=$1 now=$2 clock date_value first second wanted
+  local -i attempt=0
+  clock=$(normalize_clock "$raw_clock") || return 1
+  date_value=$(local_date_for_epoch "$now") || return 1
+
+  while (( attempt < 3 )); do
+    wanted="$date_value $clock"
+    if first=$(parse_local_minute "$wanted"); then
+      if (( first > now )); then
+        printf '%s\n' "$first"
+        return 0
+      fi
+
+      # Europe/Amsterdam fall-back repeats the local hour one hour later.
+      second=$(( first + 3600 ))
+      if (( second > now )) \
+          && [[ "$(format_local_minute "$second")" == "$wanted" ]]; then
+        printf '%s\n' "$second"
+        return 0
+      fi
+    fi
+    date_value=$(add_local_days "$date_value" 1) || return 1
+    attempt=$(( attempt + 1 ))
+  done
+  return 1
+}
+
+resolve_deadline() {
+  local expression=$1 now_text=$2 clock days_text today target_date
+  local -i now target days
+  local absolute_re='^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]$'
+  local combined_re='^(([0-9]|[0-9][0-9]):[0-9][0-9])[[:space:]]+\+([0-9]+)d$'
+  local clock_re='^([0-9]|[0-9][0-9]):[0-9][0-9]$'
+
+  safe_epoch "$now_text" || return 1
+  now=$((10#$now_text))
+
+  if [[ "$expression" =~ $absolute_re ]]; then
+    target=$(parse_local_minute "$expression") || return 1
+    (( target > now )) || return 1
+    printf '%s\n' "$target"
+    return 0
+  fi
+
+  if [[ "$expression" =~ $combined_re ]]; then
+    clock=${BASH_REMATCH[1]}
+    days_text=${BASH_REMATCH[3]}
+    clock=$(normalize_clock "$clock") || return 1
+    safe_component "$days_text" || return 1
+    days=$((10#$days_text))
+    (( days > 0 )) || return 1
+    today=$(local_date_for_epoch "$now") || return 1
+    target_date=$(add_local_days "$today" "$days") || return 1
+    target=$(parse_local_minute "$target_date $clock") || return 1
+    (( target > now )) || return 1
+    printf '%s\n' "$target"
+    return 0
+  fi
+
+  if [[ "$expression" =~ $clock_re ]]; then
+    resolve_clock "$expression" "$now"
+    return
+  fi
+
+  resolve_duration "$expression" "$now"
+}
+
+# "YYYY-MM-DD HH:MM" in local time -> epoch seconds at second zero.
+parse_deadline() {
+  parse_local_minute "$1"
+}
+
+state_get() { jq -r "$1" "$state_file"; }
+vol_uuid() { state_get .volume_uuid; }
+
+# Resolve the volume's current device node (diskXsY) from its stable UUID.
+# Device numbers can change across reboots, the UUID cannot.
+vol_device() {
+    diskutil info -plist "$(vol_uuid)" | plutil -extract DeviceIdentifier raw -o - -
+}
+
+verify_mount_identity() { # expected_uuid expected_device
+    local expected_uuid=$1 expected_device=$2 plist actual_uuid actual_device
+
+    if plist=$(diskutil info -plist "$MOUNT_POINT" 2>/dev/null); then
+        actual_uuid=$(printf '%s' "$plist" \
+            | plutil -extract VolumeUUID raw -o - - 2>/dev/null) \
+            || actual_uuid='<unavailable>'
+        actual_device=$(printf '%s' "$plist" \
+            | plutil -extract DeviceIdentifier raw -o - - 2>/dev/null) \
+            || actual_device='<unavailable>'
+    else
+        actual_uuid='<unavailable>'
+        actual_device='<unavailable>'
+    fi
+
+    if [[ "$actual_uuid" == "$expected_uuid" \
+        && "$actual_device" == "$expected_device" ]]; then
+        return 0
+    fi
+
+    printf 'vaultlock: mount identity mismatch at %s: expected UUID %s device %s, got UUID %s device %s\n' \
+        "$MOUNT_POINT" "$expected_uuid" "$expected_device" \
+        "$actual_uuid" "$actual_device" >&2
+    return 1
+}
+
+run_hook_file() { # mode phase scope hook uuid device deadline epoch round locked
+  local mode=$1 phase=$2 scope=$3 hook=$4 uuid=$5 device=$6
+  local deadline=$7 deadline_epoch=$8 round=$9
+  shift 9
+  local locked=$1 status
+  local -a hook_args=(
+    --phase "$phase"
+    --scope "$scope"
+    --volume "$VOLUME"
+    --mount-point "$MOUNT_POINT"
+    --volume-uuid "$uuid"
+    --device "$device"
+    --state-dir "$STATE_DIR"
+    --state-file "$state_file"
+    --deadline "$deadline"
+    --deadline-epoch "$deadline_epoch"
+    --round "$round"
+    --locked "$locked"
+  )
+
+  note "running $phase $scope hook: $hook"
+  if "$hook" "${hook_args[@]}"; then
+    return 0
+  else
+    status=$?
+  fi
+  printf 'vaultlock: %s %s hook failed with exit %s: %s\n' \
+    "$phase" "$scope" "$status" "$hook" >&2
+  [[ "$mode" == "post" ]] && return 1
+  return "$status"
+}
+
+run_hook_directory() { # mode phase scope dir uuid device deadline epoch round locked
+    local mode=$1 phase=$2 scope=$3 directory=$4 uuid=$5 device=$6
+    local deadline=$7 deadline_epoch=$8 round=$9
+    shift 9
+    local locked=$1 hook previous_lc=${LC_ALL-} previous_globignore=${GLOBIGNORE-} status
+    local -i had_lc=0 had_globignore=0 globignore_exported=0 had_noglob=0
+    local -i had_dotglob=0 had_failglob=0 had_nullglob=0 failed=0
+    local -a hooks
+
+    [[ -d "$directory" ]] || return 0
+    [[ ${LC_ALL+x} ]] && had_lc=1
+    [[ ${GLOBIGNORE+x} ]] && had_globignore=1
+    if export -p GLOBIGNORE >/dev/null 2>&1; then globignore_exported=1; fi
+    [[ $- == *f* ]] && had_noglob=1
+    if shopt -q dotglob; then had_dotglob=1; fi
+    if shopt -q failglob; then had_failglob=1; fi
+    if shopt -q nullglob; then had_nullglob=1; fi
+
+    set +f
+    shopt -u dotglob failglob
+    shopt -s nullglob
+    unset GLOBIGNORE
+    LC_ALL=C
+    hooks=("$directory"/*)
+
+    if (( had_lc )); then LC_ALL=$previous_lc; else unset LC_ALL; fi
+    if (( had_globignore )); then
+        GLOBIGNORE=$previous_globignore
+        if (( globignore_exported )); then export GLOBIGNORE; fi
+    else
+        unset GLOBIGNORE
+    fi
+    if (( had_dotglob )); then shopt -s dotglob; else shopt -u dotglob; fi
+    if (( had_failglob )); then shopt -s failglob; else shopt -u failglob; fi
+    if (( had_nullglob )); then shopt -s nullglob; else shopt -u nullglob; fi
+    if (( had_noglob )); then set -f; else set +f; fi
+
+    for hook in "${hooks[@]}"; do
+    [[ -f "$hook" && -x "$hook" ]] || continue
+    if run_hook_file "$mode" "$phase" "$scope" "$hook" "$uuid" "$device" \
+        "$deadline" "$deadline_epoch" "$round" "$locked"; then
+      continue
+    else
+      status=$?
+    fi
+    if [[ "$mode" == "pre" ]]; then return "$status"; fi
+    failed=1
+  done
+  (( failed == 0 ))
+}
+
+run_pre_lock_hooks() { # uuid device deadline epoch round locked
+    local uuid=$1 device=$2 deadline=$3 epoch=$4 round=$5 locked=$6
+    local legacy="$STATE_DIR/pre-lock.sh"
+
+    verify_mount_identity "$uuid" "$device" || return
+    if [[ -f "$legacy" && -x "$legacy" ]]; then
+    run_hook_file pre pre-lock global "$legacy" "$uuid" "$device" \
+      "$deadline" "$epoch" "$round" "$locked" || return
+  fi
+    run_hook_directory pre pre-lock global "$STATE_DIR/hooks/pre-lock.d" \
+        "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked" || return
+    verify_mount_identity "$uuid" "$device" || return
+    run_hook_directory pre pre-lock vault "$MOUNT_POINT/.vaultlock/hooks/pre-lock.d" \
+        "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked"
+}
+
+run_post_unlock_hooks() { # uuid device deadline epoch round locked
+    local uuid=$1 device=$2 deadline=$3 epoch=$4 round=$5 locked=$6
+    local -i failed=0
+
+    verify_mount_identity "$uuid" "$device" || return
+    run_hook_directory post post-unlock vault \
+    "$MOUNT_POINT/.vaultlock/hooks/post-unlock.d" \
+    "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked" || failed=1
+  run_hook_directory post post-unlock global "$STATE_DIR/hooks/post-unlock.d" \
+    "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked" || failed=1
+  (( failed == 0 ))
+}
+
+run_hook_phase() { # phase uuid device deadline epoch round locked
+  local phase=$1 uuid=$2 device=$3 deadline=$4 epoch=$5 round=$6 locked=$7
+  case "$phase" in
+    pre-lock)
+      run_pre_lock_hooks "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked"
+      ;;
+    post-lock)
+      run_hook_directory post post-lock global "$STATE_DIR/hooks/post-lock.d" \
+        "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked"
+      ;;
+    pre-unlock)
+      run_hook_directory pre pre-unlock global "$STATE_DIR/hooks/pre-unlock.d" \
+        "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked"
+      ;;
+    post-unlock)
+      run_post_unlock_hooks "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked"
+      ;;
+    *)
+      die "unknown hook phase: $phase"
+      ;;
+  esac
+}
+
+# Mount the vault if it is crypto-unlocked but unmounted. Die if locked.
+require_mounted() {
+    local uuid device
+
+    uuid=$(vol_uuid)
+    device=$(vol_device)
+    if ! mount | grep -q "on $MOUNT_POINT ("; then
+        diskutil mount "$device" >/dev/null 2>&1 \
+            || die "vault is not mountable (locked?), see: vaultlock status"
+    fi
+    verify_mount_identity "$uuid" "$device" \
+        || die "expected vault is not mounted at $MOUNT_POINT"
+}
+
+cmd_init() {
+  [[ -e "$state_file" ]] && die "state already exists at $state_file"
+  diskutil info "$MOUNT_POINT" >/dev/null 2>&1 && die "volume $VOLUME already exists"
+  command -v jq >/dev/null || die "jq required"
+  tle_bin >/dev/null || die "tle required, see Task 1 of the plan"
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+  umask 077
+  local pass
+  pass=$(head -c 32 /dev/urandom | base64)
+  printf '%s' "$pass" > "$STATE_DIR/passphrase.txt"
+  security add-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w "$pass" -U
+  printf '%s' "$pass" | sudo diskutil apfs addVolume "$CONTAINER" APFS "$VOLUME" -stdinpassphrase
+  local uuid
+  uuid=$(diskutil info -plist "$MOUNT_POINT" | plutil -extract VolumeUUID raw -o - -)
+  jq -n --arg uuid "$uuid" --arg created "$(/bin/date -Iseconds)" \
+    '{locked: false, volume_uuid: $uuid, created: $created,
+      deadline: null, deadline_epoch: null, round: null}' > "$state_file"
+  note "created encrypted volume $VOLUME ($uuid), state in $STATE_DIR"
+}
+
+cmd_adopt() {
+  local src=${1:?usage: vaultlock adopt <dir>}
+  src=${src%/}
+  src="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
+  [[ -d "$src" && ! -L "$src" ]] || die "$src is not a real directory"
+  [[ "$src" != "$MOUNT_POINT"/* ]] || die "$src is already on the vault"
+  [[ -f "$state_file" ]] || die "no state, run vaultlock init first"
+  require_mounted
+  local dst
+  dst="$MOUNT_POINT/$(basename "$src")"
+  [[ -e "$dst" ]] && die "$dst already exists"
+  note "copying $src -> $dst (ditto preserves xattrs and permissions)"
+  ditto "$src" "$dst"
+  local n_src n_dst
+  n_src=$(find "$src" | wc -l | tr -d ' ') || die "entry count failed for $src (partial copy may remain at $dst)"
+  n_dst=$(find "$dst" | wc -l | tr -d ' ') || die "entry count failed for $dst (partial copy remains at $dst)"
+  [[ "$n_src" == "$n_dst" ]] \
+    || die "copy verification failed ($n_src vs $n_dst entries), source kept at $src"
+  rm -rf "$src"
+  ln -s "$dst" "$src"
+  note "adopted: $src -> $dst"
+}
+
+sha256_of() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
+
+remaining_human() {
+  local target=$1 now rem
+  now=$(/bin/date +%s)
+  rem=$(( target - now ))
+  if (( rem <= 0 )); then printf 'deadline passed\n'; return 0; fi
+  printf '%dh %dm\n' $(( rem / 3600 )) $(( rem % 3600 / 60 ))
+}
+
+cmd_lock() {
+  local when tle target now round dev pass errfile lock_out deadline_iso uuid
+  local skip_hooks=false
+  if [[ "${1:-}" == "--no-hooks" ]]; then
+    skip_hooks=true
+    shift
+  fi
+  if [[ "${1:-}" == --* ]]; then
+    die "unknown lock option: $1"
+  fi
+  [[ $# -gt 0 ]] || die "usage: vaultlock lock <deadline>"
+  when=$*
+  now=$(/bin/date +%s)
+  target=$(resolve_deadline "$when" "$now") \
+    || die "cannot resolve '$when' to a future deadline, see: vaultlock help"
+  deadline_iso=$(/bin/date -j -r "$target" '+%Y-%m-%dT%H:%M:%S%z') \
+    || die "deadline is outside the supported date range"
+  [[ -f "$state_file" ]] || die "no state, run vaultlock init first"
+  [[ "$(state_get .locked)" == "false" ]] || die "already locked until $(state_get .deadline)"
+  [[ -f "$STATE_DIR/passphrase.txt" ]] || die "missing $STATE_DIR/passphrase.txt, cannot rotate"
+  tle=$(tle_bin) || die "tle not found"
+  curl -fsS --max-time 10 "$DRAND_URL/$QUICKNET_CHAIN/info" >/dev/null \
+    || die "drand chain info unreachable, refusing to lock"
+  require_mounted
+  dev=$(vol_device)
+  uuid=$(vol_uuid)
+  round=$(round_for_epoch "$target")
+
+  if [[ "$skip_hooks" == "false" ]]; then
+    run_hook_phase pre-lock "$uuid" "$dev" "$deadline_iso" "$target" "$round" false \
+      || die "pre-lock hooks failed, vault remains unlocked"
+  fi
+
+  # Backup hatches, while the mount point still exists.
+  # -v (volume-level) is the only exclusion kind tmutil accepts for a
+  # volume root; sticky and -p (fixed-path) exclusions both fail with
+  # "Invalid argument" on a mount point (verified against tmutil(8)).
+  sudo tmutil addexclusion -v "$MOUNT_POINT"
+  sudo tmutil deletelocalsnapshots "$MOUNT_POINT" >/dev/null 2>&1 || true
+
+  if ! diskutil unmount "$MOUNT_POINT"; then
+    note "vault is busy, offending processes:"
+    lsof +f -- "$MOUNT_POINT" || true
+    die "close them and rerun vaultlock lock (no crypto state was changed)"
+  fi
+
+  pass=$(head -c 32 /dev/urandom | base64)
+  umask 077
+  # New passphrase hits disk BEFORE the volume learns it. A crash between
+  # these steps leaves the volume passphrase known on disk either way.
+  printf '%s' "$pass" > "$STATE_DIR/passphrase-new.txt"
+  sudo diskutil apfs changePassphrase "$dev" -user disk \
+    -oldpassphrase "$(cat "$STATE_DIR/passphrase.txt")" -newpassphrase "$pass"
+  mv "$STATE_DIR/passphrase-new.txt" "$STATE_DIR/passphrase.txt"
+  security add-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w "$pass" -U
+
+  printf '%s' "$pass" | "$tle" -e -n "$DRAND_URL" -c "$QUICKNET_CHAIN" -r "$round" \
+    -o "$STATE_DIR/passphrase.tle"
+  [[ -s "$STATE_DIR/passphrase.tle" ]] || die "empty ciphertext, NOT locking"
+  errfile="$STATE_DIR/.tle-verify-err"
+  if "$tle" -d -n "$DRAND_URL" -c "$QUICKNET_CHAIN" "$STATE_DIR/passphrase.tle" \
+      >/dev/null 2>"$errfile"; then
+    die "ciphertext decrypts right now (past round?), NOT locking"
+  fi
+  grep -qiE "$EARLY_RE" "$errfile" \
+    || die "unexpected tle verify error: $(cat "$errfile"), NOT locking"
+  sha256_of "$pass" > "$STATE_DIR/passphrase.sha256"
+
+  jq --arg d "$deadline_iso" --argjson e "$target" --argjson r "$round" \
+     '.locked = true | .deadline = $d | .deadline_epoch = $e | .round = $r' \
+     "$state_file" > "$state_file.tmp" || die "state update failed, NOT deleting plaintext"
+  mv "$state_file.tmp" "$state_file" || die "state rename failed, NOT deleting plaintext"
+
+  # Only now, with a verified ciphertext on disk, destroy the plaintext.
+  rm -f "$STATE_DIR/passphrase.txt"
+  security delete-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
+  sudo tmutil deletelocalsnapshots /System/Volumes/Data >/dev/null || true
+
+  # On this platform, unmounting a "-stdinpassphrase disk" APFS volume
+  # (no macOS-user SecureToken backing it) auto-relocks it, so lockVolume
+  # here normally reports "already locked" - that is the safe outcome,
+  # not a failure. Any other lockVolume error is fatal. Either way, the
+  # checks below are the real proof: they inspect actual disk state.
+  lock_out=$(sudo diskutil apfs lockVolume "$dev" 2>&1) || {
+    grep -qi 'already locked' <<<"$lock_out" \
+      || die "lockVolume failed after plaintext was already destroyed - vault security UNVERIFIED, check diskutil apfs list manually: $lock_out"
+  }
+  note "$lock_out"
+  diskutil info "$dev" | grep -q 'FileVault:.*Yes' || die "volume does not report FileVault"
+  if diskutil mount "$dev" >/dev/null 2>&1; then
+    die "PANIC: volume mounted without a passphrase, lock is NOT effective"
+  fi
+  if [[ "$skip_hooks" == "false" ]] \
+      && ! run_hook_phase post-lock "$uuid" "$dev" "$deadline_iso" \
+        "$target" "$round" true; then
+    die "vault is locked until $deadline_iso, but one or more post-lock hooks failed"
+  fi
+  note "locked until $deadline_iso (drand round $round)"
+}
+
+cmd_unlock() {
+  local skip_hooks=false
+  if [[ "${1:-}" == "--no-hooks" ]]; then
+    skip_hooks=true
+    shift
+  fi
+  if [[ "${1:-}" == --* ]]; then
+    die "unknown unlock option: $1"
+  fi
+  [[ $# -eq 0 ]] || die "usage: vaultlock unlock [--no-hooks]"
+  [[ -f "$state_file" ]] || die "no state"
+  [[ "$(state_get .locked)" == "true" ]] || die "not locked"
+  local tle pass errfile want got dev uuid deadline deadline_epoch round
+  uuid=$(vol_uuid)
+  dev=$(vol_device)
+  deadline=$(state_get .deadline)
+  deadline_epoch=$(state_get .deadline_epoch)
+  round=$(state_get .round)
+  if [[ "$skip_hooks" == "false" ]]; then
+    run_hook_phase pre-unlock "$uuid" "$dev" "$deadline" \
+      "$deadline_epoch" "$round" true \
+      || die "pre-unlock hooks failed, vault remains locked"
+  fi
+  tle=$(tle_bin) || die "tle not found"
+  errfile="$STATE_DIR/.tle-unlock-err"
+  if ! pass=$("$tle" -d -n "$DRAND_URL" -c "$QUICKNET_CHAIN" "$STATE_DIR/passphrase.tle" \
+      2>"$errfile"); then
+    if grep -qiE "$EARLY_RE" "$errfile"; then
+      die "still locked until $(state_get .deadline) ($(remaining_human "$(state_get .deadline_epoch)") remaining) - this failure is the lock working"
+    fi
+    die "tle failed: $(cat "$errfile")"
+  fi
+  want=$(cat "$STATE_DIR/passphrase.sha256")
+  got=$(sha256_of "$pass")
+  [[ "$want" == "$got" ]] || die "decrypted passphrase fails sha256 check, aborting before diskutil"
+  printf '%s' "$pass" | sudo diskutil apfs unlockVolume "$dev" -stdinpassphrase
+  umask 077
+  printf '%s' "$pass" > "$STATE_DIR/passphrase.txt"
+  security add-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w "$pass" -U
+  jq '.locked = false' "$state_file" > "$state_file.tmp" || die "state update failed after unlock, fix ~/.vaultlock/state.json by hand (locked should be false)"
+  mv "$state_file.tmp" "$state_file" || die "state rename failed after unlock, fix ~/.vaultlock/state.json by hand (locked should be false)"
+  if [[ "$skip_hooks" == "false" ]] \
+      && ! run_hook_phase post-unlock "$uuid" "$dev" "$deadline" \
+        "$deadline_epoch" "$round" false; then
+    die "vault is unlocked and mounted at $MOUNT_POINT, but one or more post-unlock hooks failed"
+  fi
+  note "unlocked and mounted at $MOUNT_POINT"
+  note "next: cd ~/your-project && ./run.sh"
+}
+
+cmd_status() {
+  [[ -f "$state_file" ]] || die "no state, run vaultlock init first"
+  local locked deadline round dev
+  locked=$(state_get .locked)
+  deadline=$(state_get .deadline)
+  round=$(state_get .round)
+  dev=$(vol_device) || dev=""
+  if [[ "$locked" == "true" ]]; then
+    note "LOCKED until $deadline"
+    note "remaining: $(remaining_human "$(state_get .deadline_epoch)")"
+    note "drand round: target $round, current $(current_round)"
+    note "when the deadline passes: vaultlock unlock (needs internet)"
+  else
+    if mount | grep -q "on $MOUNT_POINT ("; then
+      note "UNLOCKED (mounted at $MOUNT_POINT)"
+    else
+      note "UNLOCKED (not mounted)"
+    fi
+    [[ "$deadline" != "null" ]] && note "previous deadline: $deadline"
+  fi
+  [[ -n "$dev" ]] && diskutil info "$dev" | grep -E 'Volume Name|FileVault|Mounted' || true
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: vaultlock <command>
+  init                       create the encrypted vault volume
+  adopt <dir>                move a directory onto the vault, leave a symlink
+  lock [--no-hooks] <deadline>
+                             time-lock the vault until a future deadline
+  unlock [--no-hooks]        unlock after the deadline (needs internet)
+  status                     show lock state and remaining time
+
+deadline forms:
+  "YYYY-MM-DD HH:MM"         absolute local date and time
+  H:MM                       next occurrence of a local clock time
+  NdNhNm                     elapsed duration, for example 1d4h or 20h
+  H:MM +Nd                   local clock time N calendar days from today
+
+hook directories:
+  ~/.vaultlock/hooks/<phase>.d
+  /Volumes/vault/.vaultlock/hooks/{pre-lock,post-unlock}.d
+EOF
+  exit 64
+}
+
+case "${1:-}" in
+  __round) round_for_epoch "$2" ;;
+  __parse) parse_deadline "$2" ;;
+  __deadline)
+    now=${2:?usage: vaultlock __deadline <now_epoch> <expression>}
+    shift 2
+    [[ $# -gt 0 ]] || die "usage: vaultlock __deadline <now_epoch> <expression>"
+    resolve_deadline "$*" "$now"
+    ;;
+  __hooks)
+    [[ $# -eq 8 ]] \
+      || die "usage: vaultlock __hooks <phase> <uuid> <device> <deadline> <epoch> <round> <locked>"
+    shift
+    run_hook_phase "$@"
+    ;;
+  init) shift; cmd_init "$@" ;;
+  adopt) shift; cmd_adopt "$@" ;;
+  lock) shift; cmd_lock "$@" ;;
+  unlock) shift; cmd_unlock "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  *) usage ;;
+esac
