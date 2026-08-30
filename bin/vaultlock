@@ -87,7 +87,10 @@ OPERATION_LOCK_DIR_IDENTITY=""
 OPERATION_LOCK_OWNER_IDENTITY=""
 OPERATION_LOCK_OWNER_DIGEST=""
 OPERATION_LOCK_ACTIVE=false
+OPERATION_LOCK_PARTIAL=false
 OPERATION_LOCK_TEMP=""
+OPERATION_LOCK_TEMP_IDENTITY=""
+OPERATION_LOCK_TEMP_DIGEST=""
 INSPECTED_LOCK_DIR_IDENTITY=""
 INSPECTED_LOCK_OWNER_IDENTITY=""
 INSPECTED_LOCK_OWNER_DIGEST=""
@@ -125,6 +128,9 @@ ADOPT_STAGED_LINK=""
 ADOPT_STAGED_LINK_IDENTITY=""
 ADOPT_STAGED_LINK_TARGET=""
 ADOPT_BACKUP=""
+ADOPT_BACKUP_RESERVATION=""
+ADOPT_BACKUP_RESERVATION_IDENTITY=""
+ADOPT_BACKUP_RESERVATION_DEVICE=""
 ADOPT_BACKUP_QUARANTINE=""
 ADOPT_BACKUP_QUARANTINE_IDENTITY=""
 ADOPT_DIRECTORY_SKELETON=""
@@ -714,10 +720,10 @@ inspect_operation_lock() {
     IFS= read -r line5
     ! IFS= read -r extra
   } < "$OPERATION_LOCK_DIR/owner" || return 1
-  [[ "$line1" == "version=1" \
+    [[ "$line1" == "version=1" \
     && "$line2" =~ ^pid=([1-9][0-9]*)$ \
     && "$line3" == start=* \
-    && -n "${line3#start=}" \
+    && "${line3#start=}" =~ ^[A-Z][a-z]{2}[[:space:]]+[A-Z][a-z]{2}[[:space:]]+[0-9]{1,2}[[:space:]]+[0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]]+[0-9]{4}$ \
     && "$line4" =~ ^command=(init|adopt|lock|unlock)$ \
     && "$line5" =~ ^token=([0-9a-f]{64})$ ]] || return 1
   INSPECTED_LOCK_DIR_IDENTITY=$directory_device:$directory_inode
@@ -797,6 +803,105 @@ generate_operation_token() {
   printf '%s\n' "$token"
 }
 
+partial_operation_lock_directory_matches() {
+  local metadata directory_device directory_inode directory_mode directory_uid
+  [[ "$OPERATION_LOCK_PARTIAL" == true \
+    && -n "$OPERATION_LOCK_DIR_IDENTITY" \
+    && -d "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" ]] \
+    || return 1
+  metadata=$(/usr/bin/stat -f '%d:%i:%Lp:%u' -- \
+    "$OPERATION_LOCK_DIR" 2>/dev/null) || return 1
+  IFS=: read -r directory_device directory_inode directory_mode directory_uid \
+    <<< "$metadata"
+  [[ "$directory_device:$directory_inode" == "$OPERATION_LOCK_DIR_IDENTITY" \
+    && "$directory_mode" == 700 && "$directory_uid" == "$UID" ]]
+}
+
+partial_operation_lock_file_matches() { # path identity digest
+  local path=$1 expected_identity=$2 expected_digest=$3 metadata
+  local file_device file_inode file_mode file_uid file_nlink actual_digest
+  [[ -n "$path" && -n "$expected_identity" \
+    && -f "$path" && ! -L "$path" ]] || return 1
+  metadata=$(/usr/bin/stat -f '%d:%i:%Lp:%u:%l' -- "$path" 2>/dev/null) \
+    || return 1
+  IFS=: read -r file_device file_inode file_mode file_uid file_nlink \
+    <<< "$metadata"
+  [[ "$file_device:$file_inode" == "$expected_identity" \
+    && "$file_mode" == 600 && "$file_uid" == "$UID" \
+    && ( "$file_nlink" == 1 || "$file_nlink" == 2 ) ]] || return 1
+  if [[ -n "$expected_digest" ]]; then
+    actual_digest=$(operation_owner_digest "$path") || return 1
+    [[ "$actual_digest" == "$expected_digest" ]] || return 1
+  fi
+}
+
+cleanup_partial_operation_lock() {
+  local failed=false expected_owner_identity expected_owner_digest candidate
+  local discovered_temp="" discovered_identity=""
+  [[ "$OPERATION_LOCK_PARTIAL" == true ]] || return 0
+  if [[ -z "$OPERATION_LOCK_TEMP" ]] \
+    && partial_operation_lock_directory_matches; then
+    for candidate in "$OPERATION_LOCK_DIR"/.owner.*; do
+      [[ -e "$candidate" || -L "$candidate" ]] || continue
+      if [[ -n "$discovered_temp" ]]; then
+        failed=true
+        break
+      fi
+      discovered_identity=$(operation_path_identity "$candidate") \
+        || { failed=true; break; }
+      partial_operation_lock_file_matches "$candidate" \
+        "$discovered_identity" "" || { failed=true; break; }
+      discovered_temp=$candidate
+    done
+    if [[ -n "$discovered_temp" ]]; then
+      OPERATION_LOCK_TEMP=$discovered_temp
+      OPERATION_LOCK_TEMP_IDENTITY=$discovered_identity
+    fi
+  fi
+  expected_owner_identity=$OPERATION_LOCK_OWNER_IDENTITY
+  expected_owner_digest=$OPERATION_LOCK_OWNER_DIGEST
+  if [[ -z "$expected_owner_identity" ]]; then
+    expected_owner_identity=$OPERATION_LOCK_TEMP_IDENTITY
+    expected_owner_digest=$OPERATION_LOCK_TEMP_DIGEST
+  fi
+  if [[ -n "$OPERATION_LOCK_TEMP" \
+    && ( -e "$OPERATION_LOCK_TEMP" || -L "$OPERATION_LOCK_TEMP" ) ]]; then
+    if partial_operation_lock_file_matches "$OPERATION_LOCK_TEMP" \
+      "$OPERATION_LOCK_TEMP_IDENTITY" "$OPERATION_LOCK_TEMP_DIGEST"; then
+      "$RM_COMMAND" -f -- "$OPERATION_LOCK_TEMP" || failed=true
+    else
+      failed=true
+    fi
+  fi
+  if partial_operation_lock_directory_matches; then
+    if [[ -e "$OPERATION_LOCK_DIR/owner" \
+      || -L "$OPERATION_LOCK_DIR/owner" ]]; then
+      if partial_operation_lock_file_matches "$OPERATION_LOCK_DIR/owner" \
+        "$expected_owner_identity" "$expected_owner_digest"; then
+        "$RM_COMMAND" -f -- "$OPERATION_LOCK_DIR/owner" || failed=true
+      else
+        failed=true
+      fi
+    fi
+    if [[ "$failed" == false ]]; then
+      "$RMDIR_COMMAND" -- "$OPERATION_LOCK_DIR" || failed=true
+    fi
+  else
+    failed=true
+  fi
+  if [[ "$failed" == false ]]; then
+    OPERATION_LOCK_PARTIAL=false
+    OPERATION_LOCK_TEMP=""
+    OPERATION_LOCK_TEMP_IDENTITY=""
+    OPERATION_LOCK_TEMP_DIGEST=""
+    OPERATION_LOCK_DIR_IDENTITY=""
+    OPERATION_LOCK_OWNER_IDENTITY=""
+    OPERATION_LOCK_OWNER_DIGEST=""
+    return 0
+  fi
+  return 1
+}
+
 release_owned_operation_lock() {
   local directory_identity owner_identity owner_digest
   [[ "$OPERATION_LOCK_ACTIVE" == true ]] || return 0
@@ -819,6 +924,7 @@ release_owned_operation_lock() {
   "$RM_COMMAND" -f -- "$OPERATION_LOCK_DIR/owner" || return 1
   "$RMDIR_COMMAND" -- "$OPERATION_LOCK_DIR" || return 1
   OPERATION_LOCK_ACTIVE=false
+  OPERATION_LOCK_PARTIAL=false
 }
 
 operation_cleanup_dispatcher() { # signal
@@ -826,6 +932,12 @@ operation_cleanup_dispatcher() { # signal
   trap - EXIT HUP INT TERM
   if [[ "$OPERATION_LOCK_ACTIVE" == true ]]; then
     if ! release_owned_operation_lock; then
+      release_failed=true
+      printf 'vaultlock: operation lock retained: %s\n' \
+        "$OPERATION_LOCK_DIR" >&2
+    fi
+  elif [[ "$OPERATION_LOCK_PARTIAL" == true ]]; then
+    if ! cleanup_partial_operation_lock; then
       release_failed=true
       printf 'vaultlock: operation lock retained: %s\n' \
         "$OPERATION_LOCK_DIR" >&2
@@ -854,16 +966,25 @@ create_owned_operation_lock() {
   [[ "$PROCESS_PROBE_KIND" == present ]] \
     || die "cannot inspect current process for operation lock"
   start=$PROCESS_PROBE_START
-  temporary=$("$MKTEMP_COMMAND" "$HOME/.vaultlock-operation.owner.XXXXXX") \
+  temporary=$("$MKTEMP_COMMAND" "$OPERATION_LOCK_DIR/.owner.XXXXXX") \
     || die "cannot create operation lock owner staging file"
+  [[ "$temporary" == "$OPERATION_LOCK_DIR/.owner."* \
+    && "${temporary#"$OPERATION_LOCK_DIR/.owner."}" != */* ]] \
+    || die "operation lock owner staging path is outside expected boundary"
   OPERATION_LOCK_TEMP=$temporary
+  OPERATION_LOCK_TEMP_IDENTITY=$(operation_path_identity "$temporary") \
+    || die "cannot capture operation lock owner staging identity"
   "$CHMOD_COMMAND" 600 "$temporary" \
     || die "cannot protect operation lock owner staging file"
   printf 'version=1\npid=%s\nstart=%s\ncommand=%s\ntoken=%s\n' \
     "$$" "$start" "$OPERATION_LOCK_COMMAND" "$OPERATION_LOCK_TOKEN" \
     > "$temporary"
+  OPERATION_LOCK_TEMP_DIGEST=$(operation_owner_digest "$temporary") \
+    || die "cannot fingerprint operation lock owner staging file"
   "$LN_COMMAND" -- "$temporary" "$OPERATION_LOCK_DIR/owner" \
     || die "cannot install operation lock owner record"
+  OPERATION_LOCK_OWNER_IDENTITY=$OPERATION_LOCK_TEMP_IDENTITY
+  OPERATION_LOCK_OWNER_DIGEST=$OPERATION_LOCK_TEMP_DIGEST
   "$RM_COMMAND" -f -- "$temporary" \
     || die "cannot remove operation lock owner staging file"
   OPERATION_LOCK_TEMP=""
@@ -876,12 +997,21 @@ create_owned_operation_lock() {
   OPERATION_LOCK_DIR_IDENTITY=$INSPECTED_LOCK_DIR_IDENTITY
   OPERATION_LOCK_OWNER_IDENTITY=$INSPECTED_LOCK_OWNER_IDENTITY
   OPERATION_LOCK_OWNER_DIGEST=$INSPECTED_LOCK_OWNER_DIGEST
+  OPERATION_LOCK_PARTIAL=false
   OPERATION_LOCK_ACTIVE=true
 }
 
 quarantine_inspected_stale_operation_lock() {
-  local suffix quarantine quarantine_identity expected_identity
-  expected_identity=$INSPECTED_LOCK_DIR_IDENTITY
+  local suffix quarantine original_lock_dir
+  local expected_directory expected_owner expected_digest expected_pid
+  local expected_start expected_command expected_token
+  expected_directory=$INSPECTED_LOCK_DIR_IDENTITY
+  expected_owner=$INSPECTED_LOCK_OWNER_IDENTITY
+  expected_digest=$INSPECTED_LOCK_OWNER_DIGEST
+  expected_pid=$INSPECTED_LOCK_PID
+  expected_start=$INSPECTED_LOCK_START
+  expected_command=$INSPECTED_LOCK_COMMAND
+  expected_token=$INSPECTED_LOCK_TOKEN
   run_named_transition operation_lock_final_check \
     "$OPERATION_LOCK_DIR/owner"
   revalidate_inspected_operation_lock \
@@ -901,10 +1031,22 @@ quarantine_inspected_stale_operation_lock() {
     || die "cannot quarantine verified stale operation lock"
   [[ ! -e "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" ]] \
     || die "stale operation lock source remains after quarantine"
-  quarantine_identity=$(operation_path_identity "$quarantine") || \
-    die "cannot verify stale operation lock quarantine"
-  [[ "$quarantine_identity" == "$expected_identity" ]] \
-    || die "stale operation lock quarantine identity changed"
+  run_named_transition operation_lock_after_quarantine_move \
+    "$quarantine/owner"
+  original_lock_dir=$OPERATION_LOCK_DIR
+  OPERATION_LOCK_DIR=$quarantine
+  if ! inspect_operation_lock \
+    || [[ "$INSPECTED_LOCK_DIR_IDENTITY" != "$expected_directory" \
+    || "$INSPECTED_LOCK_OWNER_IDENTITY" != "$expected_owner" \
+    || "$INSPECTED_LOCK_OWNER_DIGEST" != "$expected_digest" \
+    || "$INSPECTED_LOCK_PID" != "$expected_pid" \
+    || "$INSPECTED_LOCK_START" != "$expected_start" \
+    || "$INSPECTED_LOCK_COMMAND" != "$expected_command" \
+    || "$INSPECTED_LOCK_TOKEN" != "$expected_token" ]]; then
+    OPERATION_LOCK_DIR=$original_lock_dir
+    die "stale operation lock quarantine changed after move"
+  fi
+  OPERATION_LOCK_DIR=$original_lock_dir
   note "Retained stale operation lock quarantine: $quarantine"
 }
 
@@ -916,6 +1058,9 @@ acquire_operation_lock() { # command
     || die "cannot generate operation lock token"
   for attempt in 1 2; do
     if "$MKDIR_COMMAND" -m 700 -- "$OPERATION_LOCK_DIR" 2>/dev/null; then
+      OPERATION_LOCK_DIR_IDENTITY=$(operation_path_identity "$OPERATION_LOCK_DIR") \
+        || die "cannot capture partial operation lock identity"
+      OPERATION_LOCK_PARTIAL=true
       create_owned_operation_lock
       return 0
     fi
@@ -987,6 +1132,15 @@ capture_common_frozen_plan_fields() { # command
     "${SNAPSHOT_EXPECTED_UUID:-}"
   append_frozen_plan_field snapshot_apfs_valid "${SNAPSHOT_APFS_VALID:-}"
   append_frozen_plan_field snapshot_apfs_locked "${SNAPSHOT_APFS_LOCKED:-}"
+  append_frozen_plan_field snapshot_apfs_mounted "${SNAPSHOT_APFS_MOUNTED:-}"
+  append_frozen_plan_field snapshot_apfs_inspected \
+    "${SNAPSHOT_APFS_INSPECTED:-}"
+  append_frozen_plan_field snapshot_valid "${SNAPSHOT_VALID:-}"
+  append_frozen_plan_field snapshot_error "${SNAPSHOT_ERROR:-}"
+  append_frozen_plan_field snapshot_deadline "${SNAPSHOT_DEADLINE:-}"
+  append_frozen_plan_field snapshot_deadline_epoch \
+    "${SNAPSHOT_DEADLINE_EPOCH:-}"
+  append_frozen_plan_field snapshot_round "${SNAPSHOT_ROUND:-}"
   append_frozen_plan_field snapshot_actual_uuid "${SNAPSHOT_ACTUAL_UUID:-}"
   append_frozen_plan_field snapshot_device "${SNAPSHOT_DEVICE:-}"
   append_frozen_plan_field snapshot_mount "${SNAPSHOT_ACTUAL_MOUNT_POINT:-}"
@@ -1045,6 +1199,16 @@ capture_common_candidate_plan_fields() { # command
     "${SNAPSHOT_EXPECTED_UUID:-}"
   append_candidate_plan_field snapshot_apfs_valid "${SNAPSHOT_APFS_VALID:-}"
   append_candidate_plan_field snapshot_apfs_locked "${SNAPSHOT_APFS_LOCKED:-}"
+  append_candidate_plan_field snapshot_apfs_mounted \
+    "${SNAPSHOT_APFS_MOUNTED:-}"
+  append_candidate_plan_field snapshot_apfs_inspected \
+    "${SNAPSHOT_APFS_INSPECTED:-}"
+  append_candidate_plan_field snapshot_valid "${SNAPSHOT_VALID:-}"
+  append_candidate_plan_field snapshot_error "${SNAPSHOT_ERROR:-}"
+  append_candidate_plan_field snapshot_deadline "${SNAPSHOT_DEADLINE:-}"
+  append_candidate_plan_field snapshot_deadline_epoch \
+    "${SNAPSHOT_DEADLINE_EPOCH:-}"
+  append_candidate_plan_field snapshot_round "${SNAPSHOT_ROUND:-}"
   append_candidate_plan_field snapshot_actual_uuid "${SNAPSHOT_ACTUAL_UUID:-}"
   append_candidate_plan_field snapshot_device "${SNAPSHOT_DEVICE:-}"
   append_candidate_plan_field snapshot_mount "${SNAPSHOT_ACTUAL_MOUNT_POINT:-}"
@@ -1087,8 +1251,12 @@ freeze_planned_command_snapshot() { # command
   capture_common_frozen_plan_fields "$command"
   case "$command" in
     init)
-      state_dir_identity=$(path_identity "$STATE_DIR") || \
-        die "cannot freeze state directory identity"
+      if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+        state_dir_identity=$(path_identity "$STATE_DIR") || \
+          die "cannot freeze state directory identity"
+      else
+        state_dir_identity=absent
+      fi
       if [[ -e "$state_file" || -L "$state_file" ]]; then
         state_file_identity=$(path_identity "$state_file") || \
           die "cannot freeze state file identity"
@@ -1100,7 +1268,13 @@ freeze_planned_command_snapshot() { # command
       append_frozen_plan_field state_file_identity "$state_file_identity"
       ;;
     adopt)
+      state_dir_identity=$(path_identity "$STATE_DIR") || \
+        die "cannot freeze adopt state directory identity"
+      state_file_identity=$(path_identity "$state_file") || \
+        die "cannot freeze adopt state file identity"
       append_frozen_plan_field typed_operand_count 1
+      append_frozen_plan_field state_dir_identity "$state_dir_identity"
+      append_frozen_plan_field state_file_identity "$state_file_identity"
       append_frozen_plan_field typed_operand_0_name source
       append_frozen_plan_field typed_operand_0_value "$ADOPT_SOURCE"
       append_frozen_plan_field adopt_source_identity "$ADOPT_SOURCE_IDENTITY"
@@ -1123,8 +1297,12 @@ capture_candidate_planned_command_snapshot() { # command
   capture_common_candidate_plan_fields "$command"
   case "$command" in
     init)
-      state_dir_identity=$(path_identity "$STATE_DIR") || \
-        die "cannot capture candidate state directory identity"
+      if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+        state_dir_identity=$(path_identity "$STATE_DIR") || \
+          die "cannot capture candidate state directory identity"
+      else
+        state_dir_identity=absent
+      fi
       if [[ -e "$state_file" || -L "$state_file" ]]; then
         state_file_identity=$(path_identity "$state_file") || \
           die "cannot capture candidate state file identity"
@@ -1136,7 +1314,13 @@ capture_candidate_planned_command_snapshot() { # command
       append_candidate_plan_field state_file_identity "$state_file_identity"
       ;;
     adopt)
+      state_dir_identity=$(path_identity "$STATE_DIR") || \
+        die "cannot capture candidate adopt state directory identity"
+      state_file_identity=$(path_identity "$state_file") || \
+        die "cannot capture candidate adopt state file identity"
       append_candidate_plan_field typed_operand_count 1
+      append_candidate_plan_field state_dir_identity "$state_dir_identity"
+      append_candidate_plan_field state_file_identity "$state_file_identity"
       append_candidate_plan_field typed_operand_0_name source
       append_candidate_plan_field typed_operand_0_value "$ADOPT_SOURCE"
       append_candidate_plan_field adopt_source_identity "$ADOPT_SOURCE_IDENTITY"
@@ -2233,6 +2417,9 @@ inspect_adopt_state() {
   ADOPT_BACKUP_IDENTITY=""
   ADOPT_BACKUP_DEVICE=""
   ADOPT_BACKUP_TREE_DIGEST=""
+  ADOPT_BACKUP_RESERVATION=""
+  ADOPT_BACKUP_RESERVATION_IDENTITY=""
+  ADOPT_BACKUP_RESERVATION_DEVICE=""
   ADOPT_BACKUP_QUARANTINE=""
   ADOPT_BACKUP_QUARANTINE_IDENTITY=""
   ADOPT_DIRECTORY_SKELETON=""
@@ -2351,7 +2538,10 @@ path_xattr_manifest_stream() { # path
     size_field=${line#*$'\t'}
     size=$(printf '%s' "$size_field" | /usr/bin/tr -d '[:space:]')
     [[ "$size" =~ ^[0-9]+$ ]] || return 1
-    name=$(decode_ls_escaped_name "$escaped_name") || return 1
+    name=
+    IFS= read -r -d '' name \
+      < <(decode_ls_escaped_name "$escaped_name" && printf '\0') \
+      || return 1
     value=$(/usr/bin/xattr -psx -- "$name" "$path" 2>/dev/null \
       | /usr/bin/tr -d '[:space:]') || return 1
     [[ "$value" =~ ^[0-9A-Fa-f]*$ \
@@ -2779,6 +2969,32 @@ adopt_original_tree_at() { # path
   [[ "$digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]]
 }
 
+adopt_backup_reservation_matches() {
+  local metadata reservation_device reservation_inode reservation_mode
+  local reservation_uid
+  [[ -n "$ADOPT_BACKUP_RESERVATION" \
+    && -n "$ADOPT_BACKUP_RESERVATION_IDENTITY" \
+    && -d "$ADOPT_BACKUP_RESERVATION" \
+    && ! -L "$ADOPT_BACKUP_RESERVATION" ]] || return 1
+  metadata=$(/usr/bin/stat -f '%d:%i:%Lp:%u' -- \
+    "$ADOPT_BACKUP_RESERVATION" 2>/dev/null) || return 1
+  IFS=: read -r reservation_device reservation_inode reservation_mode \
+    reservation_uid <<< "$metadata"
+  [[ "$reservation_device:$reservation_inode" \
+    == "$ADOPT_BACKUP_RESERVATION_IDENTITY" \
+    && "$reservation_device" == "$ADOPT_BACKUP_RESERVATION_DEVICE" \
+    && "$reservation_mode" == 700 && "$reservation_uid" == "$UID" ]]
+}
+
+remove_empty_adopt_backup_reservation() {
+  adopt_backup_reservation_matches || return 1
+  [[ ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
+  "$RMDIR_COMMAND" -- "$ADOPT_BACKUP_RESERVATION" || return 1
+  ADOPT_BACKUP_RESERVATION=""
+  ADOPT_BACKUP_RESERVATION_IDENTITY=""
+  ADOPT_BACKUP_RESERVATION_DEVICE=""
+}
+
 describe_adopt_rollback_locations() {
   local detail=""
   local display_backup=$ADOPT_SOURCE_DISPLAY.vaultlock-backup
@@ -2786,12 +3002,21 @@ describe_adopt_rollback_locations() {
   if adopt_original_tree_at "$ADOPT_SOURCE"; then
     detail="original source restored at $ADOPT_SOURCE_DISPLAY"
   elif [[ -e "$ADOPT_SOURCE" || -L "$ADOPT_SOURCE" ]]; then
-    detail="replacement retained at $ADOPT_SOURCE_DISPLAY"
+    run_named_transition adopt_reporting_before_source_classification \
+      "$ADOPT_SOURCE" || return 1
+    if adopt_staged_link_owned_at "$ADOPT_SOURCE"; then
+      detail="replacement retained at $ADOPT_SOURCE_DISPLAY"
+    elif [[ -e "$ADOPT_SOURCE" || -L "$ADOPT_SOURCE" ]]; then
+      detail="unverified source entry retained at $ADOPT_SOURCE_DISPLAY"
+    fi
   fi
-  if adopt_original_tree_at "$ADOPT_BACKUP"; then
+  if adopt_original_tree_at "$ADOPT_BACKUP" \
+    && adopt_backup_reservation_matches; then
     [[ -z "$detail" ]] || detail="$detail; "
     detail="${detail}data remains at $display_backup, backup retained at $display_backup"
-  elif [[ -e "$ADOPT_BACKUP" || -L "$ADOPT_BACKUP" ]]; then
+  elif [[ -e "$ADOPT_BACKUP_RESERVATION" \
+    || -L "$ADOPT_BACKUP_RESERVATION" \
+    || -e "$ADOPT_BACKUP" || -L "$ADOPT_BACKUP" ]]; then
     [[ -z "$detail" ]] || detail="$detail; "
     detail="${detail}unverified backup retained at $display_backup"
   fi
@@ -2814,6 +3039,7 @@ rollback_adopt_source() {
   local backup_identity backup_digest restored_identity restored_digest
   run_named_transition adopt_rollback_before_source_link_move "$ADOPT_BACKUP" \
     || return 1
+  adopt_backup_reservation_matches || return 1
   [[ -d "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
   backup_identity=$(path_identity "$ADOPT_BACKUP") || return 1
   [[ "$backup_identity" == "$ADOPT_BACKUP_IDENTITY" ]] || return 1
@@ -2829,13 +3055,16 @@ rollback_adopt_source() {
     adopt_staged_link_owned_at "$ADOPT_STAGED_LINK" || return 1
   fi
   [[ ! -e "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" ]] || return 1
+  [[ -d "$ADOPT_PARENT" && ! -L "$ADOPT_PARENT" \
+    && "$(path_identity "$ADOPT_PARENT")" == "$ADOPT_PARENT_IDENTITY" ]] \
+    || return 1
   [[ -d "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
   backup_identity=$(path_identity "$ADOPT_BACKUP") || return 1
   [[ "$backup_identity" == "$ADOPT_SOURCE_IDENTITY" ]] || return 1
   backup_digest=$(stable_tree_digest "$ADOPT_BACKUP" "$backup_identity" \
     "$ADOPT_SOURCE_DEVICE") || return 1
   [[ "$backup_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] || return 1
-  mv -n -- "$ADOPT_BACKUP" "$ADOPT_SOURCE" || return 1
+  mv -hn -- "$ADOPT_BACKUP" "$ADOPT_PARENT" || return 1
   [[ ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
   restored_identity=$(path_identity "$ADOPT_SOURCE") || return 1
   restored_digest=$(stable_tree_digest "$ADOPT_SOURCE" "$restored_identity" \
@@ -2844,10 +3073,11 @@ rollback_adopt_source() {
       || "$restored_digest" != "$ADOPT_SOURCE_TREE_DIGEST" ]]; then
     if [[ -d "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" \
         && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]]; then
-      mv -n -- "$ADOPT_SOURCE" "$ADOPT_BACKUP" || return 1
+    mv -hn -- "$ADOPT_SOURCE" "$ADOPT_BACKUP_RESERVATION" || return 1
     fi
     return 1
   fi
+  remove_empty_adopt_backup_reservation || return 1
   cleanup_staged_link
 }
 
@@ -3072,6 +3302,8 @@ quarantine_adopt_backup() {
   fi
   adopt_quarantined_backup_matches \
     || die "backup quarantine verification failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  remove_empty_adopt_backup_reservation \
+    || die "backup reservation cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE, reservation retained at $ADOPT_BACKUP_RESERVATION"
   create_adopt_directory_skeleton
 }
 
@@ -3105,7 +3337,8 @@ delete_quarantined_adopt_backup() {
 }
 
 execute_adopt_replace_source() {
-  local link_target backup_digest
+  local link_target backup_digest backup_candidate move_status
+  local backup_identity backup_device
   [[ "$ADOPT_COPY_VERIFIED" == "true" ]] \
     || die "adopt replacement requires verified copy"
   assert_adopt_source_manifest \
@@ -3132,31 +3365,85 @@ execute_adopt_replace_source() {
   assert_adopt_destination_manifest \
     "destination manifest changed before backup move, staged link retained at $ADOPT_STAGED_LINK"
   verify_adopt_mount_identity
-  if ! mv -- "$ADOPT_SOURCE" "$ADOPT_BACKUP"; then
+  backup_candidate=$ADOPT_BACKUP
+  run_named_transition adopt_before_backup_move "$backup_candidate"
+  if [[ -e "$backup_candidate" || -L "$backup_candidate" ]]; then
     cleanup_staged_link \
-      || die "cannot stage source backup, staged link retained at $ADOPT_STAGED_LINK"
-    die "cannot stage source backup, source remains unchanged"
+      || die "source backup path changed before move, source remains unchanged, staged link retained at $ADOPT_STAGED_LINK"
+    die "source backup path changed before move, source remains unchanged"
   fi
-  ADOPT_BACKUP_IDENTITY=$(path_identity "$ADOPT_BACKUP") || {
-    die "cannot verify staged source backup, backup retained at $ADOPT_BACKUP"
+  if ! "$MKDIR_COMMAND" -m 700 -- "$backup_candidate" 2>/dev/null; then
+    cleanup_staged_link \
+      || die "cannot reserve source backup path, source remains unchanged, staged link retained at $ADOPT_STAGED_LINK"
+    die "cannot reserve source backup path, source remains unchanged"
+  fi
+  ADOPT_BACKUP_RESERVATION=$backup_candidate
+  ADOPT_BACKUP_RESERVATION_IDENTITY=$(path_identity \
+    "$ADOPT_BACKUP_RESERVATION") \
+    || die "cannot verify source backup reservation, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  ADOPT_BACKUP_RESERVATION_DEVICE=$(
+    "$BSD_STAT" -f '%d' -- "$ADOPT_BACKUP_RESERVATION" 2>/dev/null
+  ) || die "cannot verify source backup reservation device, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  adopt_backup_reservation_matches \
+    || die "source backup reservation changed, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  ADOPT_BACKUP=$ADOPT_BACKUP_RESERVATION/${ADOPT_SOURCE##*/}
+  [[ ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
+    || die "source backup reservation is not empty, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  if "$MV_COMMAND" -hn -- "$ADOPT_SOURCE" "$ADOPT_BACKUP_RESERVATION"; then
+    move_status=0
+  else
+    move_status=$?
+  fi
+  if [[ ! -e "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" \
+    && -d "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" \
+    && "$(path_identity "$ADOPT_BACKUP")" == "$ADOPT_SOURCE_IDENTITY" ]]; then
+    :
+  elif [[ -d "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" \
+    && "$(path_identity "$ADOPT_SOURCE")" == "$ADOPT_SOURCE_IDENTITY" \
+    && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]]; then
+    remove_empty_adopt_backup_reservation || \
+      die "cannot stage source backup, source remains unchanged, backup reservation retained at $ADOPT_BACKUP_RESERVATION"
+    cleanup_staged_link \
+      || die "cannot stage source backup, source remains unchanged, staged link retained at $ADOPT_STAGED_LINK"
+    die "cannot stage source backup, source remains unchanged"
+  else
+    die "source backup move ended in an ambiguous state (status $move_status), inspect $ADOPT_SOURCE and $ADOPT_BACKUP_RESERVATION"
+  fi
+  ADOPT_BACKUP_IDENTITY=$ADOPT_SOURCE_IDENTITY
+  ADOPT_BACKUP_DEVICE=$ADOPT_SOURCE_DEVICE
+  ADOPT_BACKUP_TREE_DIGEST=$ADOPT_SOURCE_TREE_DIGEST
+  backup_identity=$(path_identity "$ADOPT_BACKUP") || {
+    abort_adopt_replacement_with_rollback \
+      "cannot verify staged source backup"
   }
-  [[ "$ADOPT_BACKUP_IDENTITY" == "$ADOPT_SOURCE_IDENTITY" ]] || {
-    die "staged source backup identity changed, backup retained at $ADOPT_BACKUP"
+  [[ "$backup_identity" == "$ADOPT_SOURCE_IDENTITY" ]] || {
+    abort_adopt_replacement_with_rollback \
+      "staged source backup identity changed"
   }
-  ADOPT_BACKUP_DEVICE=$("$BSD_STAT" -f '%d' -- "$ADOPT_BACKUP" \
+  backup_device=$("$BSD_STAT" -f '%d' -- "$ADOPT_BACKUP" \
     2>/dev/null) \
-    || die "cannot verify staged source backup device, backup retained at $ADOPT_BACKUP"
-  [[ "$ADOPT_BACKUP_DEVICE" == "$ADOPT_SOURCE_DEVICE" ]] \
-    || die "staged source backup device changed, backup retained at $ADOPT_BACKUP"
+    || abort_adopt_replacement_with_rollback \
+      "cannot verify staged source backup device"
+  [[ "$backup_device" == "$ADOPT_SOURCE_DEVICE" ]] \
+    || abort_adopt_replacement_with_rollback \
+      "staged source backup device changed"
   backup_digest=$(stable_tree_digest "$ADOPT_BACKUP" \
-    "$ADOPT_BACKUP_IDENTITY" "$ADOPT_BACKUP_DEVICE") \
-    || die "cannot verify staged source backup manifest, backup retained at $ADOPT_BACKUP"
+    "$backup_identity" "$backup_device") \
+    || abort_adopt_replacement_with_rollback \
+      "cannot verify staged source backup manifest"
   [[ "$backup_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] \
-    || die "staged source backup manifest changed, backup retained at $ADOPT_BACKUP"
+    || abort_adopt_replacement_with_rollback \
+      "staged source backup manifest changed"
+  ADOPT_BACKUP_IDENTITY=$backup_identity
+  ADOPT_BACKUP_DEVICE=$backup_device
   ADOPT_BACKUP_TREE_DIGEST=$backup_digest
-  assert_adopt_destination_manifest \
-    "destination manifest changed after backup move, backup retained at $ADOPT_BACKUP"
-  verify_adopt_mount_identity
+  run_named_transition adopt_after_backup_verified "$ADOPT_DESTINATION"
+  adopt_destination_manifest_matches \
+    || abort_adopt_replacement_with_rollback \
+      "destination manifest changed after backup move"
+  adopt_mount_identity_matches \
+    || abort_adopt_replacement_with_rollback \
+      "mounted vault identity changed after backup move"
   if ! mv -n -- "$ADOPT_STAGED_LINK" "$ADOPT_SOURCE" \
       || [[ -e "$ADOPT_STAGED_LINK" || -L "$ADOPT_STAGED_LINK" ]]; then
     abort_adopt_replacement_with_rollback "replacement failed"

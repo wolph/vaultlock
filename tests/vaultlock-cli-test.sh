@@ -732,9 +732,9 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         fi
         exit 1
       fi
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_rollback_move" \
-          && "$fixture_mv_source" == *.vaultlock-backup \
-          && "$fixture_mv_destination" == "${fixture_mv_source%.vaultlock-backup}" ]]; then
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_rollback_move" \
+      && "$fixture_mv_source" == *.vaultlock-backup/* \
+      && "$fixture_mv_destination" == "${fixture_mv_source%/*/*}" ]]; then
         exit 1
       fi
       /bin/mv "$@" || exit 1
@@ -751,18 +751,22 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_backup_at_quarantine_boundary"
         fi
       fi
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_restored_identity" \
-          && "$fixture_mv_source" == *.vaultlock-backup \
-          && "$fixture_mv_destination" == "${fixture_mv_source%.vaultlock-backup}" ]]; then
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_restored_identity" \
+      && "$fixture_mv_source" == *.vaultlock-backup/* \
+      && "$fixture_mv_destination" == "${fixture_mv_source%/*/*}" ]]; then
         : > "$VAULTLOCK_TEST_APFS_STATE/rollback_moved"
       fi
       ;;
-    ln)
-      fixture_ln_destination=""
-      for fixture_argument in "$@"; do fixture_ln_destination=$fixture_argument; done
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_ln" \
-        && "$fixture_ln_destination" != "$HOME/.vaultlock-operation.lock/owner" ]]; then
-        exit 1
+  ln)
+    fixture_ln_destination=""
+    for fixture_argument in "$@"; do fixture_ln_destination=$fixture_argument; done
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_operation_lock_owner_install" \
+      && "$fixture_ln_destination" == "$HOME/.vaultlock-operation.lock/owner" ]]; then
+      exit 1
+    fi
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_ln" \
+      && "$fixture_ln_destination" != "$HOME/.vaultlock-operation.lock/owner" ]]; then
+      exit 1
       fi
       /bin/ln "$@"
       if [[ "$fixture_ln_destination" == "$VAULTLOCK_STATE_DIR/state.json" ]]; then
@@ -846,7 +850,14 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/quarantine_made_nonprivate"
       fi
       ;;
-    mktemp) /usr/bin/mktemp "$@" ;;
+  mktemp)
+    fixture_mktemp_path=$(/usr/bin/mktemp "$@") || exit 1
+    printf '%s\n' "$fixture_mktemp_path"
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_operation_owner_mktemp" \
+      && "$fixture_mktemp_path" == "$HOME/.vaultlock-operation.lock/.owner."* ]]; then
+      /bin/kill -TERM "$PPID"
+    fi
+    ;;
     ps)
       [[ "${1:-}" == "-p" && "${2:-}" =~ ^[0-9]+$ \
         && "${3:-}" == "-o" && "${4:-}" == "lstart=" \
@@ -889,11 +900,35 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           printf '{"introduced":"plan drift"}\n' \
             > "$VAULTLOCK_STATE_DIR/state.json"
           ;;
-        owner_identity_swap)
-          /bin/mv "$fixture_subject" "$fixture_subject.pre-transition"
-          printf 'version=1\npid=broken\n' > "$fixture_subject"
-          /bin/chmod 600 "$fixture_subject"
-          ;;
+      owner_identity_swap)
+        /bin/mv "$fixture_subject" "$fixture_subject.pre-transition"
+        printf 'version=1\npid=broken\n' > "$fixture_subject"
+        /bin/chmod 600 "$fixture_subject"
+        ;;
+      state_equivalent_inode_swap)
+        /bin/cp "$VAULTLOCK_STATE_DIR/state.json" \
+          "$VAULTLOCK_TEST_APFS_STATE/state-equivalent-copy"
+        /bin/rm "$VAULTLOCK_STATE_DIR/state.json"
+        /bin/mv "$VAULTLOCK_TEST_APFS_STATE/state-equivalent-copy" \
+          "$VAULTLOCK_STATE_DIR/state.json"
+        ;;
+      adopt_mount_uuid_swap)
+        fixture_write uuid UUID-POST-BACKUP-SWAP
+        ;;
+      adopt_mount_device_swap)
+        fixture_write device disk99s9
+        ;;
+      adopt_backup_path_file_create)
+        printf 'foreign backup file\n' > "$fixture_subject"
+        ;;
+      adopt_backup_path_directory_create)
+        /bin/mkdir "$fixture_subject"
+        printf 'foreign backup directory\n' > "$fixture_subject/foreign"
+        ;;
+      adopt_installed_source_identity_swap)
+        /bin/mv "$fixture_subject" "$fixture_subject.pre-transition"
+        printf 'foreign source entry\n' > "$fixture_subject"
+        ;;
         adopt_backup_identity_swap)
           /bin/mv "$fixture_subject" "$fixture_subject.pre-transition"
           /usr/bin/ditto "$fixture_subject.pre-transition" "$fixture_subject"
@@ -1268,6 +1303,8 @@ reset_operation_lock_fixture() {
     "$apfs_state/token_generated_twice" \
     "$apfs_state/ps_ambiguous" \
     "$apfs_state/signal_ditto" \
+    "$apfs_state/signal_operation_owner_mktemp" \
+    "$apfs_state/fail_operation_lock_owner_install" \
     "$apfs_state/fail_operation_lock_release" \
     "$apfs_state/hold_ditto" \
     "$apfs_state/ditto_entered" \
@@ -2591,8 +2628,8 @@ if rollback_symlink_race_output=$(run_vaultlock adopt --yes \
     "$rollback_symlink_race_source" 2>&1); then
   record_failure "adopt rollback refuses unowned source symlink"
 else
-  check_contains "adopt rollback race reports retained replacement" \
-    "replacement retained at $rollback_symlink_race_source" \
+  check_contains "adopt rollback race reports unverified source entry" \
+    "unverified source entry retained at $rollback_symlink_race_source" \
     "$rollback_symlink_race_output"
   check_contains "adopt rollback race reports retained backup" \
     "backup retained at $rollback_symlink_race_source.vaultlock-backup" \
@@ -3736,7 +3773,210 @@ check "adopt newline xattr oracle" newline-value \
     "$mount_point/adopt-xattr-escapes/subdirectory/file")"
 check "adopt backslash xattr oracle" backslash-value \
   "$(/usr/bin/xattr -p "$xattr_backslash_name" \
-    "$mount_point/adopt-xattr-escapes/subdirectory/file")"
+  "$mount_point/adopt-xattr-escapes/subdirectory/file")"
+
+reset_operation_lock_fixture
+reset_init_fixture
+/bin/rm -rf -- "${state_dir:?}"
+if absent_state_plan=$(run_vaultlock init --dry-run 2>&1); then
+  check_contains "init absent state directory renders full plan" \
+    'Prepare protected state and generate recovery material' "$absent_state_plan"
+else
+  record_failure "init absent state directory dry-run succeeds: $absent_state_plan"
+fi
+[[ ! -e "$state_dir" && ! -L "$state_dir" ]] \
+  || record_failure "init absent state directory dry-run does not create state"
+printf 'n\n' > "$confirm_device"
+if absent_state_decline=$(run_vaultlock init 2>&1); then
+  record_failure "init absent state directory decline exits nonzero"
+else
+  check_contains "init absent state directory normal planning succeeds" \
+    'cancelled, no changes made' "$absent_state_decline"
+fi
+[[ ! -e "$state_dir" && ! -L "$state_dir" ]] \
+  || record_failure "init absent state directory decline does not create state"
+/bin/mkdir -p "$state_dir"
+
+reset_operation_lock_fixture
+reset_init_fixture
+: > "$apfs_state/signal_operation_owner_mktemp"
+if partial_lock_signal_output=$(run_vaultlock init --yes 2>&1); then
+  partial_lock_signal_status=0
+else
+  partial_lock_signal_status=$?
+fi
+: "$partial_lock_signal_output"
+check "init owner-temp signal preserves TERM status" 143 \
+  "$partial_lock_signal_status"
+[[ ! -e "$operation_lock_dir" && ! -L "$operation_lock_dir" ]] \
+  || record_failure "init owner-temp signal removes partial lock directory"
+partial_owner_temp_count=$(find "$test_home" -maxdepth 1 \
+  -name '.vaultlock-operation.owner.*' | wc -l | tr -d ' ')
+check "init owner-temp signal removes staging file" 0 \
+  "$partial_owner_temp_count"
+
+reset_operation_lock_fixture
+reset_init_fixture
+: > "$apfs_state/fail_operation_lock_owner_install"
+if partial_lock_link_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init owner-record install failure exits nonzero"
+else
+  check_contains "init owner-record install failure reports primary cause" \
+    'cannot install operation lock owner record' "$partial_lock_link_output"
+fi
+[[ ! -e "$operation_lock_dir" && ! -L "$operation_lock_dir" ]] \
+  || record_failure "init owner-record install failure removes partial lock directory"
+partial_owner_temp_count=$(find "$test_home" -maxdepth 1 \
+  -name '.vaultlock-operation.owner.*' | wc -l | tr -d ' ')
+check "init owner-record install failure removes staging file" 0 \
+  "$partial_owner_temp_count"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+malformed_start_source=$(new_adopt_source operation-lock-malformed-start)
+create_operation_lock 999999 garbage adopt "$fake_operation_token"
+if malformed_start_output=$(run_vaultlock adopt --yes \
+  "$malformed_start_source" 2>&1); then
+  record_failure "adopt rejects malformed operation lock start"
+else
+  check_contains "adopt malformed start fails closed" \
+    'malformed operation lock owner' "$malformed_start_output"
+fi
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "adopt preserves malformed-start operation lock"
+malformed_start_quarantine_count=$(find "$test_home" -maxdepth 1 -type d \
+  -name '.vaultlock-operation.lock.quarantine.*' | wc -l | tr -d ' ')
+check "adopt does not quarantine malformed-start lock" 0 \
+  "$malformed_start_quarantine_count"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+stale_moved_owner_source=$(new_adopt_source operation-lock-moved-owner-swap)
+create_operation_lock 999999 "$fake_process_start" adopt "$fake_operation_token"
+printf 'owner_identity_swap\n' \
+  > "$apfs_state/transition_operation_lock_after_quarantine_move"
+if stale_moved_owner_output=$(run_vaultlock adopt --yes \
+  "$stale_moved_owner_source" 2>&1); then
+  record_failure "adopt rejects stale lock owner swap after quarantine move"
+else
+  check_contains "adopt stale moved-owner swap fails closed" \
+    'stale operation lock quarantine changed' "$stale_moved_owner_output"
+fi
+check_empty "adopt stale moved-owner swap stops before domain mutation" \
+  "$mutation_log"
+stale_moved_quarantine_count=$(find "$test_home" -maxdepth 1 -type d \
+  -name '.vaultlock-operation.lock.quarantine.*' | wc -l | tr -d ' ')
+check "adopt retains unverifiable stale lock quarantine" 1 \
+  "$stale_moved_quarantine_count"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+state_inode_source=$(new_adopt_source adopt-state-inode-drift)
+state_inode_before=$(/usr/bin/stat -f '%d:%i' "$state_dir/state.json")
+printf 'state_equivalent_inode_swap\n' \
+  > "$apfs_state/transition_plan_revalidation_before_inspection"
+if state_inode_output=$(run_vaultlock adopt --yes "$state_inode_source" 2>&1); then
+  record_failure "adopt rejects equivalent-content state inode drift"
+else
+  check_contains "adopt reports state inode plan drift" \
+    'plan changed after operation lock acquisition' "$state_inode_output"
+fi
+state_inode_after=$(/usr/bin/stat -f '%d:%i' "$state_dir/state.json")
+[[ "$state_inode_after" != "$state_inode_before" ]] \
+  || record_failure "adopt state inode drift fixture replaces inode"
+[[ -d "$state_inode_source" && ! -L "$state_inode_source" ]] \
+  || record_failure "adopt state inode drift preserves source"
+check_empty "adopt state inode drift stops before domain mutation" "$mutation_log"
+
+for post_backup_case in destination:adopt_destination_identity_swap \
+  mount-uuid:adopt_mount_uuid_swap mount-device:adopt_mount_device_swap; do
+  reset_operation_lock_fixture
+  reset_adopt_fixture
+  post_backup_name=${post_backup_case%%:*}
+  post_backup_action=${post_backup_case#*:}
+  post_backup_source=$(new_adopt_source "adopt-post-backup-$post_backup_name")
+  printf '%s\n' "$post_backup_action" \
+    > "$apfs_state/transition_adopt_after_backup_verified"
+  if post_backup_output=$(run_vaultlock adopt --yes \
+    "$post_backup_source" 2>&1); then
+    record_failure "adopt rolls back post-backup $post_backup_name drift"
+  else
+    check_contains "adopt reports post-backup $post_backup_name rollback" \
+      'original source restored' "$post_backup_output"
+  fi
+  [[ -d "$post_backup_source" && ! -L "$post_backup_source" \
+    && -f "$post_backup_source/subdirectory/file" ]] \
+    || record_failure "adopt restores source after post-backup $post_backup_name drift"
+done
+
+for backup_collision_kind in file directory; do
+  reset_operation_lock_fixture
+  reset_adopt_fixture
+  backup_collision_source=$(new_adopt_source \
+    "adopt-backup-appears-$backup_collision_kind")
+  backup_collision_path=$backup_collision_source.vaultlock-backup
+  printf 'adopt_backup_path_%s_create\n' "$backup_collision_kind" \
+    > "$apfs_state/transition_adopt_before_backup_move"
+  if backup_collision_output=$(run_vaultlock adopt --yes \
+    "$backup_collision_source" 2>&1); then
+    record_failure "adopt rejects appearing backup $backup_collision_kind"
+  else
+    check_contains "adopt appearing backup $backup_collision_kind fails closed" \
+      'source backup path changed before move' "$backup_collision_output"
+  fi
+  [[ -d "$backup_collision_source" && ! -L "$backup_collision_source" \
+    && -f "$backup_collision_source/subdirectory/file" ]] \
+    || record_failure "adopt appearing backup $backup_collision_kind preserves source"
+  if [[ "$backup_collision_kind" == file ]]; then
+    check "adopt preserves appearing backup file" 'foreign backup file' \
+      "$(< "$backup_collision_path")"
+  else
+    check "adopt preserves appearing backup directory" \
+      'foreign backup directory' "$(< "$backup_collision_path/foreign")"
+  fi
+  /bin/rm -rf -- "${backup_collision_path:?}"
+done
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+source_reporting_source=$(new_adopt_source adopt-source-reporting)
+: > "$apfs_state/fail_link_verification"
+printf 'adopt_backup_identity_swap\n' \
+  > "$apfs_state/transition_adopt_rollback_before_source_link_move"
+printf 'adopt_installed_source_identity_swap\n' \
+  > "$apfs_state/transition_adopt_reporting_before_source_classification"
+if source_reporting_output=$(run_vaultlock adopt --yes \
+  "$source_reporting_source" 2>&1); then
+  record_failure "adopt source ownership reporting fixture exits nonzero"
+else
+  check_contains "adopt reports unverified source entry by ownership" \
+    'unverified source entry retained' "$source_reporting_output"
+fi
+
+reset_adopt_fixture
+xattr_trailing_source=$(new_adopt_source adopt-xattr-trailing-newlines)
+xattr_trailing_file=$xattr_trailing_source/subdirectory/file
+xattr_one_trailing_name=$'vaultlock.one-trailing\n'
+xattr_two_trailing_name=$'vaultlock.two-trailing\n\n'
+xattr_mixed_trailing_name=$'vaultlock.backslash\\name\n'
+/usr/bin/xattr -w "$xattr_one_trailing_name" one-value "$xattr_trailing_file"
+/usr/bin/xattr -w "$xattr_two_trailing_name" two-value "$xattr_trailing_file"
+/usr/bin/xattr -w "$xattr_mixed_trailing_name" mixed-value "$xattr_trailing_file"
+if xattr_trailing_output=$(run_vaultlock adopt --yes \
+  "$xattr_trailing_source" 2>&1); then
+  :
+else
+  record_failure "adopt preserves trailing-newline xattr names: $xattr_trailing_output"
+fi
+check "adopt one-trailing-newline xattr oracle" one-value \
+  "$(/usr/bin/xattr -p "$xattr_one_trailing_name" \
+  "$mount_point/adopt-xattr-trailing-newlines/subdirectory/file")"
+check "adopt two-trailing-newline xattr oracle" two-value \
+  "$(/usr/bin/xattr -p "$xattr_two_trailing_name" \
+  "$mount_point/adopt-xattr-trailing-newlines/subdirectory/file")"
+check "adopt mixed-backslash-trailing-newline xattr oracle" mixed-value \
+  "$(/usr/bin/xattr -p "$xattr_mixed_trailing_name" \
+  "$mount_point/adopt-xattr-trailing-newlines/subdirectory/file")"
 
 reset_operation_lock_fixture
 
