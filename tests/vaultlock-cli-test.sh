@@ -24,7 +24,7 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       [[ "${1:-}" == "info" ]] \
         || printf '%s\n' "diskutil $*" >> "$VAULTLOCK_TEST_MUTATION_LOG"
       ;;
-    security|tmutil)
+    security|tmutil|ditto|mv|ln|rm|mkdir|chmod)
       printf '%s\n' "$fixture_command $*" >> "$VAULTLOCK_TEST_MUTATION_LOG"
       ;;
     tle)
@@ -35,8 +35,8 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         fi
       done
       ;;
-    sudo|mount-fixture|bash-version-fixture|curl) ;;
-    mount) ;;
+    sudo|mount-fixture|bash-version-fixture|curl|head|base64) ;;
+    mount|dirname|basename|stat|find|wc|readlink) ;;
     *)
       printf '%s\n' "$fixture_command $*" >> "$VAULTLOCK_TEST_HOOK_LOG"
       ;;
@@ -153,9 +153,18 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         apfs)
           case "${2:-}" in
             addVolume)
+              IFS= read -r fixture_passphrase || [[ -n "$fixture_passphrase" ]]
+              [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_add_volume" ]] || exit 1
               fixture_write locked false
               fixture_write mounted true
+              fixture_write uuid UUID-INIT
+              fixture_write device disk8s1
               fixture_write mount_point "$VAULTLOCK_MOUNT_POINT"
+              fixture_write mount_point_type string
+              fixture_write plist_mode normal
+              if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_final_uuid" ]]; then
+                fixture_write uuid missing
+              fi
               ;;
             changePassphrase)
               ;;
@@ -196,7 +205,94 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     bash-version-fixture)
       printf '%s\n' "$BASH_VERSION"
       ;;
-    mount|security|tle|tmutil|curl)
+    security)
+      [[ "${1:-}" == "-i" && $# -eq 1 ]] || exit 64
+      IFS= read -r fixture_security_command || exit 1
+      [[ "$fixture_security_command" == add-generic-password\ * ]] || exit 64
+      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_keychain" ]] || exit 1
+      : > "$VAULTLOCK_TEST_APFS_STATE/keychain_marker"
+      ;;
+    head)
+      [[ "$*" == "-c 32 /dev/urandom" ]] || exit 64
+      printf 'Task6SecretOnlyInStdinChannel!!!'
+      ;;
+    base64) /usr/bin/base64 "$@" ;;
+    ditto)
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_ditto" ]]; then
+        /bin/mkdir -p "$2"
+        printf 'partial\n' > "$2/partial-copy"
+        exit 1
+      fi
+      /usr/bin/ditto "$@" || exit 1
+      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/add_copy_entry" ]] \
+        || printf 'extra\n' > "$2/extra-copy-entry"
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_mount_uuid_after_copy" ]]; then
+        fixture_write uuid UUID-SWAPPED
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_mount_device_after_copy" ]]; then
+        fixture_write device disk99s9
+      fi
+      : > "$VAULTLOCK_TEST_APFS_STATE/copy_complete"
+      ;;
+    dirname) /usr/bin/dirname "$@" ;;
+    basename) /usr/bin/basename "$@" ;;
+    stat)
+      fixture_stat_path=""
+      for fixture_argument in "$@"; do fixture_stat_path=$fixture_argument; done
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_destination_identity" \
+          && "$fixture_stat_path" == "$VAULTLOCK_MOUNT_POINT"/* ]]; then
+        fixture_destination_stat_count=0
+        if [[ -f "$VAULTLOCK_TEST_APFS_STATE/destination_stat_count" ]]; then
+          fixture_destination_stat_count=$(< "$VAULTLOCK_TEST_APFS_STATE/destination_stat_count")
+        fi
+        fixture_destination_stat_count=$((fixture_destination_stat_count + 1))
+        printf '%s\n' "$fixture_destination_stat_count" \
+          > "$VAULTLOCK_TEST_APFS_STATE/destination_stat_count"
+        if [[ $fixture_destination_stat_count -gt 1 ]]; then
+          printf '998:998\n'
+          exit 0
+        fi
+        /usr/bin/stat "$@"
+      elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_source_identity_after_copy" \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/copy_complete" \
+          && "$fixture_stat_path" != "$VAULTLOCK_MOUNT_POINT"/* ]]; then
+        printf '999:999\n'
+      else
+        /usr/bin/stat "$@"
+      fi
+      ;;
+    find) /usr/bin/find "$@" ;;
+    wc) /usr/bin/wc "$@" ;;
+    readlink) /usr/bin/readlink "$@" ;;
+    mv)
+      fixture_mv_count=0
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/mv_count" ]]; then
+        fixture_mv_count=$(< "$VAULTLOCK_TEST_APFS_STATE/mv_count")
+      fi
+      fixture_mv_count=$((fixture_mv_count + 1))
+      printf '%s\n' "$fixture_mv_count" > "$VAULTLOCK_TEST_APFS_STATE/mv_count"
+      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_backup_move" \
+          || $fixture_mv_count -ne 1 ]] || exit 1
+      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_link_move" \
+          || $fixture_mv_count -ne 2 ]] || exit 1
+      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_rollback_move" \
+          || $fixture_mv_count -lt 2 ]] || exit 1
+      /bin/mv "$@"
+      ;;
+    ln)
+      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_ln" ]] || exit 1
+      /bin/ln "$@"
+      ;;
+    rm)
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_cleanup" \
+          && " $* " == *" -rf "* ]]; then
+        exit 1
+      fi
+      /bin/rm "$@"
+      ;;
+    mkdir) /bin/mkdir "$@" ;;
+    chmod) /bin/chmod "$@" ;;
+    mount|tle|tmutil|curl)
       ;;
     *)
       # Hook fixtures use the same dispatcher and only record their argv.
@@ -226,7 +322,8 @@ mkdir -p "$fake_bin" "$apfs_state" "$state_dir" "$mount_point"
 : > "$confirm_device"
 
 TEST_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-for fake_command in diskutil security sudo tle tmutil curl mount \
+for fake_command in diskutil security sudo tle tmutil curl mount head base64 \
+  ditto dirname basename stat find wc readlink mv ln rm mkdir chmod \
   mount-fixture bash-version-fixture; do
   ln -s "$TEST_SELF" "$fake_bin/$fake_command"
 done
@@ -1098,5 +1195,414 @@ printf '%s\n' "$fake_ciphertext" > "$state_dir/passphrase.tle"
 locked_unlock_no_hooks=$(run_vaultlock unlock --dry-run --no-hooks)
 check_count "recorded-locked unlock disables hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$locked_unlock_no_hooks"
+
+# Init and adopt use the same typed planner as lock and unlock.
+rm -f "$state_dir/state.json" "$state_dir/passphrase.txt" \
+  "$state_dir/passphrase.sha256" "$state_dir/passphrase.tle" \
+  "$apfs_state/locked" "$apfs_state/mounted" "$apfs_state/uuid" \
+  "$apfs_state/device" "$apfs_state/mount_point"
+: > "$action_log"
+: > "$mutation_log"
+init_plan=$(run_vaultlock init --dry-run)
+init_actions=$(printf '%s\n' "$init_plan" | grep -E '^  [123]\. ' || true)
+expected_init_actions=$(cat <<'EOF'
+  1. Prepare protected state and generate recovery material
+  2. Store recovery material in the keychain and create the encrypted APFS volume
+  3. Discover the new volume identity and write initial unlocked state
+EOF
+)
+check "init dry-run ordered actions" "$expected_init_actions" "$init_actions"
+check_line "init dry-run requires confirmation" \
+  '  Required before normal execution changes the vault' "$init_plan"
+check "init dry-run final result" 'Result: no changes made' \
+  "$(printf '%s\n' "$init_plan" | tail -1)"
+check_empty "init dry-run mutation log" "$mutation_log"
+[[ ! -e "$state_dir/state.json" && ! -e "$state_dir/passphrase.txt" ]] \
+  || record_failure "init dry-run leaves state absent"
+
+: > "$mutation_log"
+if init_declined=$(run_vaultlock init 2>&1); then
+  record_failure "init decline exits nonzero"
+else
+  check_contains "init decline reports cancellation" \
+    'cancelled, no changes made' "$init_declined"
+fi
+check_contains "init decline renders full plan" \
+  'Discover the new volume identity and write initial unlocked state' \
+  "$init_declined"
+check "init decline plan matches dry-run" \
+  "$(printf '%s\n' "$init_plan" | sed '$d')" \
+  "$(printf '%s\n' "$init_declined" | sed '$d')"
+check_empty "init decline mutation log" "$mutation_log"
+[[ ! -e "$state_dir/state.json" && ! -e "$state_dir/passphrase.txt" ]] \
+  || record_failure "init decline leaves state absent"
+
+: > "$action_log"
+: > "$mutation_log"
+init_success=$(run_vaultlock init --yes 2>&1)
+check_contains "init yes reports result" 'Result: created encrypted volume vault' \
+  "$init_success"
+check "init yes writes unlocked UUID" UUID-INIT \
+  "$(jq -r '.volume_uuid' "$state_dir/state.json")"
+check "init yes writes unlocked state" false \
+  "$(jq -r '.locked' "$state_dir/state.json")"
+[[ -s "$state_dir/passphrase.txt" ]] \
+  || record_failure "init yes preserves protected plaintext recovery"
+[[ -f "$apfs_state/keychain_marker" ]] \
+  || record_failure "init yes stores keychain item through fake stdin"
+check_contains "init invokes only security interactive mode" 'security -i' \
+  "$(< "$action_log")"
+check_count "init never passes keychain secret in argv" 0 \
+  'security add-generic-password' "$(< "$action_log")"
+generated_secret=$(< "$state_dir/passphrase.txt")
+check_count "init secret absent from output" 0 "$generated_secret" "$init_success"
+check_count "init secret absent from audit" 0 "$generated_secret" "$(< "$action_log")"
+check_count "init secret absent from mutations" 0 "$generated_secret" "$(< "$mutation_log")"
+check_count "init secret absent from hooks" 0 "$generated_secret" "$(< "$hook_log")"
+
+write_json_state false null null null UUID-INIT
+write_apfs_state false true UUID-INIT disk8s1
+adopt_source="$test_root/source directory"
+mkdir -p "$adopt_source"
+printf 'payload\n' > "$adopt_source/file with spaces"
+adopt_source_resolved="$(cd -P "$(dirname "$adopt_source")" && pwd -P)/$(basename "$adopt_source")"
+: > "$mutation_log"
+adopt_plan=$(run_vaultlock adopt --dry-run "$adopt_source")
+check_contains "adopt dry-run plans copy" \
+  "Copy $adopt_source_resolved to $mount_point/source directory" "$adopt_plan"
+check_contains "adopt dry-run plans verification" \
+  'Verify copied data, source identity, and mounted vault identity' "$adopt_plan"
+check_contains "adopt dry-run plans staged replacement" \
+  "Replace $adopt_source_resolved with a verified symlink using a staged backup" \
+  "$adopt_plan"
+check_empty "adopt dry-run mutation log" "$mutation_log"
+[[ -d "$adopt_source" && ! -L "$adopt_source" ]] \
+  || record_failure "adopt dry-run preserves source directory"
+
+: > "$mutation_log"
+if adopt_declined=$(run_vaultlock adopt "$adopt_source" 2>&1); then
+  record_failure "adopt decline exits nonzero"
+else
+  check_contains "adopt decline reports cancellation" \
+    'cancelled, no changes made' "$adopt_declined"
+fi
+check_contains "adopt decline renders staged replacement" \
+  'with a verified symlink using a staged backup' "$adopt_declined"
+check "adopt decline plan matches dry-run" \
+  "$(printf '%s\n' "$adopt_plan" | sed '$d')" \
+  "$(printf '%s\n' "$adopt_declined" | sed '$d')"
+check_empty "adopt decline mutation log" "$mutation_log"
+[[ -d "$adopt_source" && ! -L "$adopt_source" ]] \
+  || record_failure "adopt decline preserves source directory"
+
+: > "$mutation_log"
+adopt_success=$(run_vaultlock adopt --yes "$adopt_source" 2>&1)
+check_contains "adopt yes reports result" 'Result: adopted' "$adopt_success"
+[[ -L "$adopt_source_resolved" ]] \
+  || record_failure "adopt yes replaces source with symlink"
+check "adopt yes symlink target" "$mount_point/source directory" \
+  "$(readlink "$adopt_source_resolved")"
+check "adopt yes preserves copied payload" payload \
+  "$(< "$mount_point/source directory/file with spaces")"
+check_count "adopt yes leaves no backup" 0 '.vaultlock-backup.' \
+  "$(find "$(dirname "$adopt_source_resolved")" -maxdepth 1 -print)"
+
+reset_adopt_fixture() {
+  rm -f "$apfs_state/fail_ditto" "$apfs_state/add_copy_entry" \
+    "$apfs_state/swap_mount_uuid_after_copy" \
+    "$apfs_state/swap_mount_device_after_copy" \
+    "$apfs_state/swap_source_identity_after_copy" \
+    "$apfs_state/swap_destination_identity" "$apfs_state/fail_ln" \
+    "$apfs_state/fail_backup_move" "$apfs_state/fail_link_move" \
+    "$apfs_state/fail_rollback_move" "$apfs_state/fail_cleanup" \
+    "$apfs_state/copy_complete" "$apfs_state/mv_count" \
+    "$apfs_state/destination_stat_count"
+  write_apfs_state false true UUID-INIT disk8s1
+}
+
+new_adopt_source() { # name
+  local case_source="$test_root/$1"
+  rm -rf -- "${case_source:?}" "${mount_point:?}/$1"
+  mkdir -p "$case_source/subdirectory"
+  printf 'payload\n' > "$case_source/subdirectory/file"
+  printf '%s\n' "$case_source"
+}
+
+expect_adopt_failure_preserves_source() { # description source expected
+  local description=$1 source=$2 expected=$3 output
+  if output=$(run_vaultlock adopt --yes "$source" 2>&1); then
+    record_failure "$description exits nonzero"
+  else
+    check_contains "$description reports cause" "$expected" "$output"
+  fi
+  [[ -d "$source" && ! -L "$source" ]] \
+    || record_failure "$description preserves real source"
+}
+
+reset_adopt_fixture
+destination_file_source=$(new_adopt_source destination-file)
+printf 'occupied\n' > "$mount_point/destination-file"
+expect_adopt_failure_preserves_source "adopt rejects destination file" \
+  "$destination_file_source" 'already exists'
+
+reset_adopt_fixture
+destination_directory_source=$(new_adopt_source destination-directory)
+mkdir -p "$mount_point/destination-directory"
+expect_adopt_failure_preserves_source "adopt rejects destination directory" \
+  "$destination_directory_source" 'already exists'
+
+reset_adopt_fixture
+dangling_destination_source=$(new_adopt_source dangling-destination)
+ln -s "$test_root/missing-target" "$mount_point/dangling-destination"
+expect_adopt_failure_preserves_source "adopt rejects dangling destination" \
+  "$dangling_destination_source" 'already exists'
+
+reset_adopt_fixture
+symlink_target=$(new_adopt_source symlink-target)
+symlink_source="$test_root/source-leaf-symlink"
+ln -s "$symlink_target" "$symlink_source"
+if source_symlink_output=$(run_vaultlock adopt --dry-run "$symlink_source" 2>&1); then
+  record_failure "adopt rejects source leaf symlink"
+else
+  check_contains "adopt source symlink reports real-directory requirement" \
+    'is not a real directory' "$source_symlink_output"
+fi
+
+if empty_source_output=$(run_vaultlock adopt --dry-run '' 2>&1); then
+  record_failure "adopt rejects empty source"
+else
+  check_contains "adopt empty source reports boundary" 'must not be empty or root' \
+    "$empty_source_output"
+fi
+if root_source_output=$(run_vaultlock adopt --dry-run / 2>&1); then
+  record_failure "adopt rejects root source"
+else
+  check_contains "adopt root source reports boundary" 'must not be empty or root' \
+    "$root_source_output"
+fi
+if mount_root_output=$(run_vaultlock adopt --dry-run "$mount_point" 2>&1); then
+  record_failure "adopt rejects exact mount root"
+else
+  check_contains "adopt mount root reports already on vault" 'already on the vault' \
+    "$mount_root_output"
+fi
+mkdir -p "$mount_point/already-there"
+if mount_descendant_output=$(run_vaultlock adopt --dry-run \
+    "$mount_point/already-there" 2>&1); then
+  record_failure "adopt rejects mount descendant"
+else
+  check_contains "adopt mount descendant reports already on vault" \
+    'already on the vault' "$mount_descendant_output"
+fi
+control_source=$'control\nsource'
+if control_output=$(run_vaultlock adopt --dry-run "$control_source" 2>&1); then
+  record_failure "adopt rejects control characters"
+else
+  check_contains "adopt control character reports boundary" \
+    'contains control characters' "$control_output"
+fi
+
+reset_adopt_fixture
+copy_failure_source=$(new_adopt_source copy-failure)
+: > "$apfs_state/fail_ditto"
+expect_adopt_failure_preserves_source "adopt copy failure" \
+  "$copy_failure_source" 'copy failed'
+[[ -d "$mount_point/copy-failure" ]] \
+  || record_failure "adopt copy failure leaves explicit partial copy"
+
+reset_adopt_fixture
+count_failure_source=$(new_adopt_source count-failure)
+: > "$apfs_state/add_copy_entry"
+expect_adopt_failure_preserves_source "adopt count mismatch" \
+  "$count_failure_source" 'copy verification failed'
+
+reset_adopt_fixture
+source_swap_source=$(new_adopt_source source-swap)
+: > "$apfs_state/swap_source_identity_after_copy"
+expect_adopt_failure_preserves_source "adopt source identity swap" \
+  "$source_swap_source" 'source identity changed'
+
+reset_adopt_fixture
+destination_swap_source=$(new_adopt_source destination-swap)
+: > "$apfs_state/swap_destination_identity"
+expect_adopt_failure_preserves_source "adopt destination identity swap" \
+  "$destination_swap_source" 'destination identity changed'
+
+reset_adopt_fixture
+mount_uuid_swap_source=$(new_adopt_source mount-uuid-swap)
+: > "$apfs_state/swap_mount_uuid_after_copy"
+expect_adopt_failure_preserves_source "adopt mount UUID swap" \
+  "$mount_uuid_swap_source" 'mounted vault identity changed'
+
+reset_adopt_fixture
+mount_device_swap_source=$(new_adopt_source mount-device-swap)
+: > "$apfs_state/swap_mount_device_after_copy"
+expect_adopt_failure_preserves_source "adopt mount device swap" \
+  "$mount_device_swap_source" 'mounted vault identity changed'
+
+reset_adopt_fixture
+link_failure_source=$(new_adopt_source link-failure)
+: > "$apfs_state/fail_ln"
+expect_adopt_failure_preserves_source "adopt staged link failure" \
+  "$link_failure_source" 'cannot stage replacement symlink'
+
+reset_adopt_fixture
+link_move_failure_source=$(new_adopt_source link-move-failure)
+: > "$apfs_state/fail_link_move"
+expect_adopt_failure_preserves_source "adopt link move rollback" \
+  "$link_move_failure_source" 'original source restored'
+
+reset_adopt_fixture
+cleanup_failure_source=$(new_adopt_source cleanup-failure)
+: > "$apfs_state/fail_cleanup"
+if cleanup_failure_output=$(run_vaultlock adopt --yes \
+    "$cleanup_failure_source" 2>&1); then
+  record_failure "adopt cleanup failure exits nonzero"
+else
+  check_contains "adopt cleanup failure reports retained backup" \
+    'backup retained at' "$cleanup_failure_output"
+fi
+[[ -L "$cleanup_failure_source" ]] \
+  || record_failure "adopt cleanup failure preserves installed symlink"
+cleanup_backup_count=$(find "$test_root" -maxdepth 1 -type d \
+  -name 'cleanup-failure.vaultlock-backup.*' | wc -l | tr -d ' ')
+check "adopt cleanup failure retains one backup" 1 "$cleanup_backup_count"
+
+reset_adopt_fixture
+backup_move_failure_source=$(new_adopt_source backup-move-failure)
+: > "$apfs_state/fail_backup_move"
+expect_adopt_failure_preserves_source "adopt backup move failure" \
+  "$backup_move_failure_source" 'source remains unchanged'
+
+reset_adopt_fixture
+rollback_failure_source=$(new_adopt_source rollback-failure)
+: > "$apfs_state/fail_link_move"
+: > "$apfs_state/fail_rollback_move"
+if rollback_failure_output=$(run_vaultlock adopt --yes \
+    "$rollback_failure_source" 2>&1); then
+  record_failure "adopt rollback failure exits nonzero"
+else
+  check_contains "adopt rollback failure reports backup" \
+    'data remains at' "$rollback_failure_output"
+fi
+rollback_backup_count=$(find "$test_root" -maxdepth 1 -type d \
+  -name 'rollback-failure.vaultlock-backup.*' | wc -l | tr -d ' ')
+check "adopt rollback failure retains one backup" 1 "$rollback_backup_count"
+
+reset_adopt_fixture
+noninteractive_adopt_source=$(new_adopt_source noninteractive-adopt)
+mv "$confirm_device" "$confirm_device.saved"
+if noninteractive_adopt_output=$(run_vaultlock adopt \
+    "$noninteractive_adopt_source" 2>&1); then
+  record_failure "adopt noninteractive confirmation exits nonzero"
+else
+  check_contains "adopt noninteractive confirmation reports yes hint" \
+    'rerun with --yes' "$noninteractive_adopt_output"
+  check_contains "adopt noninteractive confirmation renders full plan" \
+    'with a verified symlink using a staged backup' \
+    "$noninteractive_adopt_output"
+fi
+mv "$confirm_device.saved" "$confirm_device"
+[[ -d "$noninteractive_adopt_source" && ! -L "$noninteractive_adopt_source" ]] \
+  || record_failure "adopt noninteractive confirmation preserves source"
+
+reset_init_fixture() {
+  rm -f "$state_dir/state.json" "$state_dir"/state.json.tmp.* \
+    "$state_dir/passphrase.txt" "$state_dir/passphrase-new.txt" \
+    "$state_dir/passphrase.tle" "$state_dir/passphrase.sha256" \
+    "$apfs_state/locked" "$apfs_state/mounted" "$apfs_state/uuid" \
+    "$apfs_state/device" "$apfs_state/mount_point" \
+    "$apfs_state/mount_point_type" "$apfs_state/plist_mode" \
+    "$apfs_state/keychain_marker" "$apfs_state/fail_keychain" \
+    "$apfs_state/fail_add_volume" "$apfs_state/fail_final_uuid"
+  : > "$action_log"
+  : > "$mutation_log"
+  : > "$hook_log"
+}
+
+reset_init_fixture
+printf '{}\n' > "$state_dir/state.json"
+if existing_state_output=$(run_vaultlock init --dry-run 2>&1); then
+  record_failure "init rejects existing state"
+else
+  check_contains "init existing state reports conflict" 'state already exists' \
+    "$existing_state_output"
+fi
+check_empty "init existing state performs no mutation" "$mutation_log"
+
+reset_init_fixture
+write_apfs_state false true UUID-CONFLICT disk7s1
+if conflicting_volume_output=$(run_vaultlock init --dry-run 2>&1); then
+  record_failure "init rejects conflicting volume"
+else
+  check_contains "init conflicting volume reports conflict" 'already exists' \
+    "$conflicting_volume_output"
+fi
+check_empty "init conflicting volume performs no mutation" "$mutation_log"
+
+reset_init_fixture
+printf 'old-recovery\n' > "$state_dir/passphrase.txt"
+if existing_artifact_output=$(run_vaultlock init --dry-run 2>&1); then
+  record_failure "init rejects preexisting recovery artifact"
+else
+  check_contains "init recovery artifact reports conflict" \
+    'recovery artifacts already exist' "$existing_artifact_output"
+fi
+check_empty "init recovery artifact performs no mutation" "$mutation_log"
+
+reset_init_fixture
+: > "$apfs_state/fail_keychain"
+if keychain_failure_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init keychain failure exits nonzero"
+else
+  check_contains "init keychain failure reports protected recovery" \
+    'protected recovery material remains' "$keychain_failure_output"
+fi
+[[ -s "$state_dir/passphrase.txt" && ! -e "$state_dir/state.json" \
+    && ! -e "$apfs_state/locked" ]] \
+  || record_failure "init keychain failure preserves recovery without fake state"
+keychain_failure_secret=$(< "$state_dir/passphrase.txt")
+check_count "init keychain failure hides secret in output" 0 \
+  "$keychain_failure_secret" "$keychain_failure_output"
+check_count "init keychain failure hides secret in logs" 0 \
+  "$keychain_failure_secret" "$(< "$action_log")$(< "$mutation_log")$(< "$hook_log")"
+
+reset_init_fixture
+: > "$apfs_state/fail_add_volume"
+if add_failure_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init addVolume failure exits nonzero"
+else
+  check_contains "init addVolume failure reports protected recovery" \
+    'protected recovery material remains' "$add_failure_output"
+fi
+[[ -s "$state_dir/passphrase.txt" && ! -e "$state_dir/state.json" \
+    && ! -e "$apfs_state/locked" ]] \
+  || record_failure "init addVolume failure preserves recovery without fake state"
+
+reset_init_fixture
+: > "$apfs_state/fail_final_uuid"
+if uuid_failure_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init final UUID failure exits nonzero"
+else
+  check_contains "init final UUID failure reports protected recovery" \
+    'cannot discover final APFS identity' "$uuid_failure_output"
+fi
+[[ -s "$state_dir/passphrase.txt" && ! -e "$state_dir/state.json" \
+    && -e "$apfs_state/locked" ]] \
+  || record_failure "init final UUID failure preserves recovery and orphan volume"
+
+reset_init_fixture
+mv "$confirm_device" "$confirm_device.saved"
+if missing_confirmation_output=$(run_vaultlock init 2>&1); then
+  record_failure "init missing confirmation device exits nonzero"
+else
+  check_contains "init missing confirmation device reports yes hint" \
+    'rerun with --yes' "$missing_confirmation_output"
+  check_contains "init missing confirmation device renders full plan" \
+    'Discover the new volume identity and write initial unlocked state' \
+    "$missing_confirmation_output"
+fi
+mv "$confirm_device.saved" "$confirm_device"
+check_empty "init missing confirmation device performs no mutation" "$mutation_log"
 
 exit "$fail"

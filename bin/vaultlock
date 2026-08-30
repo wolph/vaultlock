@@ -46,6 +46,15 @@ PLAN_CONTEXT_ROUND=""
 PLAN_TARGET_TEXT=""
 PLAN_REQUEST_TEXT=""
 
+INIT_PASSPHRASE=""
+ADOPT_SOURCE=""
+ADOPT_DESTINATION=""
+ADOPT_SOURCE_IDENTITY=""
+ADOPT_DESTINATION_IDENTITY=""
+ADOPT_COPY_VERIFIED=false
+ADOPT_STAGED_LINK=""
+ADOPT_BACKUP=""
+
 DISCOVERED_HOOK_PATHS=()
 DISCOVERED_HOOK_SCOPES=()
 HOOK_ARGV=()
@@ -625,7 +634,9 @@ keychain_update|\
 tle_encrypt|tle_verify_future|persist_locked_recovery|remove_plaintext|\
 tm_delete_data_snapshots|apfs_lock|verify_locked_postconditions|tle_decrypt|\
 verify_decrypted_hash|apfs_unlock|persist_plaintext|persist_unlocked_state|\
-verify_secure_target|verify_unlocked_target)
+verify_secure_target|verify_unlocked_target|\
+init_prepare_state|init_create_volume|init_write_state|\
+adopt_copy|adopt_verify|adopt_replace_source)
       ;;
     *)
       die "unknown plan operation ID: $operation_id"
@@ -943,48 +954,316 @@ require_mounted() {
         || die "expected vault is not mounted at $MOUNT_POINT"
 }
 
-cmd_init() {
-  [[ -e "$state_file" ]] && die "state already exists at $state_file"
-  diskutil info "$MOUNT_POINT" >/dev/null 2>&1 && die "volume $VOLUME already exists"
-  command -v jq >/dev/null || die "jq required"
-  tle_bin >/dev/null || die "tle required, see Task 1 of the plan"
+inspect_init_absent_state() {
+  SNAPSHOT_RECORDED_LOCKED=unknown
+  SNAPSHOT_APFS_LOCKED=unknown
+  SNAPSHOT_APFS_MOUNTED=unknown
+  SNAPSHOT_EXPECTED_UUID=unknown
+  SNAPSHOT_ACTUAL_UUID=unknown
+  SNAPSHOT_DEVICE=unknown
+  SNAPSHOT_ACTUAL_MOUNT_POINT=unknown
+  SNAPSHOT_DEADLINE=null
+  SNAPSHOT_DEADLINE_EPOCH=null
+  SNAPSHOT_ROUND=null
+  SNAPSHOT_PLAINTEXT_PRESENT=false
+  SNAPSHOT_CIPHERTEXT_PRESENT=false
+  SNAPSHOT_HASH_PRESENT=false
+  SNAPSHOT_STATE_VALID=false
+  SNAPSHOT_APFS_VALID=false
+  SNAPSHOT_APFS_INSPECTED=false
+  SNAPSHOT_VALID=false
+  SNAPSHOT_ERROR="state file is absent"
+  RUNTIME_ASSESSMENT="not initialized"
+
+  command -v jq >/dev/null || die "jq is required"
+  command -v plutil >/dev/null || die "plutil is required"
+  if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+    [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
+      || die "state directory is not a real directory: $STATE_DIR"
+  fi
+  [[ ! -e "$state_file" && ! -L "$state_file" ]] \
+    || die "state already exists at $state_file"
+  [[ ! -e "$STATE_DIR/passphrase.txt" \
+      && ! -L "$STATE_DIR/passphrase.txt" \
+      && ! -e "$STATE_DIR/passphrase-new.txt" \
+      && ! -L "$STATE_DIR/passphrase-new.txt" \
+      && ! -e "$STATE_DIR/passphrase.tle" \
+      && ! -L "$STATE_DIR/passphrase.tle" \
+      && ! -e "$STATE_DIR/passphrase.sha256" \
+      && ! -L "$STATE_DIR/passphrase.sha256" ]] \
+    || die "recovery artifacts already exist in $STATE_DIR"
+  if diskutil info -plist "$MOUNT_POINT" >/dev/null 2>&1; then
+    die "volume $VOLUME already exists at $MOUNT_POINT"
+  fi
+}
+
+build_init_plan() {
+  PLAN_TARGET_TEXT="an initialized, unlocked, mounted vault at $MOUNT_POINT"
+  plan_add init_prepare_state \
+    "Prepare protected state and generate recovery material"
+  plan_add init_create_volume \
+    "Store recovery material in the keychain and create the encrypted APFS volume"
+  plan_add init_write_state \
+    "Discover the new volume identity and write initial unlocked state"
+}
+
+safe_public_token() { [[ -n "$1" && "$1" =~ ^[A-Za-z0-9._@+-]+$ ]]; }
+safe_base64_token() { [[ -n "$1" && "$1" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; }
+
+keychain_store_passphrase() { # passphrase
+  local passphrase=$1
+  safe_public_token "${USER:-}" || die "USER is missing or unsafe for keychain storage"
+  safe_public_token "$KEYCHAIN_SERVICE" \
+    || die "keychain service is unsafe for keychain storage"
+  safe_base64_token "$passphrase" \
+    || die "generated recovery material is not valid base64"
+  printf 'add-generic-password -a %s -s %s -w %s -U\n' \
+    "$USER" "$KEYCHAIN_SERVICE" "$passphrase" | security -i
+}
+
+execute_init_prepare_state() {
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
   umask 077
-  local pass
-  pass=$(head -c 32 /dev/urandom | base64)
-  printf '%s' "$pass" > "$STATE_DIR/passphrase.txt"
-  security add-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w "$pass" -U
-  printf '%s' "$pass" | sudo diskutil apfs addVolume "$CONTAINER" APFS "$VOLUME" -stdinpassphrase
-  local uuid
-  uuid=$(diskutil info -plist "$MOUNT_POINT" | plutil -extract VolumeUUID raw -o - -)
-  jq -n --arg uuid "$uuid" --arg created "$(/bin/date -Iseconds)" \
-    '{locked: false, volume_uuid: $uuid, created: $created,
-      deadline: null, deadline_epoch: null, round: null}' > "$state_file"
-  note "created encrypted volume $VOLUME ($uuid), state in $STATE_DIR"
+  INIT_PASSPHRASE=$(head -c 32 /dev/urandom | base64 | tr -d '\n') \
+    || die "recovery material generation failed"
+  safe_base64_token "$INIT_PASSPHRASE" \
+    || die "recovery material generation returned invalid base64"
+  printf '%s' "$INIT_PASSPHRASE" > "$STATE_DIR/passphrase.txt" \
+    || die "cannot write protected recovery material"
+  chmod 600 "$STATE_DIR/passphrase.txt" \
+    || die "cannot protect recovery material"
 }
 
-cmd_adopt() {
-  local src=${1:?usage: vaultlock adopt <dir>}
-  src=${src%/}
-  src="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
-  [[ -d "$src" && ! -L "$src" ]] || die "$src is not a real directory"
-  [[ "$src" != "$MOUNT_POINT"/* ]] || die "$src is already on the vault"
-  [[ -f "$state_file" ]] || die "no state, run vaultlock init first"
-  require_mounted
-  local dst
-  dst="$MOUNT_POINT/$(basename "$src")"
-  [[ -e "$dst" ]] && die "$dst already exists"
-  note "copying $src -> $dst (ditto preserves xattrs and permissions)"
-  ditto "$src" "$dst"
-  local n_src n_dst
-  n_src=$(find "$src" | wc -l | tr -d ' ') || die "entry count failed for $src (partial copy may remain at $dst)"
-  n_dst=$(find "$dst" | wc -l | tr -d ' ') || die "entry count failed for $dst (partial copy remains at $dst)"
-  [[ "$n_src" == "$n_dst" ]] \
-    || die "copy verification failed ($n_src vs $n_dst entries), source kept at $src"
-  rm -rf "$src"
-  ln -s "$dst" "$src"
-  note "adopted: $src -> $dst"
+execute_init_create_volume() {
+  [[ -n "$INIT_PASSPHRASE" ]] || die "init recovery material is unavailable"
+  keychain_store_passphrase "$INIT_PASSPHRASE" \
+    || die "keychain storage failed, protected recovery material remains at $STATE_DIR/passphrase.txt"
+  printf '%s' "$INIT_PASSPHRASE" \
+    | sudo diskutil apfs addVolume "$CONTAINER" APFS "$VOLUME" -stdinpassphrase \
+    || die "APFS volume creation failed, protected recovery material remains at $STATE_DIR/passphrase.txt"
+}
+
+read_apfs_identity() { # target
+  local target=$1 plist uuid device locked mount_point
+  plist=$(diskutil info -plist "$target" 2>/dev/null) || return 1
+  printf '%s' "$plist" | plutil -lint - >/dev/null 2>&1 || return 1
+  uuid=$(printf '%s' "$plist" \
+    | plutil -extract VolumeUUID raw -expect string -o - - 2>/dev/null) \
+    || return 1
+  device=$(printf '%s' "$plist" \
+    | plutil -extract DeviceIdentifier raw -expect string -o - - 2>/dev/null) \
+    || return 1
+  locked=$(printf '%s' "$plist" \
+    | plutil -extract Locked raw -expect bool -o - - 2>/dev/null) \
+    || return 1
+  mount_point=$(printf '%s' "$plist" \
+    | plutil -extract MountPoint raw -expect string -o - - 2>/dev/null) \
+    || return 1
+  [[ -n "$uuid" && "$device" =~ ^disk[[:alnum:]]+$ \
+      && "$locked" == "false" && "$mount_point" == "$MOUNT_POINT" ]] \
+    || return 1
+  printf '%s\t%s\n' "$uuid" "$device"
+}
+
+execute_init_write_state() {
+  local identity uuid device temporary_state
+  identity=$(read_apfs_identity "$MOUNT_POINT") \
+    || die "cannot discover final APFS identity, protected recovery material remains at $STATE_DIR/passphrase.txt"
+  IFS=$'\t' read -r uuid device <<< "$identity"
+  PLAN_CONTEXT_UUID=$uuid
+  PLAN_CONTEXT_DEVICE=$device
+  temporary_state="$state_file.tmp.$$"
+  jq -n --arg uuid "$uuid" --arg created "$(/bin/date -Iseconds)" \
+    '{locked: false, volume_uuid: $uuid, created: $created, deadline: null, deadline_epoch: null, round: null}' \
+    > "$temporary_state" \
+    || die "initial state creation failed, protected recovery material remains at $STATE_DIR/passphrase.txt"
+  chmod 600 "$temporary_state" \
+    || die "cannot protect initial state, recovery material remains at $STATE_DIR/passphrase.txt"
+  mv "$temporary_state" "$state_file" \
+    || die "initial state installation failed, recovery material remains at $STATE_DIR/passphrase.txt"
+}
+
+verify_init_target() {
+  inspect_runtime_state
+  classify_runtime_state
+  [[ "$RUNTIME_ASSESSMENT" == "usable" \
+      && "$SNAPSHOT_EXPECTED_UUID" == "$PLAN_CONTEXT_UUID" \
+      && "$SNAPSHOT_DEVICE" == "$PLAN_CONTEXT_DEVICE" ]] \
+    || die "created vault failed usable-target verification"
+}
+
+path_has_control_character() {
+  [[ "$1" == *$'\n'* || "$1" == *$'\r'* || "$1" == *$'\t'* ]] \
+    && return 0
+  LC_ALL=C printf '%s' "$1" | grep -q '[[:cntrl:]]'
+}
+path_identity() { stat -f '%d:%i' -- "$1" 2>/dev/null; }
+
+assert_path_identity() { # path expected description
+  local actual
+  actual=$(path_identity "$1") || die "$3 identity is unavailable"
+  [[ "$actual" == "$2" ]] || die "$3 identity changed"
+}
+
+inspect_adopt_state() {
+  local raw=$OPTION_OPERANDS parent leaf canonical_mount
+  [[ -n "$raw" && "$raw" != "/" ]] || die "adopt source must not be empty or root"
+  path_has_control_character "$raw" && die "adopt source contains control characters"
+  while [[ "$raw" != "/" && "$raw" == */ ]]; do raw=${raw%/}; done
+  parent=$(dirname -- "$raw") || die "cannot resolve adopt source parent"
+  leaf=$(basename -- "$raw") || die "cannot resolve adopt source name"
+  [[ "$leaf" != "." && "$leaf" != ".." ]] || die "adopt source name is not allowed"
+  parent=$(cd -P -- "$parent" 2>/dev/null && pwd -P) \
+    || die "cannot resolve adopt source parent"
+  ADOPT_SOURCE="$parent/$leaf"
+  [[ ! -L "$ADOPT_SOURCE" && -d "$ADOPT_SOURCE" ]] \
+    || die "$ADOPT_SOURCE is not a real directory"
+  canonical_mount=$(cd -P -- "$MOUNT_POINT" 2>/dev/null && pwd -P) \
+    || die "cannot resolve expected mount point"
+  [[ "$ADOPT_SOURCE" != "$canonical_mount" \
+      && "$ADOPT_SOURCE" != "$canonical_mount"/* ]] \
+    || die "$ADOPT_SOURCE is already on the vault"
+  inspect_runtime_state
+  classify_runtime_state
+  [[ "$RUNTIME_ASSESSMENT" == "usable" \
+      && "$SNAPSHOT_APFS_MOUNTED" == "true" \
+      && "$SNAPSHOT_ACTUAL_MOUNT_POINT" == "$MOUNT_POINT" ]] \
+    || die "adopt requires a usable mounted vault"
+  ADOPT_DESTINATION="$MOUNT_POINT/$leaf"
+  [[ ! -e "$ADOPT_DESTINATION" && ! -L "$ADOPT_DESTINATION" ]] \
+    || die "$ADOPT_DESTINATION already exists"
+  ADOPT_SOURCE_IDENTITY=$(path_identity "$ADOPT_SOURCE") \
+    || die "cannot capture source identity"
+  PLAN_CONTEXT_UUID=$SNAPSHOT_EXPECTED_UUID
+  PLAN_CONTEXT_DEVICE=$SNAPSHOT_DEVICE
+  ADOPT_COPY_VERIFIED=false
+}
+
+build_adopt_plan() {
+  PLAN_TARGET_TEXT="$ADOPT_SOURCE linked to copied data at $ADOPT_DESTINATION"
+  plan_add adopt_copy "Copy $ADOPT_SOURCE to $ADOPT_DESTINATION"
+  plan_add adopt_verify \
+    "Verify copied data, source identity, and mounted vault identity"
+  plan_add adopt_replace_source \
+    "Replace $ADOPT_SOURCE with a verified symlink using a staged backup"
+}
+
+verify_adopt_mount_identity() {
+  local identity actual_uuid actual_device
+  identity=$(read_apfs_identity "$MOUNT_POINT") \
+    || die "mounted vault identity is unavailable"
+  IFS=$'\t' read -r actual_uuid actual_device <<< "$identity"
+  [[ "$actual_uuid" == "$PLAN_CONTEXT_UUID" \
+      && "$actual_device" == "$PLAN_CONTEXT_DEVICE" ]] \
+    || die "mounted vault identity changed"
+}
+
+execute_adopt_copy() {
+  assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
+  verify_adopt_mount_identity
+  [[ ! -e "$ADOPT_DESTINATION" && ! -L "$ADOPT_DESTINATION" ]] \
+    || die "$ADOPT_DESTINATION appeared before copy"
+  ditto "$ADOPT_SOURCE" "$ADOPT_DESTINATION" \
+    || die "copy failed, source remains at $ADOPT_SOURCE and partial copy may remain at $ADOPT_DESTINATION"
+}
+
+entry_count() { # directory
+  local count
+  count=$(find "$1" -print | wc -l | tr -d '[:space:]') || return 1
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$count"
+}
+
+execute_adopt_verify() {
+  local source_count destination_count
+  assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
+  [[ ! -L "$ADOPT_DESTINATION" && -d "$ADOPT_DESTINATION" ]] \
+    || die "copied destination is not a real directory"
+  verify_adopt_mount_identity
+  source_count=$(entry_count "$ADOPT_SOURCE") \
+    || die "entry count failed for $ADOPT_SOURCE, source remains unchanged"
+  destination_count=$(entry_count "$ADOPT_DESTINATION") \
+    || die "entry count failed for $ADOPT_DESTINATION, source remains unchanged"
+  [[ "$source_count" == "$destination_count" ]] \
+    || die "copy verification failed ($source_count vs $destination_count entries), source remains at $ADOPT_SOURCE"
+  ADOPT_DESTINATION_IDENTITY=$(path_identity "$ADOPT_DESTINATION") \
+    || die "cannot capture copied destination identity"
+  ADOPT_COPY_VERIFIED=true
+}
+
+cleanup_staged_link() {
+  [[ -z "$ADOPT_STAGED_LINK" || ! -L "$ADOPT_STAGED_LINK" ]] \
+    || rm -f -- "$ADOPT_STAGED_LINK" || true
+}
+
+rollback_adopt_source() {
+  local restored_identity
+  if [[ -L "$ADOPT_SOURCE" ]]; then rm -f -- "$ADOPT_SOURCE" || return 1; fi
+  [[ ! -e "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" ]] || return 1
+  [[ -d "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
+  mv -- "$ADOPT_BACKUP" "$ADOPT_SOURCE" || return 1
+  restored_identity=$(path_identity "$ADOPT_SOURCE") || return 1
+  [[ "$restored_identity" == "$ADOPT_SOURCE_IDENTITY" ]] || return 1
+  cleanup_staged_link
+}
+
+execute_adopt_replace_source() {
+  local link_target backup_identity
+  [[ "$ADOPT_COPY_VERIFIED" == "true" ]] \
+    || die "adopt replacement requires verified copy"
+  assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
+  assert_path_identity "$ADOPT_DESTINATION" "$ADOPT_DESTINATION_IDENTITY" "destination"
+  [[ ! -L "$ADOPT_DESTINATION" && -d "$ADOPT_DESTINATION" ]] \
+    || die "destination is no longer a real directory"
+  verify_adopt_mount_identity
+  ADOPT_STAGED_LINK="$ADOPT_SOURCE.vaultlock-link.$$"
+  ADOPT_BACKUP="$ADOPT_SOURCE.vaultlock-backup.$$"
+  [[ ! -e "$ADOPT_STAGED_LINK" && ! -L "$ADOPT_STAGED_LINK" \
+      && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
+    || die "adopt staging paths already exist"
+  ln -s -- "$ADOPT_DESTINATION" "$ADOPT_STAGED_LINK" \
+    || die "cannot stage replacement symlink, source remains unchanged"
+  mv -- "$ADOPT_SOURCE" "$ADOPT_BACKUP" || {
+    cleanup_staged_link
+    die "cannot stage source backup, source remains unchanged"
+  }
+  backup_identity=$(path_identity "$ADOPT_BACKUP") || {
+    rollback_adopt_source || true
+    die "cannot verify staged source backup"
+  }
+  [[ "$backup_identity" == "$ADOPT_SOURCE_IDENTITY" ]] || {
+    rollback_adopt_source || true
+    die "staged source backup identity changed"
+  }
+  if ! mv -- "$ADOPT_STAGED_LINK" "$ADOPT_SOURCE"; then
+    rollback_adopt_source \
+      || die "replacement failed and rollback failed, data remains at $ADOPT_BACKUP"
+    die "replacement failed, original source restored"
+  fi
+  link_target=$(readlink "$ADOPT_SOURCE" 2>/dev/null) || link_target=""
+  if [[ ! -L "$ADOPT_SOURCE" || "$link_target" != "$ADOPT_DESTINATION" ]]; then
+    rollback_adopt_source \
+      || die "replacement verification failed and rollback failed, data remains at $ADOPT_BACKUP"
+    die "replacement verification failed, original source restored"
+  fi
+  backup_identity=$(path_identity "$ADOPT_BACKUP") \
+    || die "cannot verify backup before cleanup, backup retained at $ADOPT_BACKUP"
+  [[ "$backup_identity" == "$ADOPT_SOURCE_IDENTITY" \
+      && -d "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
+    || die "backup identity changed before cleanup, backup retained at $ADOPT_BACKUP"
+  rm -rf -- "$ADOPT_BACKUP" \
+    || die "replacement succeeded but backup cleanup failed, backup retained at $ADOPT_BACKUP"
+  ADOPT_BACKUP=""
+}
+
+verify_adopt_target() {
+  local link_target
+  link_target=$(readlink "$ADOPT_SOURCE" 2>/dev/null) || link_target=""
+  [[ -L "$ADOPT_SOURCE" && "$link_target" == "$ADOPT_DESTINATION" ]] \
+    || die "adopted source is not the expected symlink"
+  assert_path_identity "$ADOPT_DESTINATION" "$ADOPT_DESTINATION_IDENTITY" "destination"
+  verify_adopt_mount_identity
 }
 
 sha256_of() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
@@ -1268,6 +1547,66 @@ run_dry_run_plan() { # command
   printf 'Result: no changes made\n'
 }
 
+execute_plan() {
+  local index operation_id
+  for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
+    operation_id=${PLAN_OPERATION_IDS[$index]}
+    case "$operation_id" in
+      init_prepare_state) execute_init_prepare_state ;;
+      init_create_volume) execute_init_create_volume ;;
+      init_write_state) execute_init_write_state ;;
+      adopt_copy) execute_adopt_copy ;;
+      adopt_verify) execute_adopt_verify ;;
+      adopt_replace_source) execute_adopt_replace_source ;;
+      *) die "no executor for plan operation: $operation_id" ;;
+    esac
+  done
+}
+
+run_planned_command() { # command
+  local command=$1
+  case "$command" in
+    init)
+      inspect_init_absent_state
+      plan_reset
+      build_init_plan
+      ;;
+    adopt)
+      inspect_adopt_state
+      plan_reset
+      build_adopt_plan
+      ;;
+    *) die "no planned command runner for: $command" ;;
+  esac
+  render_plan "$command"
+  if [[ "$OPTION_DRY_RUN" == "true" ]]; then
+    printf 'Result: no changes made\n'
+    return 0
+  fi
+  confirm_plan
+  execute_plan
+  case "$command" in
+    init)
+      verify_init_target
+      note "Result: created encrypted volume $VOLUME ($PLAN_CONTEXT_UUID), state in $STATE_DIR"
+      ;;
+    adopt)
+      verify_adopt_target
+      note "Result: adopted $ADOPT_SOURCE -> $ADOPT_DESTINATION"
+      ;;
+  esac
+}
+
+dispatch_init() {
+  parse_command_options init "$@"
+  run_planned_command init
+}
+
+dispatch_adopt() {
+  parse_command_options adopt "$@"
+  run_planned_command adopt
+}
+
 dispatch_lock() {
   local argument
   for argument in "$@"; do
@@ -1526,8 +1865,8 @@ case "${1:-}" in
     shift
     run_hook_phase "$@"
     ;;
-  init) shift; cmd_init "$@" ;;
-  adopt) shift; cmd_adopt "$@" ;;
+  init) shift; dispatch_init "$@" ;;
+  adopt) shift; dispatch_adopt "$@" ;;
   lock) shift; dispatch_lock "$@" ;;
   unlock) shift; dispatch_unlock "$@" ;;
   status) shift; cmd_status "$@" ;;
