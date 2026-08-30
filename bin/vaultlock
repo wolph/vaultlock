@@ -60,9 +60,20 @@ ADOPT_SOURCE=""
 ADOPT_DESTINATION=""
 ADOPT_SOURCE_IDENTITY=""
 ADOPT_DESTINATION_IDENTITY=""
+ADOPT_PARENT=""
+ADOPT_PARENT_IDENTITY=""
+ADOPT_SOURCE_DEVICE=""
+ADOPT_DESTINATION_DEVICE=""
+ADOPT_SOURCE_TREE_DIGEST=""
+ADOPT_DESTINATION_TREE_DIGEST=""
+ADOPT_BACKUP_IDENTITY=""
+ADOPT_BACKUP_DEVICE=""
+ADOPT_BACKUP_TREE_DIGEST=""
 ADOPT_COPY_VERIFIED=false
 ADOPT_STAGED_LINK=""
 ADOPT_BACKUP=""
+ADOPT_BACKUP_QUARANTINE=""
+ADOPT_BACKUP_QUARANTINE_IDENTITY=""
 
 DISCOVERED_HOOK_PATHS=()
 DISCOVERED_HOOK_SCOPES=()
@@ -1035,6 +1046,7 @@ inspect_init_volume_absence() {
 
 inspect_init_absent_state() {
   local artifact
+  preflight_init_dependencies
   SNAPSHOT_RECORDED_LOCKED=unknown
   SNAPSHOT_APFS_LOCKED=unknown
   SNAPSHOT_APFS_MOUNTED=unknown
@@ -1096,6 +1108,23 @@ build_init_plan() {
 safe_public_token() { [[ -n "$1" && "$1" =~ ^[A-Za-z0-9._@+-]+$ ]]; }
 safe_base64_token() { [[ -n "$1" && "$1" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; }
 
+require_command() { # command
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required"
+}
+
+preflight_init_dependencies() {
+  local command
+  for command in security sudo head base64 mktemp; do
+    require_command "$command"
+  done
+  safe_public_token "${USER:-}" || die "USER is missing or unsafe"
+  safe_public_token "$KEYCHAIN_SERVICE" || die "keychain service is unsafe"
+}
+
+preflight_adopt_dependencies() {
+  require_command ditto
+}
+
 keychain_store_passphrase() { # passphrase
   local passphrase=$1
   safe_public_token "${USER:-}" || die "USER is missing or unsafe for keychain storage"
@@ -1103,7 +1132,6 @@ keychain_store_passphrase() { # passphrase
     || die "keychain service is unsafe for keychain storage"
   safe_base64_token "$passphrase" \
     || die "generated recovery material is not valid base64"
-  require_init_state_dir_identity
   printf 'add-generic-password -a %s -s %s -w %s -U\n' \
     "$USER" "$KEYCHAIN_SERVICE" "$passphrase" \
     | security -i >/dev/null 2>&1
@@ -1227,6 +1255,7 @@ execute_init_create_volume() {
   verify_installed_init_recovery "volume creation"
   inspect_init_volume_absence
   verify_installed_init_recovery "keychain storage"
+  require_init_state_dir_identity
   keychain_store_passphrase "$INIT_PASSPHRASE" \
     || die "keychain storage failed, protected recovery material remains at $STATE_DIR/passphrase.txt"
   verify_installed_init_recovery "APFS volume creation"
@@ -1327,20 +1356,20 @@ execute_init_write_state() {
     die "state staging path is unsafe, protected recovery material remains at $INIT_RECOVERY_PATH"
   fi
   installed_identity=$(path_identity "$state_file") \
-    || die "installed state identity is unavailable, recovery material remains at $INIT_RECOVERY_PATH"
+    || die "installed state identity is unavailable, installed state retained at $state_file, recovery material remains at $INIT_RECOVERY_PATH"
   [[ "$installed_identity" == "$temporary_identity" ]] \
-    || die "installed state identity mismatch, recovery material remains at $INIT_RECOVERY_PATH"
+    || die "installed state identity mismatch, installed state retained at $state_file, recovery material remains at $INIT_RECOVERY_PATH"
   INIT_STATE_IDENTITY=$installed_identity
   installed_digest=$(state_path_digest "$state_file") \
-    || die "installed state content is unreadable, recovery material remains at $INIT_RECOVERY_PATH"
+    || die "installed state content is unreadable, installed state retained at $state_file, recovery material remains at $INIT_RECOVERY_PATH"
   final_identity=$(path_identity "$state_file") \
-    || die "installed state identity is unavailable after fingerprinting, recovery material remains at $INIT_RECOVERY_PATH"
+    || die "installed state identity is unavailable after fingerprinting, installed state retained at $state_file, recovery material remains at $INIT_RECOVERY_PATH"
   [[ "$final_identity" == "$INIT_STATE_IDENTITY" ]] \
-    || die "installed state identity changed during fingerprinting, recovery material remains at $INIT_RECOVERY_PATH"
+    || die "installed state identity changed during fingerprinting, installed state retained at $state_file, recovery material remains at $INIT_RECOVERY_PATH"
   [[ "$installed_digest" == "$INIT_STATE_DIGEST" ]] \
-    || die "installed state content changed during installation, recovery material remains at $INIT_RECOVERY_PATH"
+    || die "installed state content changed during installation, installed state retained at $state_file, recovery material remains at $INIT_RECOVERY_PATH"
   rm -f -- "$temporary_state" \
-    || die "cannot remove state staging name, recovery material remains at $INIT_RECOVERY_PATH"
+    || die "cannot remove state staging name, installed state retained at $state_file, recovery material remains at $INIT_RECOVERY_PATH"
 }
 
 ensure_init_quarantine_private() { # directory expected_identity
@@ -1549,6 +1578,7 @@ assert_path_identity() { # path expected description
 
 inspect_adopt_state() {
   local raw=$OPTION_OPERANDS parent leaf canonical_mount
+  preflight_adopt_dependencies
   [[ -n "$raw" && "$raw" != "/" ]] || die "adopt source must not be empty or root"
   path_has_control_character "$raw" && die "adopt source contains control characters"
   while [[ "$raw" != "/" && "$raw" == */ ]]; do raw=${raw%/}; done
@@ -1557,6 +1587,9 @@ inspect_adopt_state() {
   [[ "$leaf" != "." && "$leaf" != ".." ]] || die "adopt source name is not allowed"
   parent=$(cd -P -- "$parent" 2>/dev/null && pwd -P) \
     || die "cannot resolve adopt source parent"
+  ADOPT_PARENT=$parent
+  ADOPT_PARENT_IDENTITY=$(path_identity "$ADOPT_PARENT") \
+    || die "cannot capture adopt source parent identity"
   ADOPT_SOURCE="$parent/$leaf"
   [[ ! -L "$ADOPT_SOURCE" && -d "$ADOPT_SOURCE" ]] \
     || die "$ADOPT_SOURCE is not a real directory"
@@ -1582,8 +1615,19 @@ inspect_adopt_state() {
     || die "adopt backup path already exists: $ADOPT_BACKUP"
   ADOPT_SOURCE_IDENTITY=$(path_identity "$ADOPT_SOURCE") \
     || die "cannot capture source identity"
+  ADOPT_SOURCE_DEVICE=$(stat -f '%d' -- "$ADOPT_SOURCE" 2>/dev/null) \
+    || die "cannot capture source device"
   PLAN_CONTEXT_UUID=$SNAPSHOT_EXPECTED_UUID
   PLAN_CONTEXT_DEVICE=$SNAPSHOT_DEVICE
+  ADOPT_SOURCE_TREE_DIGEST=""
+  ADOPT_DESTINATION_IDENTITY=""
+  ADOPT_DESTINATION_DEVICE=""
+  ADOPT_DESTINATION_TREE_DIGEST=""
+  ADOPT_BACKUP_IDENTITY=""
+  ADOPT_BACKUP_DEVICE=""
+  ADOPT_BACKUP_TREE_DIGEST=""
+  ADOPT_BACKUP_QUARANTINE=""
+  ADOPT_BACKUP_QUARANTINE_IDENTITY=""
   ADOPT_COPY_VERIFIED=false
 }
 
@@ -1606,54 +1650,201 @@ verify_adopt_mount_identity() {
     || die "mounted vault identity changed"
 }
 
+sha256_output_digest() { # shasum output
+  local output=$1 digest
+  digest=${output%% *}
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
+empty_payload_digest() {
+  local output
+  output=$(/usr/bin/shasum -a 256 < /dev/null 2>/dev/null) || return 1
+  sha256_output_digest "$output"
+}
+
+path_stat_signature() { # path
+  stat -f '%d:%i:%Lp:%z:%r:%m:%c' -- "$1" 2>/dev/null
+}
+
+path_payload_digest() { # type path
+  local type=$1 path=$2 output
+  case "$type" in
+    d)
+      empty_payload_digest
+      ;;
+    f)
+      output=$(/usr/bin/shasum -a 256 -- "$path" 2>/dev/null) \
+        || return 1
+      sha256_output_digest "$output"
+      ;;
+    l)
+      output=$(readlink -n -- "$path" 2>/dev/null \
+        | /usr/bin/shasum -a 256 2>/dev/null) || return 1
+      sha256_output_digest "$output"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+tree_manifest_stream() { # root expected_device
+  local root=$1 expected_device=$2 path relative type
+  local device mode size rdev before after payload
+  local LC_ALL=C
+  LC_ALL=C find -P -s -x "$root" -print0 \
+    | while IFS= read -r -d '' path; do
+      if [[ "$path" == "$root" ]]; then
+        relative=.
+      elif [[ "$path" == "$root/"* ]]; then
+        relative=${path#"$root/"}
+      else
+        return 1
+      fi
+      device=$(stat -f '%d' -- "$path" 2>/dev/null) || return 1
+      [[ "$device" == "$expected_device" ]] || return 1
+      if [[ -L "$path" ]]; then
+        type=l
+      elif [[ -d "$path" ]]; then
+        type=d
+      elif [[ -f "$path" ]]; then
+        type=f
+      else
+        return 1
+      fi
+      before=$(path_stat_signature "$path") || return 1
+      mode=$(stat -f '%Lp' -- "$path" 2>/dev/null) || return 1
+      size=$(stat -f '%z' -- "$path" 2>/dev/null) || return 1
+      rdev=$(stat -f '%r' -- "$path" 2>/dev/null) || return 1
+      payload=$(path_payload_digest "$type" "$path") || return 1
+      after=$(path_stat_signature "$path") || return 1
+      [[ "$before" == "$after" ]] || return 1
+      printf '%q\0%s\0%s\0%s\0%s\0%s\0' \
+        "$relative" "$type" "$mode" "$size" "$rdev" "$payload"
+    done
+}
+
+tree_digest_once() { # root expected_identity expected_device
+  local root=$1 expected_identity=$2 expected_device=$3 output digest
+  [[ ! -L "$root" && -d "$root" ]] || return 1
+  [[ "$(path_identity "$root")" == "$expected_identity" ]] || return 1
+  [[ "$(stat -f '%d' -- "$root" 2>/dev/null)" == "$expected_device" ]] \
+    || return 1
+  output=$(tree_manifest_stream "$root" "$expected_device" \
+    | /usr/bin/shasum -a 256 2>/dev/null) || return 1
+  digest=$(sha256_output_digest "$output") || return 1
+  [[ "$(path_identity "$root")" == "$expected_identity" ]] || return 1
+  [[ "$(stat -f '%d' -- "$root" 2>/dev/null)" == "$expected_device" ]] \
+    || return 1
+  printf '%s\n' "$digest"
+}
+
+stable_tree_digest() { # root expected_identity expected_device
+  local first second
+  first=$(tree_digest_once "$1" "$2" "$3") || return 1
+  second=$(tree_digest_once "$1" "$2" "$3") || return 1
+  [[ "$first" == "$second" ]] || return 1
+  printf '%s\n' "$first"
+}
+
+assert_adopt_source_manifest() { # failure message
+  local digest
+  assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
+  assert_path_identity "$ADOPT_PARENT" "$ADOPT_PARENT_IDENTITY" \
+    "source parent"
+  digest=$(stable_tree_digest "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" \
+    "$ADOPT_SOURCE_DEVICE") || die "$1"
+  [[ "$digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] || die "$1"
+}
+
+assert_adopt_destination_manifest() { # failure message
+  local digest
+  assert_path_identity "$ADOPT_DESTINATION" "$ADOPT_DESTINATION_IDENTITY" \
+    "destination"
+  digest=$(stable_tree_digest "$ADOPT_DESTINATION" \
+    "$ADOPT_DESTINATION_IDENTITY" "$ADOPT_DESTINATION_DEVICE") || die "$1"
+  [[ "$digest" == "$ADOPT_DESTINATION_TREE_DIGEST" ]] || die "$1"
+}
+
 execute_adopt_copy() {
+  assert_path_identity "$ADOPT_PARENT" "$ADOPT_PARENT_IDENTITY" \
+    "source parent"
   assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
   verify_adopt_mount_identity
   [[ ! -e "$ADOPT_DESTINATION" && ! -L "$ADOPT_DESTINATION" ]] \
     || die "$ADOPT_DESTINATION appeared before copy"
+  ADOPT_SOURCE_TREE_DIGEST=$(stable_tree_digest "$ADOPT_SOURCE" \
+    "$ADOPT_SOURCE_IDENTITY" "$ADOPT_SOURCE_DEVICE") \
+    || die "cannot create stable source manifest, source remains at $ADOPT_SOURCE"
+  assert_path_identity "$ADOPT_PARENT" "$ADOPT_PARENT_IDENTITY" \
+    "source parent"
+  assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
+  verify_adopt_mount_identity
   ditto "$ADOPT_SOURCE" "$ADOPT_DESTINATION" \
     || die "copy failed, source remains at $ADOPT_SOURCE and partial copy may remain at $ADOPT_DESTINATION"
 }
 
-entry_count() { # directory
-  local count
-  count=$(find "$1" -print | wc -l | tr -d '[:space:]') || return 1
-  [[ "$count" =~ ^[0-9]+$ ]] || return 1
-  printf '%s\n' "$count"
-}
-
 execute_adopt_verify() {
-  local source_count destination_count
+  local source_digest destination_digest
   assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
+  assert_path_identity "$ADOPT_PARENT" "$ADOPT_PARENT_IDENTITY" \
+    "source parent"
+  source_digest=$(stable_tree_digest "$ADOPT_SOURCE" \
+    "$ADOPT_SOURCE_IDENTITY" "$ADOPT_SOURCE_DEVICE") \
+    || die "source manifest changed after copy, source remains at $ADOPT_SOURCE"
+  [[ "$source_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] \
+    || die "source manifest changed after copy, source remains at $ADOPT_SOURCE"
   [[ ! -L "$ADOPT_DESTINATION" && -d "$ADOPT_DESTINATION" ]] \
     || die "copied destination is not a real directory"
   verify_adopt_mount_identity
-  source_count=$(entry_count "$ADOPT_SOURCE") \
-    || die "entry count failed for $ADOPT_SOURCE, source remains unchanged"
-  destination_count=$(entry_count "$ADOPT_DESTINATION") \
-    || die "entry count failed for $ADOPT_DESTINATION, source remains unchanged"
-  [[ "$source_count" == "$destination_count" ]] \
-    || die "copy verification failed ($source_count vs $destination_count entries), source remains at $ADOPT_SOURCE"
   ADOPT_DESTINATION_IDENTITY=$(path_identity "$ADOPT_DESTINATION") \
     || die "cannot capture copied destination identity"
+  assert_path_identity "$ADOPT_DESTINATION" "$ADOPT_DESTINATION_IDENTITY" \
+    "destination"
+  ADOPT_DESTINATION_DEVICE=$(stat -f '%d' -- "$ADOPT_DESTINATION" \
+    2>/dev/null) || die "cannot capture copied destination device"
+  destination_digest=$(stable_tree_digest "$ADOPT_DESTINATION" \
+    "$ADOPT_DESTINATION_IDENTITY" "$ADOPT_DESTINATION_DEVICE") \
+    || die "copy verification failed, source remains at $ADOPT_SOURCE"
+  [[ "$destination_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] \
+    || die "copy verification failed, source remains at $ADOPT_SOURCE"
+  ADOPT_DESTINATION_TREE_DIGEST=$destination_digest
+  source_digest=$(stable_tree_digest "$ADOPT_SOURCE" \
+    "$ADOPT_SOURCE_IDENTITY" "$ADOPT_SOURCE_DEVICE") \
+    || die "source manifest changed after copy, source remains at $ADOPT_SOURCE"
+  [[ "$source_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] \
+    || die "source manifest changed after copy, source remains at $ADOPT_SOURCE"
   ADOPT_COPY_VERIFIED=true
 }
 
 cleanup_staged_link() {
-  [[ -z "$ADOPT_STAGED_LINK" || ! -L "$ADOPT_STAGED_LINK" ]] \
-    || rm -f -- "$ADOPT_STAGED_LINK" || true
+  if [[ -z "$ADOPT_STAGED_LINK" || ! -L "$ADOPT_STAGED_LINK" ]]; then
+    return 0
+  fi
+  if ! rm -f -- "$ADOPT_STAGED_LINK"; then
+    printf 'vaultlock: cannot remove staged link, retained at %s\n' \
+      "$ADOPT_STAGED_LINK" >&2
+    return 1
+  fi
 }
 
 rollback_adopt_source() {
-  local backup_identity restored_identity
+  local backup_identity backup_digest restored_identity restored_digest
   if [[ -L "$ADOPT_SOURCE" ]]; then rm -f -- "$ADOPT_SOURCE" || return 1; fi
   [[ ! -e "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" ]] || return 1
   [[ -d "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
   backup_identity=$(path_identity "$ADOPT_BACKUP") || return 1
   [[ "$backup_identity" == "$ADOPT_SOURCE_IDENTITY" ]] || return 1
+  backup_digest=$(stable_tree_digest "$ADOPT_BACKUP" "$backup_identity" \
+    "$ADOPT_SOURCE_DEVICE") || return 1
+  [[ "$backup_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] || return 1
   mv -- "$ADOPT_BACKUP" "$ADOPT_SOURCE" || return 1
   restored_identity=$(path_identity "$ADOPT_SOURCE") || return 1
-  if [[ "$restored_identity" != "$ADOPT_SOURCE_IDENTITY" ]]; then
+  restored_digest=$(stable_tree_digest "$ADOPT_SOURCE" "$restored_identity" \
+    "$ADOPT_SOURCE_DEVICE") || restored_digest=""
+  if [[ "$restored_identity" != "$ADOPT_SOURCE_IDENTITY" \
+      || "$restored_digest" != "$ADOPT_SOURCE_TREE_DIGEST" ]]; then
     if [[ -d "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" \
         && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]]; then
       mv -- "$ADOPT_SOURCE" "$ADOPT_BACKUP" || return 1
@@ -1663,30 +1854,178 @@ rollback_adopt_source() {
   cleanup_staged_link
 }
 
+adopt_mount_identity_matches() {
+  local identity actual_uuid actual_device
+  identity=$(read_apfs_identity "$MOUNT_POINT") || return 1
+  IFS=$'\t' read -r actual_uuid actual_device <<< "$identity"
+  [[ "$actual_uuid" == "$PLAN_CONTEXT_UUID" \
+    && "$actual_device" == "$PLAN_CONTEXT_DEVICE" ]]
+}
+
+adopt_link_matches() {
+  local link_target
+  link_target=$(readlink "$ADOPT_SOURCE" 2>/dev/null) || return 1
+  [[ -L "$ADOPT_SOURCE" && "$link_target" == "$ADOPT_DESTINATION" ]]
+}
+
+adopt_destination_manifest_matches() {
+  local digest
+  [[ ! -L "$ADOPT_DESTINATION" && -d "$ADOPT_DESTINATION" ]] || return 1
+  [[ "$(path_identity "$ADOPT_DESTINATION")" \
+    == "$ADOPT_DESTINATION_IDENTITY" ]] || return 1
+  digest=$(stable_tree_digest "$ADOPT_DESTINATION" \
+    "$ADOPT_DESTINATION_IDENTITY" "$ADOPT_DESTINATION_DEVICE") || return 1
+  [[ "$digest" == "$ADOPT_DESTINATION_TREE_DIGEST" ]]
+}
+
+adopt_quarantine_envelope_matches() {
+  [[ "$(path_identity "$ADOPT_PARENT")" == "$ADOPT_PARENT_IDENTITY" ]] \
+    || return 1
+  [[ ! -L "$ADOPT_BACKUP_QUARANTINE" \
+    && -d "$ADOPT_BACKUP_QUARANTINE" ]] || return 1
+  [[ "$(path_identity "$ADOPT_BACKUP_QUARANTINE")" \
+    == "$ADOPT_BACKUP_QUARANTINE_IDENTITY" ]] || return 1
+  [[ "$(path_mode "$ADOPT_BACKUP_QUARANTINE")" == "700" ]] || return 1
+  adopt_link_matches || return 1
+  adopt_destination_manifest_matches || return 1
+  adopt_mount_identity_matches || return 1
+}
+
+adopt_quarantined_backup_matches() {
+  local quarantined=$ADOPT_BACKUP_QUARANTINE/backup digest
+  adopt_quarantine_envelope_matches || return 1
+  [[ ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
+  [[ ! -L "$quarantined" && -d "$quarantined" ]] || return 1
+  [[ "$(path_identity "$quarantined")" == "$ADOPT_BACKUP_IDENTITY" ]] \
+    || return 1
+  [[ "$(stat -f '%d' -- "$quarantined" 2>/dev/null)" \
+    == "$ADOPT_BACKUP_DEVICE" ]] || return 1
+  digest=$(stable_tree_digest "$quarantined" "$ADOPT_BACKUP_IDENTITY" \
+    "$ADOPT_BACKUP_DEVICE") || return 1
+  [[ "$digest" == "$ADOPT_BACKUP_TREE_DIGEST" ]]
+}
+
+tree_is_confined() { # root expected_identity expected_device
+  local root=$1 expected_identity=$2 expected_device=$3 path device
+  [[ ! -L "$root" && -d "$root" ]] || return 1
+  [[ "$(path_identity "$root")" == "$expected_identity" ]] || return 1
+  if ! LC_ALL=C find -P -s -x "$root" -print0 \
+      | while IFS= read -r -d '' path; do
+      device=$(stat -f '%d' -- "$path" 2>/dev/null) || return 1
+      [[ "$device" == "$expected_device" ]] || return 1
+      [[ -L "$path" || -d "$path" || -f "$path" ]] || return 1
+      done; then
+    return 1
+  fi
+  [[ "$(path_identity "$root")" == "$expected_identity" ]]
+}
+
+adopt_quarantined_backup_is_empty_tree() {
+  local quarantined=$ADOPT_BACKUP_QUARANTINE/backup remaining
+  adopt_quarantine_envelope_matches || return 1
+  [[ ! -L "$quarantined" && -d "$quarantined" ]] || return 1
+  [[ "$(path_identity "$quarantined")" == "$ADOPT_BACKUP_IDENTITY" ]] \
+    || return 1
+  tree_is_confined "$quarantined" "$ADOPT_BACKUP_IDENTITY" \
+    "$ADOPT_BACKUP_DEVICE" || return 1
+  remaining=$(find -P -s -x "$quarantined" ! -type d -print -quit) \
+    || return 1
+  [[ -z "$remaining" ]]
+}
+
+create_adopt_backup_quarantine() {
+  local quarantine
+  assert_path_identity "$ADOPT_PARENT" "$ADOPT_PARENT_IDENTITY" \
+    "source parent"
+  quarantine=$(mktemp -d "$ADOPT_SOURCE.vaultlock-quarantine.XXXXXX") \
+    || die "cannot create backup quarantine after replacement"
+  ADOPT_BACKUP_QUARANTINE=$quarantine
+  chmod 700 "$ADOPT_BACKUP_QUARANTINE" \
+    || die "cannot protect backup quarantine, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  ADOPT_BACKUP_QUARANTINE_IDENTITY=$(path_identity \
+    "$ADOPT_BACKUP_QUARANTINE") \
+    || die "cannot capture backup quarantine identity, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  adopt_quarantine_envelope_matches \
+    || die "backup quarantine verification failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+}
+
+quarantine_adopt_backup() {
+  local quarantined
+  create_adopt_backup_quarantine
+  quarantined=$ADOPT_BACKUP_QUARANTINE/backup
+  if ! mv -n -- "$ADOPT_BACKUP" "$quarantined"; then
+    die "cannot quarantine backup, backup retained at $ADOPT_BACKUP, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  fi
+  adopt_quarantined_backup_matches \
+    || die "backup quarantine verification failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+}
+
+delete_quarantined_adopt_backup() {
+  local quarantined=$ADOPT_BACKUP_QUARANTINE/backup
+  adopt_quarantined_backup_matches \
+    || die "backup deletion boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  find -P -x "$quarantined" -depth ! -type d \
+    -exec /bin/rm -f -- {} + \
+    || die "replacement succeeded but backup cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  adopt_quarantined_backup_is_empty_tree \
+    || die "backup cleanup boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  find -P -x "$quarantined" -depth -type d \
+    -exec /bin/rmdir -- {} + \
+    || die "replacement succeeded but backup cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  [[ ! -e "$quarantined" && ! -L "$quarantined" ]] \
+    || die "replacement succeeded but quarantined backup remains at $quarantined"
+  adopt_quarantine_envelope_matches \
+    || die "backup quarantine boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  rmdir -- "$ADOPT_BACKUP_QUARANTINE" \
+    || die "replacement succeeded but backup quarantine remains at $ADOPT_BACKUP_QUARANTINE"
+  ADOPT_BACKUP=""
+  ADOPT_BACKUP_QUARANTINE=""
+  ADOPT_BACKUP_QUARANTINE_IDENTITY=""
+}
+
 execute_adopt_replace_source() {
-  local link_target backup_identity
+  local link_target backup_digest
   [[ "$ADOPT_COPY_VERIFIED" == "true" ]] \
     || die "adopt replacement requires verified copy"
-  assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
-  assert_path_identity "$ADOPT_DESTINATION" "$ADOPT_DESTINATION_IDENTITY" "destination"
-  [[ ! -L "$ADOPT_DESTINATION" && -d "$ADOPT_DESTINATION" ]] \
-    || die "destination is no longer a real directory"
+  assert_adopt_source_manifest \
+    "source manifest changed before replacement, source remains at $ADOPT_SOURCE"
+  assert_adopt_destination_manifest \
+    "destination manifest changed before replacement, source remains at $ADOPT_SOURCE"
   verify_adopt_mount_identity
   [[ ! -e "$ADOPT_STAGED_LINK" && ! -L "$ADOPT_STAGED_LINK" \
       && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
     || die "adopt staging paths already exist"
   ln -s -- "$ADOPT_DESTINATION" "$ADOPT_STAGED_LINK" \
     || die "cannot stage replacement symlink, source remains unchanged"
-  mv -- "$ADOPT_SOURCE" "$ADOPT_BACKUP" || {
-    cleanup_staged_link
+  assert_adopt_source_manifest \
+    "source manifest changed before backup move, staged link retained at $ADOPT_STAGED_LINK"
+  assert_adopt_destination_manifest \
+    "destination manifest changed before backup move, staged link retained at $ADOPT_STAGED_LINK"
+  verify_adopt_mount_identity
+  if ! mv -- "$ADOPT_SOURCE" "$ADOPT_BACKUP"; then
+    cleanup_staged_link \
+      || die "cannot stage source backup, staged link retained at $ADOPT_STAGED_LINK"
     die "cannot stage source backup, source remains unchanged"
-  }
-  backup_identity=$(path_identity "$ADOPT_BACKUP") || {
+  fi
+  ADOPT_BACKUP_IDENTITY=$(path_identity "$ADOPT_BACKUP") || {
     die "cannot verify staged source backup, backup retained at $ADOPT_BACKUP"
   }
-  [[ "$backup_identity" == "$ADOPT_SOURCE_IDENTITY" ]] || {
+  [[ "$ADOPT_BACKUP_IDENTITY" == "$ADOPT_SOURCE_IDENTITY" ]] || {
     die "staged source backup identity changed, backup retained at $ADOPT_BACKUP"
   }
+  ADOPT_BACKUP_DEVICE=$(stat -f '%d' -- "$ADOPT_BACKUP" 2>/dev/null) \
+    || die "cannot verify staged source backup device, backup retained at $ADOPT_BACKUP"
+  [[ "$ADOPT_BACKUP_DEVICE" == "$ADOPT_SOURCE_DEVICE" ]] \
+    || die "staged source backup device changed, backup retained at $ADOPT_BACKUP"
+  backup_digest=$(stable_tree_digest "$ADOPT_BACKUP" \
+    "$ADOPT_BACKUP_IDENTITY" "$ADOPT_BACKUP_DEVICE") \
+    || die "cannot verify staged source backup manifest, backup retained at $ADOPT_BACKUP"
+  [[ "$backup_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] \
+    || die "staged source backup manifest changed, backup retained at $ADOPT_BACKUP"
+  ADOPT_BACKUP_TREE_DIGEST=$backup_digest
+  assert_adopt_destination_manifest \
+    "destination manifest changed after backup move, backup retained at $ADOPT_BACKUP"
+  verify_adopt_mount_identity
   if ! mv -- "$ADOPT_STAGED_LINK" "$ADOPT_SOURCE"; then
     rollback_adopt_source \
       || die "replacement failed and rollback failed, data remains at $ADOPT_BACKUP, backup retained at $ADOPT_BACKUP"
@@ -1698,14 +2037,22 @@ execute_adopt_replace_source() {
       || die "replacement verification failed and rollback failed, data remains at $ADOPT_BACKUP, backup retained at $ADOPT_BACKUP"
     die "replacement verification failed, original source restored"
   fi
-  backup_identity=$(path_identity "$ADOPT_BACKUP") \
+  ADOPT_BACKUP_IDENTITY=$(path_identity "$ADOPT_BACKUP") \
     || die "cannot verify backup before cleanup, backup retained at $ADOPT_BACKUP"
-  [[ "$backup_identity" == "$ADOPT_SOURCE_IDENTITY" \
+  [[ "$ADOPT_BACKUP_IDENTITY" == "$ADOPT_SOURCE_IDENTITY" \
       && -d "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
     || die "backup identity changed before cleanup, backup retained at $ADOPT_BACKUP"
-  rm -rf -- "$ADOPT_BACKUP" \
-    || die "replacement succeeded but backup cleanup failed, backup retained at $ADOPT_BACKUP"
-  ADOPT_BACKUP=""
+  backup_digest=$(stable_tree_digest "$ADOPT_BACKUP" \
+    "$ADOPT_BACKUP_IDENTITY" "$ADOPT_BACKUP_DEVICE") \
+    || die "cannot verify backup manifest before cleanup, backup retained at $ADOPT_BACKUP"
+  [[ "$backup_digest" == "$ADOPT_BACKUP_TREE_DIGEST" ]] \
+    || die "backup manifest changed before cleanup, backup retained at $ADOPT_BACKUP"
+  adopt_destination_manifest_matches \
+    || die "destination changed before backup cleanup, backup retained at $ADOPT_BACKUP"
+  adopt_mount_identity_matches \
+    || die "mounted vault changed before backup cleanup, backup retained at $ADOPT_BACKUP"
+  quarantine_adopt_backup
+  delete_quarantined_adopt_backup
 }
 
 verify_adopt_target() {
@@ -2283,6 +2630,12 @@ case "${1:-}" in
     else
       note false
     fi
+    ;;
+  __keychain_store)
+    [[ $# -eq 1 ]] || die_usage "usage: vaultlock __keychain_store"
+    IFS= read -r harness_passphrase \
+      || die "keychain helper input is unavailable"
+    keychain_store_passphrase "$harness_passphrase"
     ;;
   __confirm_plan)
     [[ $# -eq 3 ]] \

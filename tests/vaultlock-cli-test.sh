@@ -436,6 +436,10 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         exit 1
       fi
       /usr/bin/ditto "$@" || exit 1
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/modify_source_after_copy" ]]; then
+        printf 'modified after copy\n' > "$1/subdirectory/file"
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/modify_source_after_copy"
+      fi
       [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/add_copy_entry" ]] \
         || printf 'extra\n' > "$2/extra-copy-entry"
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_mount_uuid_after_copy" ]]; then
@@ -451,7 +455,12 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     stat)
       fixture_stat_path=""
       for fixture_argument in "$@"; do fixture_stat_path=$fixture_argument; done
-      if [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/state.json" \
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/foreign_device_after_backup_quarantine" \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/adopt_backup_quarantined" \
+          && "$fixture_stat_path" == *.vaultlock-quarantine.*/backup/subdirectory/file \
+          && "${1:-}" == "-f" && "${2:-}" == "%d" ]]; then
+        printf '999\n'
+      elif [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/state.json" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/overwrite_state_after_install_identity" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/state_link_installed" ]]; then
         /usr/bin/stat "$@" || exit 1
@@ -515,19 +524,9 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         esac
         /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/write_state_recovery_race"
       elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_backup_identity" \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/adopt_link_move_failed" \
           && "$fixture_stat_path" == *.vaultlock-backup* ]]; then
-        fixture_backup_stat_count=0
-        if [[ -f "$VAULTLOCK_TEST_APFS_STATE/backup_stat_count" ]]; then
-          fixture_backup_stat_count=$(< "$VAULTLOCK_TEST_APFS_STATE/backup_stat_count")
-        fi
-        fixture_backup_stat_count=$((fixture_backup_stat_count + 1))
-        printf '%s\n' "$fixture_backup_stat_count" \
-          > "$VAULTLOCK_TEST_APFS_STATE/backup_stat_count"
-        if [[ $fixture_backup_stat_count -gt 1 ]]; then
-          printf '997:997\n'
-          exit 0
-        fi
-        /usr/bin/stat "$@"
+        printf '997:997\n'
       elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_restored_identity" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/rollback_moved" \
           && "$fixture_stat_path" != "$VAULTLOCK_MOUNT_POINT"/* ]]; then
@@ -554,7 +553,13 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         /usr/bin/stat "$@"
       fi
       ;;
-    find) /usr/bin/find "$@" ;;
+    find)
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_cleanup" \
+          && " $* " == *" -exec /bin/rm "* ]]; then
+        exit 1
+      fi
+      /usr/bin/find "$@"
+      ;;
     wc) /usr/bin/wc "$@" ;;
     readlink)
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_link_verification" \
@@ -584,26 +589,52 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         : > "$VAULTLOCK_TEST_APFS_STATE/quarantine_made_nonprivate"
         /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/make_quarantine_nonprivate_before_move"
       fi
-      fixture_mv_count=0
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/mv_count" ]]; then
-        fixture_mv_count=$(< "$VAULTLOCK_TEST_APFS_STATE/mv_count")
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/replace_source_entry_before_backup_move" \
+          && "$fixture_mv_source" != "$VAULTLOCK_MOUNT_POINT"/* \
+          && "$fixture_mv_destination" == *.vaultlock-backup ]]; then
+        /bin/rm -f "$fixture_mv_source/subdirectory/file"
+        printf 'same count replacement\n' \
+          > "$fixture_mv_source/subdirectory/replacement"
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/replace_source_entry_before_backup_move"
       fi
-      fixture_mv_count=$((fixture_mv_count + 1))
-      printf '%s\n' "$fixture_mv_count" > "$VAULTLOCK_TEST_APFS_STATE/mv_count"
-      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_backup_move" \
-          || $fixture_mv_count -ne 1 ]] || exit 1
-      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_link_move" \
-          || $fixture_mv_count -ne 2 ]] || exit 1
-      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_rollback_move" \
-          || $fixture_mv_count -lt 2 ]] || exit 1
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_backup_move" \
+          && "$fixture_mv_destination" == *.vaultlock-backup \
+          && "$fixture_mv_source" == "${fixture_mv_destination%.vaultlock-backup}" ]]; then
+        exit 1
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_link_move" \
+          && "$fixture_mv_source" == *.vaultlock-link \
+          && "$fixture_mv_destination" == "${fixture_mv_source%.vaultlock-link}" ]]; then
+        : > "$VAULTLOCK_TEST_APFS_STATE/adopt_link_move_failed"
+        exit 1
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_rollback_move" \
+          && "$fixture_mv_source" == *.vaultlock-backup \
+          && "$fixture_mv_destination" == "${fixture_mv_source%.vaultlock-backup}" ]]; then
+        exit 1
+      fi
       /bin/mv "$@" || exit 1
+      if [[ "$fixture_mv_destination" == *.vaultlock-quarantine.*/backup ]]; then
+        : > "$VAULTLOCK_TEST_APFS_STATE/adopt_backup_quarantined"
+        if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_backup_at_quarantine_boundary" ]]; then
+          /bin/mkdir "$fixture_mv_destination.replacement"
+          printf 'unowned replacement\n' \
+            > "$fixture_mv_destination.replacement/replacement"
+          /bin/mv "$fixture_mv_destination" \
+            "${fixture_mv_destination%/*}/owned-backup"
+          /bin/mv "$fixture_mv_destination.replacement" \
+            "$fixture_mv_destination"
+          /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_backup_at_quarantine_boundary"
+        fi
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move" \
           && "$fixture_mv_destination" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.*/state.json ]]; then
         fixture_replace_cleanup_state "$fixture_mv_destination"
         /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move"
       fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_restored_identity" \
-          && $fixture_mv_count -ge 3 ]]; then
+          && "$fixture_mv_source" == *.vaultlock-backup \
+          && "$fixture_mv_destination" == "${fixture_mv_source%.vaultlock-backup}" ]]; then
         : > "$VAULTLOCK_TEST_APFS_STATE/rollback_moved"
       fi
       ;;
@@ -626,6 +657,10 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_init_state_cleanup" \
           && ( "$fixture_rm_path" == "$VAULTLOCK_STATE_DIR/state.json" \
             || "$fixture_rm_path" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.*/state.json ) ]]; then
+        exit 1
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_staged_link_cleanup" \
+          && "$fixture_rm_path" == *.vaultlock-link ]]; then
         exit 1
       fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_after_quarantine_move" \
@@ -804,7 +839,25 @@ run_vaultlock() {
   VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
   VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
   VAULTLOCK_TEST_APFS_STATE="$apfs_state" \
-    /bin/bash "$VL" "$@"
+  /bin/bash "$VL" "$@"
+}
+
+run_vaultlock_with_stdin() { # input command...
+  local input=$1
+  shift
+  printf '%s\n' "$input" | HOME="$test_home" \
+  PATH="$fake_bin" \
+  VAULTLOCK_STATE_DIR="$state_dir" \
+  VAULTLOCK_MOUNT_POINT="$mount_point" \
+  VAULTLOCK_MOUNT_COMMAND="$fake_bin/mount-fixture" \
+  VAULTLOCK_CONFIRM_DEVICE="$confirm_device" \
+  VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  VAULTLOCK_TEST_FAKE_BIN="$fake_bin" \
+  VAULTLOCK_TEST_ACTION_LOG="$action_log" \
+  VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
+  VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
+  VAULTLOCK_TEST_APFS_STATE="$apfs_state" \
+  /bin/bash "$VL" "$@"
 }
 
 run_vaultlock_tty_yes() {
@@ -1613,6 +1666,62 @@ rm -f "$state_dir/state.json" "$state_dir/passphrase.txt" \
   "$apfs_state/device" "$apfs_state/mount_point"
 : > "$action_log"
 : > "$mutation_log"
+
+for init_preflight_command in security sudo head base64 mktemp; do
+  mv "$fake_bin/$init_preflight_command" \
+    "$fake_bin/$init_preflight_command.missing"
+  : > "$mutation_log"
+  if init_preflight_output=$(run_vaultlock init --dry-run 2>&1); then
+    record_failure "init preflights missing $init_preflight_command"
+  else
+    check_contains "init missing $init_preflight_command reports dependency" \
+      "$init_preflight_command is required" "$init_preflight_output"
+  fi
+  check_count "init missing $init_preflight_command renders no plan" 0 \
+    'Vaultlock plan:' "$init_preflight_output"
+  check_empty "init missing $init_preflight_command performs no mutation" \
+    "$mutation_log"
+  mv "$fake_bin/$init_preflight_command.missing" \
+    "$fake_bin/$init_preflight_command"
+done
+
+: > "$mutation_log"
+if unsafe_user_output=$(USER='unsafe user' run_vaultlock init --dry-run 2>&1); then
+  record_failure "init preflights unsafe USER"
+else
+  check_contains "init unsafe USER reports token" \
+    'USER is missing or unsafe' "$unsafe_user_output"
+fi
+check_count "init unsafe USER renders no plan" 0 \
+  'Vaultlock plan:' "$unsafe_user_output"
+check_empty "init unsafe USER performs no mutation" "$mutation_log"
+
+: > "$mutation_log"
+if unsafe_service_output=$(VAULTLOCK_VOLUME='unsafe volume' \
+    run_vaultlock init --dry-run 2>&1); then
+  record_failure "init preflights unsafe keychain service"
+else
+  check_contains "init unsafe keychain service reports token" \
+    'keychain service is unsafe' "$unsafe_service_output"
+fi
+check_count "init unsafe service renders no plan" 0 \
+  'Vaultlock plan:' "$unsafe_service_output"
+check_empty "init unsafe service performs no mutation" "$mutation_log"
+
+rm -f "$apfs_state/keychain_marker"
+if keychain_helper_output=$(run_vaultlock_with_stdin QUJDRA== \
+    __keychain_store 2>&1); then
+  :
+else
+  record_failure "generic keychain helper works without init globals"
+fi
+[[ -f "$apfs_state/keychain_marker" ]] \
+  || record_failure "generic keychain helper reaches security stdin path"
+check_count "generic keychain helper exposes no init identity error" 0 \
+  'state directory identity' "$keychain_helper_output"
+rm -f "$apfs_state/keychain_marker"
+: > "$mutation_log"
+
 init_plan=$(run_vaultlock init --dry-run)
 init_actions=$(printf '%s\n' "$init_plan" | grep -E '^  [123]\. ' || true)
 expected_init_actions=$(cat <<'EOF'
@@ -1689,6 +1798,21 @@ adopt_source="$test_root/source directory"
 mkdir -p "$adopt_source"
 printf 'payload\n' > "$adopt_source/file with spaces"
 adopt_source_resolved="$(cd -P "$(dirname "$adopt_source")" && pwd -P)/$(basename "$adopt_source")"
+
+mv "$fake_bin/ditto" "$fake_bin/ditto.missing"
+: > "$mutation_log"
+if adopt_ditto_preflight_output=$(run_vaultlock adopt --dry-run \
+    "$adopt_source" 2>&1); then
+  record_failure "adopt preflights missing ditto"
+else
+  check_contains "adopt missing ditto reports dependency" \
+    'ditto is required' "$adopt_ditto_preflight_output"
+fi
+check_count "adopt missing ditto renders no plan" 0 \
+  'Vaultlock plan:' "$adopt_ditto_preflight_output"
+check_empty "adopt missing ditto performs no mutation" "$mutation_log"
+mv "$fake_bin/ditto.missing" "$fake_bin/ditto"
+
 : > "$mutation_log"
 adopt_plan=$(run_vaultlock adopt --dry-run "$adopt_source")
 check_contains "adopt dry-run plans copy" \
@@ -1719,7 +1843,11 @@ check_empty "adopt decline mutation log" "$mutation_log"
   || record_failure "adopt decline preserves source directory"
 
 : > "$mutation_log"
-adopt_success=$(run_vaultlock adopt --yes "$adopt_source" 2>&1)
+if adopt_success=$(run_vaultlock adopt --yes "$adopt_source" 2>&1); then
+  :
+else
+  record_failure "adopt yes exits successfully: ${adopt_success//$'\n'/ | }"
+fi
 check_contains "adopt yes reports result" 'Result: adopted' "$adopt_success"
 [[ -L "$adopt_source_resolved" ]] \
   || record_failure "adopt yes replaces source with symlink"
@@ -1735,16 +1863,22 @@ reset_adopt_fixture() {
   : > "$action_log"
   : > "$hook_log"
   rm -f "$apfs_state/fail_ditto" "$apfs_state/add_copy_entry" \
+    "$apfs_state/modify_source_after_copy" \
+    "$apfs_state/replace_source_entry_before_backup_move" \
+    "$apfs_state/foreign_device_after_backup_quarantine" \
+    "$apfs_state/swap_backup_at_quarantine_boundary" \
+    "$apfs_state/adopt_backup_quarantined" \
+    "$apfs_state/fail_staged_link_cleanup" \
     "$apfs_state/swap_mount_uuid_after_copy" \
     "$apfs_state/swap_mount_device_after_copy" \
     "$apfs_state/swap_source_identity_after_copy" \
     "$apfs_state/swap_destination_identity" "$apfs_state/fail_ln" \
-    "$apfs_state/swap_backup_identity" "$apfs_state/backup_stat_count" \
+    "$apfs_state/swap_backup_identity" "$apfs_state/adopt_link_move_failed" \
     "$apfs_state/swap_restored_identity" "$apfs_state/rollback_moved" \
     "$apfs_state/fail_link_verification" \
     "$apfs_state/fail_backup_move" "$apfs_state/fail_link_move" \
     "$apfs_state/fail_rollback_move" "$apfs_state/fail_cleanup" \
-    "$apfs_state/copy_complete" "$apfs_state/mv_count" \
+    "$apfs_state/copy_complete" \
     "$apfs_state/destination_stat_count"
   write_apfs_state false true UUID-INIT disk8s1
 }
@@ -1867,6 +2001,35 @@ expect_adopt_failure_preserves_source "adopt count mismatch" \
   "$count_failure_source" 'copy verification failed'
 
 reset_adopt_fixture
+source_content_change_source=$(new_adopt_source source-content-change)
+: > "$apfs_state/modify_source_after_copy"
+if source_content_change_output=$(run_vaultlock adopt --yes \
+    "$source_content_change_source" 2>&1); then
+  record_failure "adopt rejects source content change after copy"
+else
+  check_contains "adopt source content change reports manifest" \
+    'source manifest changed after copy' "$source_content_change_output"
+fi
+[[ -d "$source_content_change_source" \
+    && ! -L "$source_content_change_source" ]] \
+  || record_failure "adopt source content change preserves source directory"
+
+reset_adopt_fixture
+same_count_replace_source=$(new_adopt_source same-count-replace)
+: > "$apfs_state/replace_source_entry_before_backup_move"
+if same_count_replace_output=$(run_vaultlock adopt --yes \
+    "$same_count_replace_source" 2>&1); then
+  record_failure "adopt rejects same-count replacement before backup move"
+else
+  check_contains "adopt same-count replacement reports retained backup" \
+    'backup retained at' "$same_count_replace_output"
+fi
+same_count_backup_count=$(find "$test_root" -maxdepth 1 -type d \
+  -name 'same-count-replace.vaultlock-backup*' | wc -l | tr -d ' ')
+check "adopt same-count replacement retains backup" 1 \
+  "$same_count_backup_count"
+
+reset_adopt_fixture
 source_swap_source=$(new_adopt_source source-swap)
 : > "$apfs_state/swap_source_identity_after_copy"
 expect_adopt_failure_preserves_source "adopt source identity swap" \
@@ -1903,20 +2066,67 @@ expect_adopt_failure_preserves_source "adopt link move rollback" \
   "$link_move_failure_source" 'original source restored'
 
 reset_adopt_fixture
+staged_cleanup_failure_source=$(new_adopt_source staged-cleanup-failure)
+: > "$apfs_state/fail_backup_move"
+: > "$apfs_state/fail_staged_link_cleanup"
+if staged_cleanup_failure_output=$(run_vaultlock adopt --yes \
+    "$staged_cleanup_failure_source" 2>&1); then
+  record_failure "adopt staged-link cleanup failure exits nonzero"
+else
+  check_contains "adopt staged-link cleanup reports retained path" \
+    "$staged_cleanup_failure_source.vaultlock-link" \
+    "$staged_cleanup_failure_output"
+fi
+[[ -L "$staged_cleanup_failure_source.vaultlock-link" ]] \
+  || record_failure "adopt staged-link cleanup retains failed link"
+
+reset_adopt_fixture
 cleanup_failure_source=$(new_adopt_source cleanup-failure)
 : > "$apfs_state/fail_cleanup"
 if cleanup_failure_output=$(run_vaultlock adopt --yes \
     "$cleanup_failure_source" 2>&1); then
   record_failure "adopt cleanup failure exits nonzero"
 else
-  check_contains "adopt cleanup failure reports retained backup" \
-    'backup retained at' "$cleanup_failure_output"
+  check_contains "adopt cleanup failure reports retained quarantine" \
+    'quarantine retained at' "$cleanup_failure_output"
 fi
 [[ -L "$cleanup_failure_source" ]] \
   || record_failure "adopt cleanup failure preserves installed symlink"
 cleanup_backup_count=$(find "$test_root" -maxdepth 1 -type d \
-  -name 'cleanup-failure.vaultlock-backup*' | wc -l | tr -d ' ')
-check "adopt cleanup failure retains one backup" 1 "$cleanup_backup_count"
+  -name 'cleanup-failure.vaultlock-quarantine.*' | wc -l | tr -d ' ')
+check "adopt cleanup failure retains one quarantine" 1 "$cleanup_backup_count"
+
+reset_adopt_fixture
+foreign_device_source=$(new_adopt_source foreign-device)
+: > "$apfs_state/foreign_device_after_backup_quarantine"
+if foreign_device_output=$(run_vaultlock adopt --yes \
+    "$foreign_device_source" 2>&1); then
+  record_failure "adopt refuses foreign-device backup deletion"
+else
+  check_contains "adopt foreign-device cleanup reports quarantine" \
+    'quarantine retained at' "$foreign_device_output"
+fi
+foreign_device_quarantine_count=$(find "$test_root" -maxdepth 1 -type d \
+  -name 'foreign-device.vaultlock-quarantine.*' | wc -l | tr -d ' ')
+check "adopt foreign-device cleanup retains quarantine" 1 \
+  "$foreign_device_quarantine_count"
+
+reset_adopt_fixture
+backup_boundary_source=$(new_adopt_source backup-boundary-race)
+: > "$apfs_state/swap_backup_at_quarantine_boundary"
+if backup_boundary_output=$(run_vaultlock adopt --yes \
+    "$backup_boundary_source" 2>&1); then
+  record_failure "adopt rejects backup replacement at deletion boundary"
+else
+  check_contains "adopt backup boundary race reports quarantine" \
+    'quarantine retained at' "$backup_boundary_output"
+fi
+backup_boundary_quarantine=$(find "$test_root" -maxdepth 1 -type d \
+  -name 'backup-boundary-race.vaultlock-quarantine.*' -print -quit)
+[[ -n "$backup_boundary_quarantine" \
+    && -d "$backup_boundary_quarantine/owned-backup" \
+    && -d "$backup_boundary_quarantine/backup" ]] \
+  || record_failure "adopt backup boundary race retains both directories"
 
 reset_adopt_fixture
 backup_move_failure_source=$(new_adopt_source backup-move-failure)
@@ -2424,6 +2634,8 @@ else
   check_contains "init installed-digest rewrite reports content change" \
     'installed state content changed during installation' \
     "$state_install_content_race_output"
+  check_contains "init installed-digest rewrite reports retained state path" \
+    "$state_dir/state.json" "$state_install_content_race_output"
 fi
 check "init installed-digest rewrite preserves inode during race" \
   "$(< "$apfs_state/state_install_inode_before_rewrite")" \
