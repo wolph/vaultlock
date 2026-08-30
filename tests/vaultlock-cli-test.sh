@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Isolated CLI tests for vaultlock. All system-facing commands are fixtures.
 set -euo pipefail
 
@@ -135,6 +135,9 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           "$(fixture_read device)" "$(fixture_read mount_point)"
       fi
       ;;
+    bash-version-fixture)
+      printf '%s\n' "$BASH_VERSION"
+      ;;
     mount|security|tle|tmutil|curl)
       ;;
     *)
@@ -154,7 +157,7 @@ action_log="$test_root/actions"
 apfs_state="$test_root/apfs"
 test_home="$test_root/home"
 state_dir="$test_home/.vaultlock"
-mount_point="$test_root/Volumes/vault"
+mount_point="$test_root/Volumes/vault.test"
 confirm_device="$test_root/confirm"
 mkdir -p "$fake_bin" "$apfs_state" "$state_dir" "$mount_point"
 : > "$action_log"
@@ -162,8 +165,22 @@ mkdir -p "$fake_bin" "$apfs_state" "$state_dir" "$mount_point"
 
 TEST_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 for fake_command in diskutil security sudo tle tmutil curl mount \
-  mount-fixture; do
+  mount-fixture bash-version-fixture; do
   ln -s "$TEST_SELF" "$fake_bin/$fake_command"
+done
+
+for read_only_utility in jq plutil grep; do
+  utility_path=$(command -v "$read_only_utility") \
+    || { printf 'missing test utility: %s\n' "$read_only_utility" >&2; exit 1; }
+  case "$utility_path" in
+    /*) ;;
+    *)
+      printf 'test utility path is not absolute: %s -> %s\n' \
+        "$read_only_utility" "$utility_path" >&2
+      exit 1
+      ;;
+  esac
+  ln -s "$utility_path" "$fake_bin/$read_only_utility"
 done
 
 # shellcheck disable=SC2329  # Used by later CLI scenarios.
@@ -203,7 +220,7 @@ check_empty() { # description file
 
 run_vaultlock() {
   HOME="$test_home" \
-  PATH="$fake_bin:$PATH" \
+  PATH="$fake_bin" \
   VAULTLOCK_STATE_DIR="$state_dir" \
   VAULTLOCK_MOUNT_POINT="$mount_point" \
   VAULTLOCK_MOUNT_COMMAND="$fake_bin/mount-fixture" \
@@ -212,7 +229,7 @@ run_vaultlock() {
   VAULTLOCK_TEST_FAKE_BIN="$fake_bin" \
   VAULTLOCK_TEST_ACTION_LOG="$action_log" \
   VAULTLOCK_TEST_APFS_STATE="$apfs_state" \
-    "$VL" "$@"
+    /bin/bash "$VL" "$@"
 }
 
 write_json_state() { # locked deadline deadline_epoch round uuid
@@ -244,8 +261,40 @@ write_apfs_state() { # locked mounted uuid device
 write_json_state false null null null UUID-123
 write_apfs_state false true UUID-123 disk9s1
 
+check_contains "harness uses Bash 3.2" "3.2." "$BASH_VERSION"
+
+fake_dispatch_version=$(
+  VAULTLOCK_MOUNT_POINT="$mount_point" \
+  VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  VAULTLOCK_TEST_FAKE_BIN="$fake_bin" \
+  VAULTLOCK_TEST_ACTION_LOG="$action_log" \
+  VAULTLOCK_TEST_APFS_STATE="$apfs_state" \
+    "$fake_bin/bash-version-fixture"
+)
+check_contains "fake dispatcher uses Bash 3.2" "3.2." \
+  "$fake_dispatch_version"
+
 output=$(run_vaultlock status)
 check_contains "status uses injected mount listing" \
   "UNLOCKED (mounted at $mount_point)" "$output"
+
+host_bin="$test_root/host-bin"
+mkdir -p "$host_bin"
+ln -s "$TEST_SELF" "$host_bin/diskutil"
+mv "$fake_bin/diskutil" "$fake_bin/diskutil.fixture"
+: > "$action_log"
+PATH="$host_bin:$PATH" run_vaultlock status >/dev/null 2>&1 || true
+fallback_diskutil_calls=$(grep -c '^diskutil\([[:space:]]\|$\)' \
+  "$action_log" || true)
+check "omitted fake command cannot fall through to host PATH" \
+  0 "$fallback_diskutil_calls"
+mv "$fake_bin/diskutil.fixture" "$fake_bin/diskutil"
+
+write_apfs_state false true UUID-123 disk9s1
+printf '%s\n' "$test_root/Volumes/vaultXtest" \
+  > "$apfs_state/mount_point"
+output=$(run_vaultlock status)
+check_contains "mount point matching is literal" \
+  "UNLOCKED (not mounted)" "$output"
 
 exit "$fail"
