@@ -397,6 +397,10 @@ inspect_runtime_state() {
     return 0
   fi
   SNAPSHOT_APFS_INSPECTED=true
+  if ! printf '%s' "$apfs_plist" | plutil -lint - >/dev/null 2>&1; then
+    SNAPSHOT_ERROR="APFS property list is malformed"
+    return 0
+  fi
 
   if locked_value=$(printf '%s' "$apfs_plist" \
       | plutil -extract Locked raw -expect bool -o - - 2>/dev/null); then

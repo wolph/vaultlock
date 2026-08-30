@@ -83,12 +83,17 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           printf '<integer>7</integer>\n'
         fi
       fi
-      printf '%s\n' \
-        '<key>VolumeUUID</key>' \
-        "<string>$uuid</string>" \
-        '<key>DeviceIdentifier</key>' \
-        "<string>$device</string>" \
-        '</dict></plist>'
+      if [[ "$uuid" != "missing" ]]; then
+        printf '%s\n' \
+          '<key>VolumeUUID</key>' \
+          "<string>$uuid</string>"
+      fi
+      if [[ "$device" != "missing" ]]; then
+        printf '%s\n' \
+          '<key>DeviceIdentifier</key>' \
+          "<string>$device</string>"
+      fi
+      printf '%s\n' '</dict></plist>'
       exit 0
     fi
 
@@ -557,6 +562,31 @@ assert_status_snapshot "diskutil inspection failure" \
   unlocked \
   'unknown (diskutil info failed)' \
   "expected $mount_point, actual unknown" \
+  'plaintext present, ciphertext absent, hash absent' \
+  inconsistent
+
+write_apfs_state false true UUID-123 disk9s1
+printf '%s\n' malformed > "$apfs_state/plist_mode"
+assert_status_snapshot "malformed APFS property list" \
+  unlocked \
+  'unknown (APFS property list is malformed)' \
+  "expected $mount_point, actual unknown" \
+  'plaintext present, ciphertext absent, hash absent' \
+  inconsistent
+
+write_apfs_state false true missing disk9s1
+assert_status_snapshot "missing APFS VolumeUUID" \
+  unlocked \
+  'unknown (APFS volume UUID is missing)' \
+  "expected $mount_point, actual $mount_point" \
+  'plaintext present, ciphertext absent, hash absent' \
+  inconsistent
+
+write_apfs_state false true UUID-123 missing
+assert_status_snapshot "missing APFS DeviceIdentifier" \
+  unlocked \
+  'unknown (APFS device identifier is missing or malformed)' \
+  "expected $mount_point, actual $mount_point" \
   'plaintext present, ciphertext absent, hash absent' \
   inconsistent
 
