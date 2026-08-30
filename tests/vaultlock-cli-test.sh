@@ -106,7 +106,8 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       printf '%s\n' \
         '<?xml version="1.0" encoding="UTF-8"?>' \
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-        '<plist version="1.0"><dict>'
+        '<plist version="1.0"><dict>' \
+        '<key>VolumeName</key><string>vault</string>'
       if [[ "$have_locked" == "true" ]]; then
         printf '<key>Locked</key>\n'
         case "$locked" in
@@ -171,18 +172,41 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           case "${2:-}" in
             list)
               [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_apfs_list" ]] || exit 1
+              fixture_apfs_list_mode=$(fixture_read apfs_list_mode) \
+                || fixture_apfs_list_mode=normal
               printf '%s\n' \
                 '<?xml version="1.0" encoding="UTF-8"?>' \
-                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-                '<plist version="1.0"><dict><key>Containers</key><array><dict>' \
-                '<key>Volumes</key><array>'
-              if [[ -f "$VAULTLOCK_TEST_APFS_STATE/locked" ]]; then
-                printf '%s\n' \
-                  '<dict><key>Name</key><string>vault</string>' \
-                  "<key>VolumeUUID</key><string>$(fixture_read uuid)</string>" \
-                  "<key>DeviceIdentifier</key><string>$(fixture_read device)</string></dict>"
-              fi
-              printf '%s\n' '</array></dict></array></dict></plist>'
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+              case "$fixture_apfs_list_mode" in
+                empty)
+                  printf '%s\n' '<plist version="1.0"><dict/></plist>'
+                  ;;
+                incomplete)
+                  printf '%s\n' \
+                    '<plist version="1.0"><dict><key>Containers</key>' \
+                    '<array><dict/></array></dict></plist>'
+                  ;;
+                missing_identity)
+                  printf '%s\n' \
+                    '<plist version="1.0"><dict><key>Containers</key><array><dict>' \
+                    '<key>Volumes</key><array>' \
+                    '<dict><key>Name</key><string>vault</string></dict>' \
+                    '</array></dict></array></dict></plist>'
+                  ;;
+                normal)
+                  printf '%s\n' \
+                    '<plist version="1.0"><dict><key>Containers</key><array><dict>' \
+                    '<key>Volumes</key><array>'
+                  if [[ -f "$VAULTLOCK_TEST_APFS_STATE/locked" ]]; then
+                    printf '%s\n' \
+                      '<dict><key>Name</key><string>vault</string>' \
+                      "<key>VolumeUUID</key><string>$(fixture_read uuid)</string>" \
+                      "<key>DeviceIdentifier</key><string>$(fixture_read device)</string></dict>"
+                  fi
+                  printf '%s\n' '</array></dict></array></dict></plist>'
+                  ;;
+                *) exit 64 ;;
+              esac
               if [[ -f "$VAULTLOCK_TEST_APFS_STATE/confirmation_race_kind" ]]; then
                 fixture_race_kind=$(< "$VAULTLOCK_TEST_APFS_STATE/confirmation_race_kind")
                 case "$fixture_race_kind" in
@@ -221,6 +245,37 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
               fixture_write plist_mode normal
               if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_final_uuid" ]]; then
                 fixture_write uuid missing
+              fi
+            if [[ " $* " == *" -plist "* ]]; then
+              : > "$VAULTLOCK_TEST_APFS_STATE/unsupported_add_volume_plist"
+              printf '%s\n' \
+                '<?xml version="1.0" encoding="UTF-8"?>' \
+                '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+                '<plist version="1.0"><dict>' \
+                '<key>VolumeUUID</key><string>UUID-INIT</string>' \
+                '<key>DeviceIdentifier</key><string>disk8s1</string>' \
+                '</dict></plist>'
+            else
+              fixture_add_output_mode=$(fixture_read add_output_mode) \
+                || fixture_add_output_mode=normal
+              case "$fixture_add_output_mode" in
+                normal)
+                  printf '%s\n' 'Disk from APFS operation: disk8s1'
+                  ;;
+                ambiguous)
+                  printf '%s\n' \
+                    'Disk from APFS operation: disk8s1' \
+                    'Disk from APFS operation: disk9s1'
+                  ;;
+                malformed)
+                  printf '%s\n' 'Disk from APFS operation: /dev/disk8s1'
+                  ;;
+                *) exit 64 ;;
+              esac
+            fi
+              if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_identity_after_add" ]]; then
+                fixture_write uuid UUID-AFTER-ADD-SWAP
+                fixture_write device disk8s2
               fi
               ;;
             changePassphrase)
@@ -266,6 +321,10 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       [[ "${1:-}" == "-i" && $# -eq 1 ]] || exit 64
       IFS= read -r fixture_security_command || exit 1
       [[ "$fixture_security_command" == add-generic-password\ * ]] || exit 64
+      if /usr/bin/find "$VAULTLOCK_STATE_DIR" -maxdepth 1 \
+          -name '.security-output.*' -print -quit | grep -q .; then
+        : > "$VAULTLOCK_TEST_APFS_STATE/security_output_artifact_seen"
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/echo_security_error" ]]; then
         printf '%s\n' "$fixture_security_command"
         printf '%s\n' "$fixture_security_command" >&2
@@ -305,7 +364,31 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     stat)
       fixture_stat_path=""
       for fixture_argument in "$@"; do fixture_stat_path=$fixture_argument; done
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_backup_identity" \
+      if [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/passphrase.txt" \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/recovery_boundary_race" ]]; then
+        /usr/bin/stat "$@" || exit 1
+        fixture_recovery_race=$(< "$VAULTLOCK_TEST_APFS_STATE/recovery_boundary_race")
+        case "$fixture_recovery_race" in
+          modify)
+            printf 'modified recovery\n' > "$fixture_stat_path"
+            ;;
+          replace)
+            /bin/rm -f "$fixture_stat_path"
+            printf 'replacement recovery\n' > "$fixture_stat_path"
+            ;;
+          volume)
+            fixture_write locked false
+            fixture_write mounted false
+            fixture_write uuid UUID-AFTER-PREPARE
+            fixture_write device disk7s4
+            fixture_write mount_point ""
+            fixture_write mount_point_type string
+            fixture_write plist_mode normal
+            ;;
+          *) exit 64 ;;
+        esac
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/recovery_boundary_race"
+      elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_backup_identity" \
           && "$fixture_stat_path" == *.vaultlock-backup* ]]; then
         fixture_backup_stat_count=0
         if [[ -f "$VAULTLOCK_TEST_APFS_STATE/backup_stat_count" ]]; then
@@ -383,7 +466,19 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           && " $* " == *" -rf "* ]]; then
         exit 1
       fi
-      /bin/rm "$@"
+      /bin/rm "$@" || exit 1
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/modify_recovery_after_state" \
+          && " $* " == *"/.state."* ]]; then
+        printf 'post-state recovery modification\n' \
+          > "$VAULTLOCK_STATE_DIR/passphrase.txt"
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/modify_recovery_after_state"
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_identity_after_state" \
+          && " $* " == *"/.state."* ]]; then
+        fixture_write uuid UUID-AFTER-STATE-SWAP
+        fixture_write device disk8s3
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/swap_identity_after_state"
+      fi
       ;;
     mkdir) /bin/mkdir "$@" ;;
     chmod) /bin/chmod "$@" ;;
@@ -1367,6 +1462,13 @@ check "init yes writes unlocked UUID" UUID-INIT \
   "$(jq -r '.volume_uuid' "$state_dir/state.json")"
 check "init yes writes unlocked state" false \
   "$(jq -r '.locked' "$state_dir/state.json")"
+[[ ! -e "$apfs_state/unsupported_add_volume_plist" ]] \
+  || record_failure "init addVolume avoids unsupported -plist option"
+init_add_volume_actions=$(grep 'diskutil apfs addVolume' "$action_log")
+check_count "init addVolume command omits unsupported -plist option" 0 \
+  ' -plist' "$init_add_volume_actions"
+check_contains "init verifies created device through supported plist info" \
+  'diskutil info -plist disk8s1' "$(< "$action_log")"
 [[ -s "$state_dir/passphrase.txt" ]] \
   || record_failure "init yes preserves protected plaintext recovery"
 [[ -f "$apfs_state/keychain_marker" ]] \
@@ -1706,6 +1808,8 @@ mv "$confirm_device.saved" "$confirm_device"
 
 reset_init_fixture() {
   rm -f "$state_dir/state.json" "$state_dir"/state.json.tmp.* \
+    "$state_dir"/.passphrase.* "$state_dir"/.state.* \
+    "$state_dir"/.security-output.* \
     "$state_dir/passphrase.txt" "$state_dir/passphrase-new.txt" \
     "$state_dir/passphrase.tle" "$state_dir/passphrase.sha256" \
     "$apfs_state/locked" "$apfs_state/mounted" "$apfs_state/uuid" \
@@ -1720,6 +1824,14 @@ reset_init_fixture() {
     "$apfs_state/passphrase_redirect_target" \
     "$apfs_state/state_redirect_target"
   rm -f "$apfs_state/confirmation_race_kind"
+  rm -f "$apfs_state/apfs_list_mode" \
+    "$apfs_state/add_output_mode" \
+    "$apfs_state/recovery_boundary_race" \
+    "$apfs_state/modify_recovery_after_state" \
+    "$apfs_state/swap_identity_after_state" \
+    "$apfs_state/security_output_artifact_seen" \
+    "$apfs_state/swap_identity_after_add" \
+    "$apfs_state/unsupported_add_volume_plist"
   : > "$action_log"
   : > "$mutation_log"
   : > "$hook_log"
@@ -1743,6 +1855,36 @@ else
     'cannot inspect APFS volumes' "$inspection_failure_output"
 fi
 check_empty "init APFS inspection failure performs no mutation" "$mutation_log"
+
+reset_init_fixture
+printf 'empty\n' > "$apfs_state/apfs_list_mode"
+if empty_apfs_output=$(run_vaultlock init --dry-run 2>&1); then
+  record_failure "init rejects syntactically valid empty APFS plist"
+else
+  check_contains "init empty APFS plist reports invalid schema" \
+    'invalid APFS list schema' "$empty_apfs_output"
+fi
+check_empty "init empty APFS plist performs no mutation" "$mutation_log"
+
+reset_init_fixture
+printf 'incomplete\n' > "$apfs_state/apfs_list_mode"
+if incomplete_apfs_output=$(run_vaultlock init --dry-run 2>&1); then
+  record_failure "init rejects structurally incomplete APFS plist"
+else
+  check_contains "init incomplete APFS plist reports invalid schema" \
+    'invalid APFS list schema' "$incomplete_apfs_output"
+fi
+check_empty "init incomplete APFS plist performs no mutation" "$mutation_log"
+
+reset_init_fixture
+printf 'missing_identity\n' > "$apfs_state/apfs_list_mode"
+if missing_identity_output=$(run_vaultlock init --dry-run 2>&1); then
+  record_failure "init rejects vault record missing identity"
+else
+  check_contains "init missing volume identity reports invalid record" \
+    'vault volume record missing UUID or device' "$missing_identity_output"
+fi
+check_empty "init missing volume identity performs no mutation" "$mutation_log"
 
 reset_init_fixture
 write_apfs_state false false UUID-UNMOUNTED disk7s3
@@ -1779,6 +1921,43 @@ check "init revalidates volume introduced at confirmation" 1 \
 check_contains "init confirmation volume race reports conflict" \
   'volume vault already exists' "$INIT_RACE_OUTPUT"
 check_empty "init confirmation volume race performs no mutation" "$mutation_log"
+
+reset_init_fixture
+printf 'modify\n' > "$apfs_state/recovery_boundary_race"
+if recovery_modify_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init rejects recovery content change between operations"
+else
+  check_contains "init recovery content race reports boundary change" \
+    'installed recovery material changed before volume creation' \
+    "$recovery_modify_output"
+fi
+[[ ! -e "$apfs_state/keychain_marker" && ! -e "$apfs_state/locked" ]] \
+  || record_failure "init recovery content race stops before keychain and APFS"
+
+reset_init_fixture
+printf 'replace\n' > "$apfs_state/recovery_boundary_race"
+if recovery_replace_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init rejects recovery identity change between operations"
+else
+  check_contains "init recovery identity race reports boundary change" \
+    'installed recovery material changed before volume creation' \
+    "$recovery_replace_output"
+fi
+[[ ! -e "$apfs_state/keychain_marker" && ! -e "$apfs_state/locked" ]] \
+  || record_failure "init recovery identity race stops before keychain and APFS"
+
+reset_init_fixture
+printf 'volume\n' > "$apfs_state/recovery_boundary_race"
+if post_prepare_conflict_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init rejects conflict introduced after recovery prep"
+else
+  check_contains "init post-prepare conflict reports existing volume" \
+    'volume vault already exists' "$post_prepare_conflict_output"
+fi
+[[ ! -e "$apfs_state/keychain_marker" ]] \
+  || record_failure "init post-prepare conflict stops before keychain"
+check_count "init post-prepare conflict does not add volume" 0 \
+  'diskutil apfs addVolume' "$(< "$mutation_log")"
 
 reset_init_fixture
 printf 'passphrase sentinel\n' > "$apfs_state/passphrase_redirect_target"
@@ -1821,6 +2000,75 @@ check_count "init security echo failure hides secret in output" 0 \
   "$security_echo_secret" "$security_echo_output"
 check_count "init security echo failure hides secret in logs" 0 \
   "$security_echo_secret" "$(< "$action_log")$(< "$mutation_log")$(< "$hook_log")"
+[[ ! -e "$apfs_state/security_output_artifact_seen" ]] \
+  || record_failure "init security echo creates crash-persistent output artifact"
+security_hidden_count=$(find "$state_dir" -maxdepth 1 \
+  -name '.security-output.*' | wc -l | tr -d ' ')
+check "init security echo leaves no hidden output artifact" 0 \
+  "$security_hidden_count"
+check_count "init security echo secret absent from state manifest" 0 \
+  "$security_echo_secret" "$(tree_manifest "$state_dir")"
+
+reset_init_fixture
+: > "$apfs_state/modify_recovery_after_state"
+if final_recovery_race_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init final verification rejects modified recovery"
+else
+  check_contains "init final recovery race reports verification failure" \
+    'installed recovery material changed before final verification' \
+    "$final_recovery_race_output"
+fi
+check_count "init final recovery race does not report success" 0 \
+  'Result: created encrypted volume' "$final_recovery_race_output"
+
+reset_init_fixture
+: > "$apfs_state/swap_identity_after_add"
+if identity_swap_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init rejects identity swap after addVolume"
+else
+  check_contains "init identity swap reports created identity mismatch" \
+    'created APFS identity changed before state creation' \
+    "$identity_swap_output"
+fi
+[[ -s "$state_dir/passphrase.txt" && ! -e "$state_dir/state.json" \
+    && -e "$apfs_state/locked" ]] \
+  || record_failure "init identity swap preserves recovery and orphan volume"
+check "init identity swap preserves orphan UUID" UUID-AFTER-ADD-SWAP \
+  "$(< "$apfs_state/uuid")"
+check "init identity swap preserves orphan device" disk8s2 \
+  "$(< "$apfs_state/device")"
+check_count "init identity swap does not report success" 0 \
+  'Result: created encrypted volume' "$identity_swap_output"
+
+for add_output_mode in ambiguous malformed; do
+  reset_init_fixture
+  printf '%s\n' "$add_output_mode" > "$apfs_state/add_output_mode"
+  if add_output_failure=$(run_vaultlock init --yes 2>&1); then
+    record_failure "init rejects ${add_output_mode} addVolume device output"
+  else
+    check_contains "init ${add_output_mode} addVolume output reports identity failure" \
+      'APFS volume creation returned no unique device' \
+      "$add_output_failure"
+  fi
+  [[ -s "$state_dir/passphrase.txt" && ! -e "$state_dir/state.json" \
+      && -e "$apfs_state/locked" ]] \
+    || record_failure "init ${add_output_mode} output preserves recovery and orphan volume"
+done
+
+reset_init_fixture
+: > "$apfs_state/swap_identity_after_state"
+if late_identity_swap_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init rejects identity swap after state installation"
+else
+  check_contains "init late identity swap reports final verification failure" \
+    'created vault failed usable-target verification' \
+    "$late_identity_swap_output"
+fi
+[[ -s "$state_dir/passphrase.txt" && ! -e "$state_dir/state.json" \
+    && -e "$apfs_state/locked" ]] \
+  || record_failure "init late identity swap removes owned state and preserves orphan"
+check_count "init late identity swap does not report success" 0 \
+  'Result: created encrypted volume' "$late_identity_swap_output"
 
 reset_init_fixture
 printf '{}\n' > "$state_dir/state.json"
@@ -1851,6 +2099,24 @@ else
     'recovery artifacts already exist' "$existing_artifact_output"
 fi
 check_empty "init recovery artifact performs no mutation" "$mutation_log"
+
+for hidden_family in passphrase state security-output; do
+  reset_init_fixture
+  hidden_artifact="$state_dir/.${hidden_family}.leftover"
+  hidden_sentinel="hidden ${hidden_family} sentinel"
+  printf '%s\n' "$hidden_sentinel" > "$hidden_artifact"
+  if hidden_artifact_output=$(run_vaultlock init --dry-run 2>&1); then
+    record_failure "init rejects hidden ${hidden_family} leftover"
+  else
+    check_contains "init hidden ${hidden_family} leftover reports artifact" \
+      "unexpected init artifact exists: $hidden_artifact" \
+      "$hidden_artifact_output"
+  fi
+  check "init hidden ${hidden_family} leftover remains unchanged" \
+    "$hidden_sentinel" "$(< "$hidden_artifact")"
+  check_empty "init hidden ${hidden_family} leftover performs no mutation" \
+    "$mutation_log"
+done
 
 reset_init_fixture
 : > "$apfs_state/fail_keychain"

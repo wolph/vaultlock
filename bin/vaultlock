@@ -48,7 +48,11 @@ PLAN_REQUEST_TEXT=""
 
 INIT_PASSPHRASE=""
 INIT_RECOVERY_PATH=""
+INIT_RECOVERY_IDENTITY=""
 INIT_STATE_DIR_IDENTITY=""
+INIT_STATE_IDENTITY=""
+INIT_CREATED_UUID=""
+INIT_CREATED_DEVICE=""
 SNAPSHOT_INIT_ABSENT=false
 ADOPT_SOURCE=""
 ADOPT_DESTINATION=""
@@ -964,7 +968,7 @@ require_mounted() {
 }
 
 inspect_init_volume_absence() {
-  local apfs_plist apfs_json conflict_count
+  local apfs_plist apfs_json invalid_record_count conflict_count
   apfs_plist=$(diskutil apfs list -plist "$CONTAINER" 2>/dev/null) \
     || die "cannot inspect APFS volumes for init"
   printf '%s' "$apfs_plist" | plutil -lint - >/dev/null 2>&1 \
@@ -972,11 +976,33 @@ inspect_init_volume_absence() {
   apfs_json=$(printf '%s' "$apfs_plist" \
     | plutil -convert json -o - - 2>/dev/null) \
     || die "cannot inspect APFS volumes for init: conversion failed"
+  printf '%s' "$apfs_json" | jq -e \
+    'type == "object"
+      and (.Containers | type == "array")
+      and (.Containers | length > 0)
+      and all(.Containers[];
+        type == "object" and (.Volumes | type == "array"))' \
+    >/dev/null 2>&1 \
+    || die "cannot inspect APFS volumes for init: invalid APFS list schema"
+  invalid_record_count=$(printf '%s' "$apfs_json" | jq -er \
+      --arg volume "$VOLUME" \
+      '[.Containers[].Volumes[] | select(
+        (.Name? == $volume or .VolumeName? == $volume)
+        and ((.VolumeUUID? | type) != "string"
+          or (.VolumeUUID | length) == 0
+          or (.DeviceIdentifier? | type) != "string"
+          or (.DeviceIdentifier | length) == 0)
+      )] | length' 2>/dev/null) \
+    || die "cannot inspect APFS volumes for init: invalid converted data"
+  [[ "$invalid_record_count" =~ ^[0-9]+$ ]] \
+    || die "cannot inspect APFS volumes for init: invalid record count"
+  if (( invalid_record_count > 0 )); then
+    die "cannot inspect APFS volumes for init: vault volume record missing UUID or device"
+  fi
   conflict_count=$(printf '%s' "$apfs_json" | jq -er \
       --arg volume "$VOLUME" --arg mount "$MOUNT_POINT" \
-      '[.. | objects | select(
-        ((.Name? == $volume or .VolumeName? == $volume)
-          and (.VolumeUUID? != null or .DeviceIdentifier? != null))
+      '[.Containers[].Volumes[] | select(
+        (.Name? == $volume or .VolumeName? == $volume)
         or .MountPoint? == $mount
       )] | length' 2>/dev/null) \
     || die "cannot inspect APFS volumes for init: invalid converted data"
@@ -988,6 +1014,7 @@ inspect_init_volume_absence() {
 }
 
 inspect_init_absent_state() {
+  local artifact
   SNAPSHOT_RECORDED_LOCKED=unknown
   SNAPSHOT_APFS_LOCKED=unknown
   SNAPSHOT_APFS_MOUNTED=unknown
@@ -1024,8 +1051,13 @@ inspect_init_absent_state() {
       && ! -e "$STATE_DIR/passphrase.tle" \
       && ! -L "$STATE_DIR/passphrase.tle" \
       && ! -e "$STATE_DIR/passphrase.sha256" \
-      && ! -L "$STATE_DIR/passphrase.sha256" ]] \
+    && ! -L "$STATE_DIR/passphrase.sha256" ]] \
     || die "recovery artifacts already exist in $STATE_DIR"
+  for artifact in "$STATE_DIR"/.passphrase.* "$STATE_DIR"/.state.* \
+      "$STATE_DIR"/.security-output.*; do
+    [[ ! -e "$artifact" && ! -L "$artifact" ]] \
+      || die "unexpected init artifact exists: $artifact"
+  done
   inspect_init_volume_absence
   SNAPSHOT_APFS_INSPECTED=true
   SNAPSHOT_INIT_ABSENT=true
@@ -1045,27 +1077,16 @@ safe_public_token() { [[ -n "$1" && "$1" =~ ^[A-Za-z0-9._@+-]+$ ]]; }
 safe_base64_token() { [[ -n "$1" && "$1" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; }
 
 keychain_store_passphrase() { # passphrase
-  local passphrase=$1 security_output security_status=0
+  local passphrase=$1
   safe_public_token "${USER:-}" || die "USER is missing or unsafe for keychain storage"
   safe_public_token "$KEYCHAIN_SERVICE" \
     || die "keychain service is unsafe for keychain storage"
   safe_base64_token "$passphrase" \
     || die "generated recovery material is not valid base64"
   require_init_state_dir_identity
-  security_output=$(mktemp "$STATE_DIR/.security-output.XXXXXX") \
-    || die "cannot create protected keychain output channel"
-  chmod 600 "$security_output" \
-    || die "cannot protect keychain output channel"
-  if printf 'add-generic-password -a %s -s %s -w %s -U\n' \
-      "$USER" "$KEYCHAIN_SERVICE" "$passphrase" \
-      | security -i > "$security_output" 2>&1; then
-    security_status=0
-  else
-    security_status=$?
-  fi
-  rm -f -- "$security_output" \
-    || die "cannot remove protected keychain output channel"
-  return "$security_status"
+  printf 'add-generic-password -a %s -s %s -w %s -U\n' \
+    "$USER" "$KEYCHAIN_SERVICE" "$passphrase" \
+    | security -i >/dev/null 2>&1
 }
 
 require_init_state_dir_identity() {
@@ -1075,6 +1096,24 @@ require_init_state_dir_identity() {
   [[ "$actual_identity" == "$INIT_STATE_DIR_IDENTITY" \
       && -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
     || die "state directory identity changed during init"
+}
+
+verify_installed_init_recovery() { # phase
+  local phase=$1 actual_identity final_identity actual_content
+  require_init_state_dir_identity
+  [[ -f "$INIT_RECOVERY_PATH" && ! -L "$INIT_RECOVERY_PATH" ]] \
+    || die "installed recovery material changed before $phase"
+  actual_identity=$(path_identity "$INIT_RECOVERY_PATH") \
+    || die "installed recovery material changed before $phase"
+  actual_content=$(cat -- "$INIT_RECOVERY_PATH" && printf '\034') \
+    || die "installed recovery material changed before $phase"
+  final_identity=$(path_identity "$INIT_RECOVERY_PATH") \
+    || die "installed recovery material changed before $phase"
+  [[ -n "$INIT_RECOVERY_IDENTITY" \
+      && "$actual_identity" == "$INIT_RECOVERY_IDENTITY" \
+      && "$final_identity" == "$INIT_RECOVERY_IDENTITY" \
+      && "$actual_content" == "$INIT_PASSPHRASE"$'\034' ]] \
+    || die "installed recovery material changed before $phase"
 }
 
 execute_init_prepare_state() {
@@ -1113,18 +1152,67 @@ execute_init_prepare_state() {
     || die "installed recovery identity is unavailable"
   [[ "$installed_identity" == "$recovery_identity" ]] \
     || die "installed recovery identity mismatch"
+  INIT_RECOVERY_IDENTITY=$installed_identity
   rm -f -- "$INIT_RECOVERY_PATH" \
     || die "cannot remove recovery staging name"
   INIT_RECOVERY_PATH="$STATE_DIR/passphrase.txt"
 }
 
+created_device_from_add_output() { # output
+  local output=$1 line candidate device=""
+  local completion_prefix="Disk from APFS operation: "
+  while IFS= read -r line; do
+    if [[ "$line" == "$completion_prefix"* ]]; then
+      candidate=${line#"$completion_prefix"}
+      [[ "$candidate" =~ ^disk[[:alnum:]]+$ && -z "$device" ]] \
+        || return 1
+      device=$candidate
+    fi
+  done <<< "$output"
+  [[ -n "$device" ]] || return 1
+  printf '%s\n' "$device"
+}
+
+read_created_apfs_identity() { # device
+  local target=$1 plist name uuid device
+  plist=$(diskutil info -plist "$target" 2>/dev/null) || return 1
+  printf '%s' "$plist" | plutil -lint - >/dev/null 2>&1 || return 1
+  name=$(printf '%s' "$plist" \
+    | plutil -extract VolumeName raw -expect string -o - - 2>/dev/null) \
+    || return 1
+  uuid=$(printf '%s' "$plist" \
+    | plutil -extract VolumeUUID raw -expect string -o - - 2>/dev/null) \
+    || return 1
+  device=$(printf '%s' "$plist" \
+    | plutil -extract DeviceIdentifier raw -expect string -o - - 2>/dev/null) \
+    || return 1
+  [[ -n "$name" && -n "$uuid" && "$device" =~ ^disk[[:alnum:]]+$ ]] \
+    || return 1
+  printf '%s\t%s\t%s\n' "$name" "$uuid" "$device"
+}
+
 execute_init_create_volume() {
+  local add_output created_identity created_name verified_device
   [[ -n "$INIT_PASSPHRASE" ]] || die "init recovery material is unavailable"
+  verify_installed_init_recovery "volume creation"
+  inspect_init_volume_absence
+  verify_installed_init_recovery "keychain storage"
   keychain_store_passphrase "$INIT_PASSPHRASE" \
     || die "keychain storage failed, protected recovery material remains at $STATE_DIR/passphrase.txt"
-  printf '%s' "$INIT_PASSPHRASE" \
-    | sudo diskutil apfs addVolume "$CONTAINER" APFS "$VOLUME" -stdinpassphrase \
+  verify_installed_init_recovery "APFS volume creation"
+  add_output=$(printf '%s' "$INIT_PASSPHRASE" \
+    | sudo diskutil apfs addVolume "$CONTAINER" APFS "$VOLUME" \
+      -stdinpassphrase 2>/dev/null) \
     || die "APFS volume creation failed, protected recovery material remains at $STATE_DIR/passphrase.txt"
+  INIT_CREATED_DEVICE=$(created_device_from_add_output "$add_output") \
+    || die "APFS volume creation returned no unique device, protected recovery material remains at $STATE_DIR/passphrase.txt"
+  created_identity=$(read_created_apfs_identity "$INIT_CREATED_DEVICE") \
+    || die "cannot discover final APFS identity, protected recovery material remains at $STATE_DIR/passphrase.txt"
+  IFS=$'\t' read -r created_name INIT_CREATED_UUID verified_device \
+    <<< "$created_identity"
+  [[ "$created_name" == "$VOLUME" \
+      && "$verified_device" == "$INIT_CREATED_DEVICE" ]] \
+    || die "created APFS identity changed before state creation, protected recovery material remains at $STATE_DIR/passphrase.txt"
 }
 
 read_apfs_identity() { # target
@@ -1154,6 +1242,9 @@ execute_init_write_state() {
   identity=$(read_apfs_identity "$MOUNT_POINT") \
     || die "cannot discover final APFS identity, protected recovery material remains at $STATE_DIR/passphrase.txt"
   IFS=$'\t' read -r uuid device <<< "$identity"
+  [[ "$uuid" == "$INIT_CREATED_UUID" \
+      && "$device" == "$INIT_CREATED_DEVICE" ]] \
+    || die "created APFS identity changed before state creation, protected recovery material remains at $STATE_DIR/passphrase.txt"
   PLAN_CONTEXT_UUID=$uuid
   PLAN_CONTEXT_DEVICE=$device
   require_init_state_dir_identity
@@ -1179,17 +1270,45 @@ execute_init_write_state() {
     || die "installed state identity is unavailable, recovery material remains at $INIT_RECOVERY_PATH"
   [[ "$installed_identity" == "$temporary_identity" ]] \
     || die "installed state identity mismatch, recovery material remains at $INIT_RECOVERY_PATH"
+  INIT_STATE_IDENTITY=$installed_identity
   rm -f -- "$temporary_state" \
     || die "cannot remove state staging name, recovery material remains at $INIT_RECOVERY_PATH"
 }
 
+remove_owned_init_state() {
+  local actual_identity final_identity
+  require_init_state_dir_identity
+  [[ -f "$state_file" && ! -L "$state_file" \
+      && -n "$INIT_STATE_IDENTITY" ]] \
+    || die "created vault failed verification and installed state is not safely removable"
+  actual_identity=$(path_identity "$state_file") \
+    || die "created vault failed verification and installed state identity is unavailable"
+  [[ "$actual_identity" == "$INIT_STATE_IDENTITY" ]] \
+    || die "created vault failed verification and installed state identity changed"
+  final_identity=$(path_identity "$state_file") \
+    || die "created vault failed verification and installed state identity is unavailable"
+  [[ "$final_identity" == "$INIT_STATE_IDENTITY" ]] \
+    || die "created vault failed verification and installed state identity changed"
+  rm -f -- "$state_file" \
+    || die "created vault failed verification and installed state cannot be removed"
+  [[ ! -e "$state_file" && ! -L "$state_file" ]] \
+    || die "created vault failed verification and installed state remains"
+}
+
 verify_init_target() {
+  verify_installed_init_recovery "final verification"
   inspect_runtime_state
   classify_runtime_state
-  [[ "$RUNTIME_ASSESSMENT" == "usable" \
-      && "$SNAPSHOT_EXPECTED_UUID" == "$PLAN_CONTEXT_UUID" \
-      && "$SNAPSHOT_DEVICE" == "$PLAN_CONTEXT_DEVICE" ]] \
-    || die "created vault failed usable-target verification"
+  if [[ "$RUNTIME_ASSESSMENT" == "usable" \
+      && "$SNAPSHOT_EXPECTED_UUID" == "$INIT_CREATED_UUID" \
+      && "$SNAPSHOT_ACTUAL_UUID" == "$INIT_CREATED_UUID" \
+      && "$SNAPSHOT_DEVICE" == "$INIT_CREATED_DEVICE" \
+      && "$PLAN_CONTEXT_UUID" == "$INIT_CREATED_UUID" \
+      && "$PLAN_CONTEXT_DEVICE" == "$INIT_CREATED_DEVICE" ]]; then
+    return 0
+  fi
+  remove_owned_init_state
+  die "created vault failed usable-target verification"
 }
 
 path_has_control_character() {
