@@ -32,6 +32,23 @@ OPTION_YES=false
 OPTION_HOOKS=true
 OPTION_OPERANDS=""
 
+PLAN_OPERATION_IDS=()
+PLAN_OPERATION_TEXT=()
+PLAN_HOOK_PATHS=()
+PLAN_HOOK_PHASES=()
+PLAN_HOOK_SCOPES=()
+PLAN_CONTEXT_UUID=""
+PLAN_CONTEXT_DEVICE=""
+PLAN_CONTEXT_DEADLINE=""
+PLAN_CONTEXT_DEADLINE_EPOCH=""
+PLAN_CONTEXT_ROUND=""
+PLAN_TARGET_TEXT=""
+PLAN_REQUEST_TEXT=""
+
+DISCOVERED_HOOK_PATHS=()
+DISCOVERED_HOOK_SCOPES=()
+HOOK_ARGV=()
+
 die() { printf 'vaultlock: %s\n' "$*" >&2; exit 1; }
 die_usage() { printf 'vaultlock: %s\n' "$*" >&2; exit 64; }
 note() { printf '%s\n' "$*"; }
@@ -560,6 +577,141 @@ render_runtime_summary() {
   fi
 }
 
+plan_reset() {
+  PLAN_OPERATION_IDS=()
+  PLAN_OPERATION_TEXT=()
+  PLAN_HOOK_PATHS=()
+  PLAN_HOOK_PHASES=()
+  PLAN_HOOK_SCOPES=()
+  PLAN_TARGET_TEXT=""
+  PLAN_REQUEST_TEXT=""
+}
+
+plan_add() { # operation_id public_description
+  local operation_id=$1 public_description=$2
+
+  case "$operation_id" in
+    repair_verify_plaintext|repair_unlock_apfs|repair_mount|verify_mount_identity|\
+hooks_disabled|hook|deferred_hook_discovery|tm_exclude|\
+tm_delete_vault_snapshots|unmount_vault|stage_recovery|rotate_apfs_recovery|\
+keychain_update|\
+tle_encrypt|tle_verify_future|persist_locked_recovery|remove_plaintext|\
+tm_delete_data_snapshots|apfs_lock|verify_locked_postconditions|tle_decrypt|\
+verify_decrypted_hash|apfs_unlock|persist_plaintext|persist_unlocked_state|\
+verify_secure_target)
+      ;;
+    *)
+      die "unknown plan operation ID: $operation_id"
+      ;;
+  esac
+
+  PLAN_OPERATION_IDS+=("$operation_id")
+  PLAN_OPERATION_TEXT+=("$public_description")
+  PLAN_HOOK_PATHS+=("")
+  PLAN_HOOK_PHASES+=("")
+  PLAN_HOOK_SCOPES+=("")
+}
+
+plan_add_hook() { # phase scope path
+  local phase=$1 scope=$2 path=$3 index
+
+  case "$phase" in
+    pre-lock|post-lock|pre-unlock|post-unlock) ;;
+    *) die "unknown hook phase: $phase" ;;
+  esac
+  case "$scope" in
+    global|vault) ;;
+    *) die "unknown hook scope: $scope" ;;
+  esac
+  [[ -n "$path" ]] || die "hook plan path is empty"
+
+  plan_add hook "Run hook"
+  index=$((${#PLAN_OPERATION_IDS[@]} - 1))
+  PLAN_HOOK_PATHS[index]=$path
+  PLAN_HOOK_PHASES[index]=$phase
+  PLAN_HOOK_SCOPES[index]=$scope
+}
+
+build_hook_argv() { # phase scope uuid device deadline epoch round locked
+  local phase=$1 scope=$2 uuid=$3 device=$4 deadline=$5 epoch=$6 round=$7
+  local locked=$8
+
+  HOOK_ARGV=(
+    --phase "$phase"
+    --scope "$scope"
+    --volume "$VOLUME"
+    --mount-point "$MOUNT_POINT"
+    --volume-uuid "$uuid"
+    --device "$device"
+    --state-dir "$STATE_DIR"
+    --state-file "$state_file"
+    --deadline "$deadline"
+    --deadline-epoch "$epoch"
+    --round "$round"
+    --locked "$locked"
+  )
+}
+
+hook_locked_value() { # phase
+  case "$1" in
+    pre-lock|post-unlock) printf 'false\n' ;;
+    post-lock|pre-unlock) printf 'true\n' ;;
+    *) die "unknown hook phase: $1" ;;
+  esac
+}
+
+render_hook_plan_item() { # index
+  local index=$1 phase scope path locked argument
+  phase=${PLAN_HOOK_PHASES[$index]}
+  scope=${PLAN_HOOK_SCOPES[$index]}
+  path=${PLAN_HOOK_PATHS[$index]}
+  locked=$(hook_locked_value "$phase")
+  build_hook_argv "$phase" "$scope" "$PLAN_CONTEXT_UUID" \
+    "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
+    "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
+
+  printf 'Run hook %q' "$path"
+  for argument in "${HOOK_ARGV[@]}"; do
+    printf ' %q' "$argument"
+  done
+  printf '\n'
+}
+
+render_confirmation_requirement() { # command
+  local command=$1
+
+  printf 'Confirmation:\n'
+  if [[ "$command" != "unlock" ]]; then
+    if [[ "$OPTION_YES" == "true" ]]; then
+      printf '  Not required for normal execution because --yes was supplied\n'
+    else
+      printf '  Required before normal execution changes the vault\n'
+    fi
+  else
+    printf '  Not required for unlock\n'
+  fi
+}
+
+render_plan() { # command
+  local command=$1 index
+
+  printf 'Vaultlock plan: %s %s\n' "$command" "$VOLUME"
+  printf 'Current state:\n'
+  render_runtime_summary
+  printf 'Target: %s\n' "$PLAN_TARGET_TEXT"
+  [[ -z "$PLAN_REQUEST_TEXT" ]] || printf '%s\n' "$PLAN_REQUEST_TEXT"
+  printf 'Actions:\n'
+  for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
+    printf '  %d. ' "$((index + 1))"
+    if [[ "${PLAN_OPERATION_IDS[$index]}" == "hook" ]]; then
+      render_hook_plan_item "$index"
+    else
+      printf '%s\n' "${PLAN_OPERATION_TEXT[$index]}"
+    fi
+  done
+  render_confirmation_requirement "$command"
+}
+
 # Resolve the volume's current device node (diskXsY) from its stable UUID.
 # Device numbers can change across reboots, the UUID cannot.
 vol_device() {
@@ -597,23 +749,12 @@ run_hook_file() { # mode phase scope hook uuid device deadline epoch round locke
   local deadline=$7 deadline_epoch=$8 round=$9
   shift 9
   local locked=$1 status
-  local -a hook_args=(
-    --phase "$phase"
-    --scope "$scope"
-    --volume "$VOLUME"
-    --mount-point "$MOUNT_POINT"
-    --volume-uuid "$uuid"
-    --device "$device"
-    --state-dir "$STATE_DIR"
-    --state-file "$state_file"
-    --deadline "$deadline"
-    --deadline-epoch "$deadline_epoch"
-    --round "$round"
-    --locked "$locked"
-  )
+
+  build_hook_argv "$phase" "$scope" "$uuid" "$device" "$deadline" \
+    "$deadline_epoch" "$round" "$locked"
 
   note "running $phase $scope hook: $hook"
-  if "$hook" "${hook_args[@]}"; then
+  if "$hook" "${HOOK_ARGV[@]}"; then
     return 0
   else
     status=$?
@@ -624,13 +765,24 @@ run_hook_file() { # mode phase scope hook uuid device deadline epoch round locke
   return "$status"
 }
 
-run_hook_directory() { # mode phase scope dir uuid device deadline epoch round locked
-    local mode=$1 phase=$2 scope=$3 directory=$4 uuid=$5 device=$6
-    local deadline=$7 deadline_epoch=$8 round=$9
-    shift 9
-    local locked=$1 hook previous_lc=${LC_ALL-} previous_globignore=${GLOBIGNORE-} status
+discover_hooks_reset() {
+  DISCOVERED_HOOK_PATHS=()
+  DISCOVERED_HOOK_SCOPES=()
+}
+
+discover_hook_file() { # path scope
+  local path=$1 scope=$2
+
+  [[ -f "$path" && -x "$path" ]] || return 0
+  DISCOVERED_HOOK_PATHS+=("$path")
+  DISCOVERED_HOOK_SCOPES+=("$scope")
+}
+
+discover_hook_directory() { # directory scope
+    local directory=$1 scope=$2 hook
+    local previous_lc=${LC_ALL-} previous_globignore=${GLOBIGNORE-}
     local -i had_lc=0 had_globignore=0 globignore_exported=0 had_noglob=0
-    local -i had_dotglob=0 had_failglob=0 had_nullglob=0 failed=0
+    local -i had_dotglob=0 had_failglob=0 had_nullglob=0
     local -a hooks
 
     [[ -d "$directory" ]] || return 0
@@ -662,8 +814,23 @@ run_hook_directory() { # mode phase scope dir uuid device deadline epoch round l
     if (( had_noglob )); then set -f; else set +f; fi
 
     for hook in "${hooks[@]}"; do
-    [[ -f "$hook" && -x "$hook" ]] || continue
-    if run_hook_file "$mode" "$phase" "$scope" "$hook" "$uuid" "$device" \
+      discover_hook_file "$hook" "$scope"
+    done
+}
+
+run_hook_directory() { # mode phase scope dir uuid device deadline epoch round locked
+    local mode=$1 phase=$2 scope=$3 directory=$4 uuid=$5 device=$6
+    local deadline=$7 deadline_epoch=$8 round=$9
+    shift 9
+    local locked=$1 hook hook_scope status index
+    local -i failed=0
+
+    discover_hooks_reset
+    discover_hook_directory "$directory" "$scope"
+    for ((index=0; index<${#DISCOVERED_HOOK_PATHS[@]}; index++)); do
+    hook=${DISCOVERED_HOOK_PATHS[$index]}
+    hook_scope=${DISCOVERED_HOOK_SCOPES[$index]}
+    if run_hook_file "$mode" "$phase" "$hook_scope" "$hook" "$uuid" "$device" \
         "$deadline" "$deadline_epoch" "$round" "$locked"; then
       continue
     else
@@ -677,13 +844,16 @@ run_hook_directory() { # mode phase scope dir uuid device deadline epoch round l
 
 run_pre_lock_hooks() { # uuid device deadline epoch round locked
     local uuid=$1 device=$2 deadline=$3 epoch=$4 round=$5 locked=$6
-    local legacy="$STATE_DIR/pre-lock.sh"
+    local legacy="$STATE_DIR/pre-lock.sh" index
 
     verify_mount_identity "$uuid" "$device" || return
-    if [[ -f "$legacy" && -x "$legacy" ]]; then
-    run_hook_file pre pre-lock global "$legacy" "$uuid" "$device" \
-      "$deadline" "$epoch" "$round" "$locked" || return
-  fi
+    discover_hooks_reset
+    discover_hook_file "$legacy" global
+    for ((index=0; index<${#DISCOVERED_HOOK_PATHS[@]}; index++)); do
+      run_hook_file pre pre-lock "${DISCOVERED_HOOK_SCOPES[$index]}" \
+        "${DISCOVERED_HOOK_PATHS[$index]}" "$uuid" "$device" \
+        "$deadline" "$epoch" "$round" "$locked" || return
+    done
     run_hook_directory pre pre-lock global "$STATE_DIR/hooks/pre-lock.d" \
         "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked" || return
     verify_mount_identity "$uuid" "$device" || return
@@ -793,6 +963,288 @@ remaining_human() {
   rem=$(( target - now ))
   if (( rem <= 0 )); then printf 'deadline passed\n'; return 0; fi
   printf '%dh %dm\n' $(( rem / 3600 )) $(( rem % 3600 / 60 ))
+}
+
+plan_discovered_hook_file() { # phase scope path
+  local phase=$1 scope=$2 path=$3 index
+
+  discover_hooks_reset
+  discover_hook_file "$path" "$scope"
+  for ((index=0; index<${#DISCOVERED_HOOK_PATHS[@]}; index++)); do
+    plan_add_hook "$phase" "${DISCOVERED_HOOK_SCOPES[$index]}" \
+      "${DISCOVERED_HOOK_PATHS[$index]}"
+  done
+}
+
+plan_discovered_hook_directory() { # phase scope directory
+  local phase=$1 scope=$2 directory=$3 index
+
+  discover_hooks_reset
+  discover_hook_directory "$directory" "$scope"
+  for ((index=0; index<${#DISCOVERED_HOOK_PATHS[@]}; index++)); do
+    plan_add_hook "$phase" "${DISCOVERED_HOOK_SCOPES[$index]}" \
+      "${DISCOVERED_HOOK_PATHS[$index]}"
+  done
+}
+
+plan_deferred_hook_directory() { # directory
+  local directory=$1
+  plan_add deferred_hook_discovery \
+    "Defer discovery of $directory until the expected vault is mounted and verified"
+}
+
+require_plan_snapshot() {
+  [[ "$SNAPSHOT_VALID" == "true" ]] \
+    || die "cannot build a trustworthy plan: $SNAPSHOT_ERROR"
+}
+
+require_plan_network_tools() {
+  tle_bin >/dev/null || die "tle not found"
+  curl -fsS --max-time 10 "$DRAND_URL/$QUICKNET_CHAIN/info" >/dev/null \
+    || die "drand chain info unreachable, cannot build a trustworthy plan"
+}
+
+plan_lock_hooks() {
+  if [[ "$OPTION_HOOKS" == "false" ]]; then
+    plan_add hooks_disabled "Hooks disabled by --no-hooks"
+    return 0
+  fi
+
+  plan_discovered_hook_file pre-lock global "$STATE_DIR/pre-lock.sh"
+  plan_discovered_hook_directory pre-lock global \
+    "$STATE_DIR/hooks/pre-lock.d"
+  if [[ "$SNAPSHOT_APFS_MOUNTED" == "true" ]]; then
+    plan_discovered_hook_directory pre-lock vault \
+      "$MOUNT_POINT/.vaultlock/hooks/pre-lock.d"
+  else
+    plan_deferred_hook_directory "$MOUNT_POINT/.vaultlock/hooks/pre-lock.d"
+  fi
+}
+
+plan_post_lock_hooks() {
+  [[ "$OPTION_HOOKS" == "true" ]] || return 0
+  plan_discovered_hook_directory post-lock global \
+    "$STATE_DIR/hooks/post-lock.d"
+}
+
+plan_lock_repair() {
+  [[ "$SNAPSHOT_PLAINTEXT_PRESENT" == "true" ]] \
+    || die "cannot build a trustworthy lock plan: plaintext recovery file is missing"
+
+  if [[ "$SNAPSHOT_APFS_LOCKED" == "true" \
+      && "$SNAPSHOT_APFS_MOUNTED" == "false" \
+      && "$SNAPSHOT_HASH_PRESENT" == "true" ]]; then
+    plan_add repair_verify_plaintext \
+      "Verify the existing plaintext recovery material against its stored hash for repair"
+    plan_add repair_unlock_apfs \
+      "Unlock the expected APFS volume with the verified existing recovery material for repair"
+    plan_add repair_mount \
+      "Mount the expected APFS volume at $MOUNT_POINT for repair"
+    plan_add verify_mount_identity \
+      "Verify the mounted UUID and device before continuing"
+  elif [[ "$SNAPSHOT_APFS_LOCKED" == "false" \
+      && "$SNAPSHOT_APFS_MOUNTED" == "false" ]]; then
+    plan_add repair_mount \
+      "Mount the expected APFS volume at $MOUNT_POINT for repair"
+    plan_add verify_mount_identity \
+      "Verify the mounted UUID and device before continuing"
+  elif [[ "$SNAPSHOT_APFS_LOCKED" != "false" \
+      || "$SNAPSHOT_APFS_MOUNTED" != "true" \
+      || "$SNAPSHOT_ACTUAL_MOUNT_POINT" != "$MOUNT_POINT" ]]; then
+    die "cannot build a trustworthy lock plan from the current APFS state"
+  fi
+}
+
+plan_lock_transition() {
+  require_plan_network_tools
+  plan_lock_hooks
+  plan_add tm_exclude \
+    "Add the vault volume root to Time Machine exclusions"
+  plan_add tm_delete_vault_snapshots \
+    "Delete local Time Machine snapshots for the vault"
+  plan_add unmount_vault "Unmount the vault"
+  plan_add stage_recovery \
+    "Generate and durably stage a new random recovery passphrase"
+  plan_add rotate_apfs_recovery \
+    "Rotate the APFS volume passphrase, then commit the staged plaintext recovery file"
+  plan_add keychain_update \
+    "Update the keychain with the rotated recovery material"
+  plan_add tle_encrypt \
+    "Encrypt the rotated recovery material for the resolved drand round"
+  plan_add tle_verify_future \
+    "Verify the time-lock ciphertext is nonempty and not yet decryptable"
+  plan_add persist_locked_recovery \
+    "Write the recovery hash and durably record the locked deadline and round"
+  plan_add remove_plaintext \
+    "Remove plaintext recovery material and its keychain entry"
+  plan_add tm_delete_data_snapshots \
+    "Delete local Time Machine snapshots for the data volume"
+  plan_add apfs_lock "Lock the APFS volume"
+  plan_add verify_locked_postconditions \
+    "Verify APFS encryption, locked state, and failed unauthenticated mounting"
+  plan_post_lock_hooks
+}
+
+build_lock_plan() {
+  local now target deadline_iso round
+
+  require_plan_snapshot
+  now=$(/bin/date +%s)
+  target=$(resolve_deadline "$OPTION_OPERANDS" "$now") \
+    || die "cannot resolve '$OPTION_OPERANDS' to a future deadline, see: vaultlock help"
+  deadline_iso=$(/bin/date -j -r "$target" '+%Y-%m-%dT%H:%M:%S%z') \
+    || die "deadline is outside the supported date range"
+  round=$(round_for_epoch "$target")
+
+  PLAN_CONTEXT_UUID=$SNAPSHOT_EXPECTED_UUID
+  PLAN_CONTEXT_DEVICE=$SNAPSHOT_DEVICE
+  PLAN_CONTEXT_DEADLINE=$deadline_iso
+  PLAN_CONTEXT_DEADLINE_EPOCH=$target
+  PLAN_CONTEXT_ROUND=$round
+  PLAN_TARGET_TEXT="locked at the resolved deadline"
+  PLAN_REQUEST_TEXT="Requested deadline: $deadline_iso (epoch $target)"$'\n'\
+"Resolved drand round: target $round, current $(current_round)"
+
+  if [[ "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
+    if [[ "$RUNTIME_ASSESSMENT" == "securely locked" ]]; then
+      PLAN_TARGET_TEXT="already securely locked until $SNAPSHOT_DEADLINE"
+      PLAN_REQUEST_TEXT="Existing drand round: target $SNAPSHOT_ROUND, current $(current_round)"
+      plan_add verify_secure_target \
+        "Verify the existing locked state, recovery files, and APFS postconditions"
+      return 0
+    fi
+    die "cannot build a trustworthy lock plan from assessment: $RUNTIME_ASSESSMENT"
+  fi
+
+  plan_lock_repair
+  plan_lock_transition
+}
+
+plan_pre_unlock_hooks() {
+  if [[ "$OPTION_HOOKS" == "false" ]]; then
+    plan_add hooks_disabled "Hooks disabled by --no-hooks"
+    return 0
+  fi
+  plan_discovered_hook_directory pre-unlock global \
+    "$STATE_DIR/hooks/pre-unlock.d"
+}
+
+plan_post_unlock_hooks() {
+  [[ "$OPTION_HOOKS" == "true" ]] || return 0
+  if [[ "$SNAPSHOT_APFS_MOUNTED" == "true" ]]; then
+    plan_discovered_hook_directory post-unlock vault \
+      "$MOUNT_POINT/.vaultlock/hooks/post-unlock.d"
+  else
+    plan_deferred_hook_directory "$MOUNT_POINT/.vaultlock/hooks/post-unlock.d"
+  fi
+  plan_discovered_hook_directory post-unlock global \
+    "$STATE_DIR/hooks/post-unlock.d"
+}
+
+plan_locked_unlock_transition() {
+  [[ "$RUNTIME_ASSESSMENT" == "securely locked" ]] \
+    || die "cannot build a trustworthy unlock plan from assessment: $RUNTIME_ASSESSMENT"
+  require_plan_network_tools
+  plan_pre_unlock_hooks
+  plan_add tle_decrypt \
+    "Decrypt the stored time-lock ciphertext after its drand round is available"
+  plan_add verify_decrypted_hash \
+    "Verify the decrypted recovery material against the stored hash"
+  plan_add apfs_unlock \
+    "Unlock the expected APFS volume with the verified recovery material"
+  plan_add verify_mount_identity \
+    "Verify the mounted UUID and device before continuing"
+  plan_add persist_plaintext \
+    "Write the verified plaintext recovery file durably"
+  plan_add keychain_update \
+    "Update the keychain with the verified recovery material"
+  plan_add persist_unlocked_state \
+    "Durably record the unlocked state"
+  plan_post_unlock_hooks
+}
+
+plan_unlocked_repair() {
+  [[ "$SNAPSHOT_PLAINTEXT_PRESENT" == "true" ]] \
+    || die "cannot build a trustworthy unlock plan: plaintext recovery file is missing"
+  if [[ "$SNAPSHOT_APFS_LOCKED" == "true" \
+      && "$SNAPSHOT_APFS_MOUNTED" == "false" \
+      && "$SNAPSHOT_HASH_PRESENT" == "true" ]]; then
+    plan_add repair_verify_plaintext \
+      "Verify the existing plaintext recovery material against its stored hash for repair"
+    plan_add repair_unlock_apfs \
+      "Unlock the expected APFS volume with the verified existing recovery material for repair"
+    plan_add verify_mount_identity \
+      "Verify the mounted UUID and device before continuing"
+  elif [[ "$SNAPSHOT_APFS_LOCKED" == "false" \
+      && "$SNAPSHOT_APFS_MOUNTED" == "false" ]]; then
+    plan_add repair_mount \
+      "Mount the expected APFS volume at $MOUNT_POINT for repair"
+    plan_add verify_mount_identity \
+      "Verify the mounted UUID and device before continuing"
+  elif [[ "$SNAPSHOT_APFS_LOCKED" == "false" \
+      && "$SNAPSHOT_APFS_MOUNTED" == "true" \
+      && "$SNAPSHOT_ACTUAL_MOUNT_POINT" == "$MOUNT_POINT" ]]; then
+    plan_add verify_mount_identity \
+      "Verify the mounted UUID and device before continuing"
+  else
+    die "cannot build a trustworthy unlock plan from the current APFS state"
+  fi
+}
+
+build_unlock_plan() {
+  require_plan_snapshot
+  PLAN_CONTEXT_UUID=$SNAPSHOT_EXPECTED_UUID
+  PLAN_CONTEXT_DEVICE=$SNAPSHOT_DEVICE
+  PLAN_CONTEXT_DEADLINE=$SNAPSHOT_DEADLINE
+  PLAN_CONTEXT_DEADLINE_EPOCH=$SNAPSHOT_DEADLINE_EPOCH
+  PLAN_CONTEXT_ROUND=$SNAPSHOT_ROUND
+  PLAN_TARGET_TEXT="unlocked and mounted at $MOUNT_POINT"
+
+  if [[ "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
+    plan_locked_unlock_transition
+    return 0
+  fi
+
+  plan_unlocked_repair
+}
+
+run_dry_run_plan() { # command
+  local command=$1
+
+  inspect_runtime_state
+  classify_runtime_state
+  plan_reset
+  case "$command" in
+    lock) build_lock_plan ;;
+    unlock) build_unlock_plan ;;
+    *) die "no dry-run planner for command: $command" ;;
+  esac
+  render_plan "$command"
+  printf 'Result: no changes made\n'
+}
+
+dispatch_lock() {
+  local argument
+  for argument in "$@"; do
+    if [[ "$argument" == "--dry-run" ]]; then
+      parse_command_options lock "$@"
+      run_dry_run_plan lock
+      return 0
+    fi
+  done
+  cmd_lock "$@"
+}
+
+dispatch_unlock() {
+  local argument
+  for argument in "$@"; do
+    if [[ "$argument" == "--dry-run" ]]; then
+      parse_command_options unlock "$@"
+      run_dry_run_plan unlock
+      return 0
+    fi
+  done
+  cmd_unlock "$@"
 }
 
 cmd_lock() {
@@ -1001,6 +1453,12 @@ case "${1:-}" in
     OPTION_YES=$3
     confirm_plan
     ;;
+  __plan_operation)
+    [[ $# -eq 2 ]] \
+      || die_usage "usage: vaultlock __plan_operation <operation_id>"
+    plan_reset
+    plan_add "$2" "test operation"
+    ;;
   __deadline)
     now=${2:?usage: vaultlock __deadline <now_epoch> <expression>}
     shift 2
@@ -1015,8 +1473,8 @@ case "${1:-}" in
     ;;
   init) shift; cmd_init "$@" ;;
   adopt) shift; cmd_adopt "$@" ;;
-  lock) shift; cmd_lock "$@" ;;
-  unlock) shift; cmd_unlock "$@" ;;
+  lock) shift; dispatch_lock "$@" ;;
+  unlock) shift; dispatch_unlock "$@" ;;
   status) shift; cmd_status "$@" ;;
   *) usage ;;
 esac

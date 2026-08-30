@@ -455,4 +455,14 @@ else
 fi
 rmdir "$state_probe_dir"
 
+if output=$("$VL" __plan_operation definitely-unknown 2>&1); then
+  printf 'FAIL plan rejects unknown operation ID: command succeeded\n'
+  fail=1
+elif [[ "$output" == "vaultlock: unknown plan operation ID: definitely-unknown" ]]; then
+  printf 'ok   plan rejects unknown operation ID\n'
+else
+  printf 'FAIL plan rejects unknown operation ID: got [%s]\n' "$output"
+  fail=1
+fi
+
 exit "$fail"

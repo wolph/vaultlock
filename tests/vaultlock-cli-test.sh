@@ -7,6 +7,8 @@ fixture_command=${0##*/}
 if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     && "$fixture_command" != "vaultlock-cli-test.sh" ]]; then
   : "${VAULTLOCK_TEST_ACTION_LOG:?missing action log}"
+  : "${VAULTLOCK_TEST_MUTATION_LOG:?missing mutation log}"
+  : "${VAULTLOCK_TEST_HOOK_LOG:?missing hook log}"
   : "${VAULTLOCK_TEST_APFS_STATE:?missing APFS state directory}"
   : "${VAULTLOCK_TEST_FAKE_BIN:?missing fake binary directory}"
   : "${VAULTLOCK_MOUNT_POINT:?missing mount point}"
@@ -16,6 +18,29 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     printf ' %q' "$fixture_argument" >> "$VAULTLOCK_TEST_ACTION_LOG"
   done
   printf '\n' >> "$VAULTLOCK_TEST_ACTION_LOG"
+
+  case "$fixture_command" in
+    diskutil)
+      [[ "${1:-}" == "info" ]] \
+        || printf '%s\n' "diskutil $*" >> "$VAULTLOCK_TEST_MUTATION_LOG"
+      ;;
+    security|tmutil)
+      printf '%s\n' "$fixture_command $*" >> "$VAULTLOCK_TEST_MUTATION_LOG"
+      ;;
+    tle)
+      for fixture_argument in "$@"; do
+        if [[ "$fixture_argument" == "-o" ]]; then
+          printf '%s\n' "tle $*" >> "$VAULTLOCK_TEST_MUTATION_LOG"
+          break
+        fi
+      done
+      ;;
+    sudo|mount-fixture|bash-version-fixture|curl) ;;
+    mount) ;;
+    *)
+      printf '%s\n' "$fixture_command $*" >> "$VAULTLOCK_TEST_HOOK_LOG"
+      ;;
+  esac
 
   fixture_read() { # name
     local fixture_name=$1
@@ -187,6 +212,8 @@ trap 'rm -rf "$test_root"' EXIT
 
 fake_bin="$test_root/bin"
 action_log="$test_root/actions"
+mutation_log="$test_root/mutations"
+hook_log="$test_root/hooks"
 apfs_state="$test_root/apfs"
 test_home="$test_root/home"
 state_dir="$test_home/.vaultlock"
@@ -194,6 +221,8 @@ mount_point="$test_root/Volumes/vault.test"
 confirm_device="$test_root/confirm"
 mkdir -p "$fake_bin" "$apfs_state" "$state_dir" "$mount_point"
 : > "$action_log"
+: > "$mutation_log"
+: > "$hook_log"
 : > "$confirm_device"
 
 TEST_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
@@ -277,6 +306,8 @@ run_vaultlock() {
   VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   VAULTLOCK_TEST_FAKE_BIN="$fake_bin" \
   VAULTLOCK_TEST_ACTION_LOG="$action_log" \
+  VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
+  VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
   VAULTLOCK_TEST_APFS_STATE="$apfs_state" \
     /bin/bash "$VL" "$@"
 }
@@ -400,6 +431,8 @@ fake_dispatch_version=$(
   VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   VAULTLOCK_TEST_FAKE_BIN="$fake_bin" \
   VAULTLOCK_TEST_ACTION_LOG="$action_log" \
+  VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
+  VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
   VAULTLOCK_TEST_APFS_STATE="$apfs_state" \
     "$fake_bin/bash-version-fixture"
 )
@@ -709,5 +742,168 @@ if HOME="$test_home" PATH="$fake_bin" \
 else
   record_failure "yes must bypass confirmation device"
 fi
+
+snapshot_tree() { # source destination
+  local source=$1 destination=$2
+  mkdir -p "$destination"
+  /bin/cp -R "$source/." "$destination"
+}
+
+check_tree_unchanged() { # description before after
+  local description=$1 before=$2 after=$3
+  if diff -ruN "$before" "$after" >/dev/null; then
+    printf 'ok   %s\n' "$description"
+  else
+    printf 'FAIL %s\n' "$description"
+    diff -ruN "$before" "$after" || true
+    fail=1
+  fi
+}
+
+check_secret_absent() { # description output secret
+  local description=$1 output=$2 secret=$3
+  if [[ "$output" != *"$secret"* ]]; then
+    printf 'ok   %s\n' "$description"
+  else
+    printf 'FAIL %s: secret appeared in output\n' "$description"
+    fail=1
+  fi
+}
+
+fake_passphrase='FAKE-PASSPHRASE-DO-NOT-PRINT'
+fake_hash='FAKE-HASH-DO-NOT-PRINT'
+fake_ciphertext='FAKE-CIPHERTEXT-DO-NOT-PRINT'
+
+write_json_state false null null null UUID-123
+write_apfs_state true false UUID-123 disk9s1
+printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
+printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
+printf '%s\n' "$fake_ciphertext" > "$state_dir/passphrase.tle"
+lock_state_before="$test_root/lock-state-before"
+lock_apfs_before="$test_root/lock-apfs-before"
+snapshot_tree "$state_dir" "$lock_state_before"
+snapshot_tree "$apfs_state" "$lock_apfs_before"
+: > "$action_log"
+: > "$mutation_log"
+: > "$hook_log"
+if lock_plan=$(run_vaultlock lock --dry-run --no-hooks 2:00 +2d 2>&1); then
+  lock_status=0
+else
+  lock_status=$?
+fi
+check "lock dry-run exits successfully" 0 "$lock_status"
+check_line "lock dry-run names target" \
+  'Target: locked at the resolved deadline' "$lock_plan"
+check_contains "lock dry-run resolves deadline" \
+  'Requested deadline: ' "$lock_plan"
+check_contains "lock dry-run resolves target round" \
+  'Resolved drand round: target ' "$lock_plan"
+lock_actions=$(sed -n '/^Actions:$/,/^Confirmation:/p' <<< "$lock_plan")
+expected_lock_actions=$(cat <<EOF
+Actions:
+  1. Verify the existing plaintext recovery material against its stored hash for repair
+  2. Unlock the expected APFS volume with the verified existing recovery material for repair
+  3. Mount the expected APFS volume at $mount_point for repair
+  4. Verify the mounted UUID and device before continuing
+  5. Hooks disabled by --no-hooks
+  6. Add the vault volume root to Time Machine exclusions
+  7. Delete local Time Machine snapshots for the vault
+  8. Unmount the vault
+  9. Generate and durably stage a new random recovery passphrase
+  10. Rotate the APFS volume passphrase, then commit the staged plaintext recovery file
+  11. Update the keychain with the rotated recovery material
+  12. Encrypt the rotated recovery material for the resolved drand round
+  13. Verify the time-lock ciphertext is nonempty and not yet decryptable
+  14. Write the recovery hash and durably record the locked deadline and round
+  15. Remove plaintext recovery material and its keychain entry
+  16. Delete local Time Machine snapshots for the data volume
+  17. Lock the APFS volume
+  18. Verify APFS encryption, locked state, and failed unauthenticated mounting
+Confirmation:
+EOF
+)
+check "lock dry-run ordered actions" "$expected_lock_actions" "$lock_actions"
+check "lock dry-run final result" 'Result: no changes made' \
+  "$(tail -n 1 <<< "$lock_plan")"
+check "lock dry-run audit contains only allowlisted reads" \
+  $'diskutil info -plist UUID-123\ncurl -fsS --max-time 10 https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/info' \
+  "$(< "$action_log")"
+check_empty "lock dry-run mutation log" "$mutation_log"
+check_empty "lock dry-run hook log" "$hook_log"
+check_tree_unchanged "lock dry-run leaves state tree unchanged" \
+  "$lock_state_before" "$state_dir"
+check_tree_unchanged "lock dry-run leaves APFS fixture unchanged" \
+  "$lock_apfs_before" "$apfs_state"
+check_secret_absent "lock dry-run hides passphrase" "$lock_plan" "$fake_passphrase"
+check_secret_absent "lock dry-run hides hash" "$lock_plan" "$fake_hash"
+check_secret_absent "lock dry-run hides ciphertext" "$lock_plan" "$fake_ciphertext"
+
+write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+rm -f "$apfs_state/mount_point" "$state_dir/passphrase.txt"
+printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
+printf '%s\n' "$fake_ciphertext" > "$state_dir/passphrase.tle"
+mkdir -p "$state_dir/hooks/pre-unlock.d" "$state_dir/hooks/post-unlock.d"
+cp "$TEST_SELF" "$state_dir/hooks/pre-unlock.d/10-pre hook"
+cp "$TEST_SELF" "$state_dir/hooks/post-unlock.d/20-post hook"
+chmod +x "$state_dir/hooks/pre-unlock.d/10-pre hook" \
+  "$state_dir/hooks/post-unlock.d/20-post hook"
+unlock_state_before="$test_root/unlock-state-before"
+unlock_apfs_before="$test_root/unlock-apfs-before"
+snapshot_tree "$state_dir" "$unlock_state_before"
+snapshot_tree "$apfs_state" "$unlock_apfs_before"
+: > "$action_log"
+: > "$mutation_log"
+: > "$hook_log"
+if unlock_plan=$(run_vaultlock unlock --dry-run 2>&1); then
+  unlock_status=0
+else
+  unlock_status=$?
+fi
+check "unlock dry-run exits successfully" 0 "$unlock_status"
+check_line "unlock dry-run names target" \
+  "Target: unlocked and mounted at $mount_point" "$unlock_plan"
+check_contains "unlock dry-run lists pre-unlock hook" \
+  "10-pre\\ hook --phase pre-unlock --scope global" "$unlock_plan"
+check_contains "unlock dry-run defers unavailable local hooks" \
+  "Defer discovery of $mount_point/.vaultlock/hooks/post-unlock.d until the expected vault is mounted and verified" "$unlock_plan"
+check_contains "unlock dry-run lists global post hook after deferred item" \
+  "20-post\\ hook --phase post-unlock --scope global" "$unlock_plan"
+unlock_order=$(printf '%s\n' "$unlock_plan" \
+  | grep -E 'pre-unlock|Decrypt|Verify the decrypted|Unlock the expected|Verify the mounted|Write the verified|Update the keychain|record the unlocked|Defer discovery|post-unlock' \
+  || true)
+quoted_pre_hook=$(printf '%q' "$state_dir/hooks/pre-unlock.d/10-pre hook")
+quoted_post_hook=$(printf '%q' "$state_dir/hooks/post-unlock.d/20-post hook")
+quoted_mount_point=$(printf '%q' "$mount_point")
+quoted_state_dir=$(printf '%q' "$state_dir")
+quoted_state_file=$(printf '%q' "$state_dir/state.json")
+expected_unlock_order=$(cat <<EOF
+  1. Run hook $quoted_pre_hook --phase pre-unlock --scope global --volume vault --mount-point $quoted_mount_point --volume-uuid UUID-123 --device disk9s1 --state-dir $quoted_state_dir --state-file $quoted_state_file --deadline 2099-01-02T03:04:00+0100 --deadline-epoch 4070999040 --round 792731235 --locked true
+  2. Decrypt the stored time-lock ciphertext after its drand round is available
+  3. Verify the decrypted recovery material against the stored hash
+  4. Unlock the expected APFS volume with the verified recovery material
+  5. Verify the mounted UUID and device before continuing
+  6. Write the verified plaintext recovery file durably
+  7. Update the keychain with the verified recovery material
+  8. Durably record the unlocked state
+  9. Defer discovery of $mount_point/.vaultlock/hooks/post-unlock.d until the expected vault is mounted and verified
+  10. Run hook $quoted_post_hook --phase post-unlock --scope global --volume vault --mount-point $quoted_mount_point --volume-uuid UUID-123 --device disk9s1 --state-dir $quoted_state_dir --state-file $quoted_state_file --deadline 2099-01-02T03:04:00+0100 --deadline-epoch 4070999040 --round 792731235 --locked false
+EOF
+)
+check "unlock dry-run ordered actions" "$expected_unlock_order" "$unlock_order"
+check "unlock dry-run final result" 'Result: no changes made' \
+  "$(tail -n 1 <<< "$unlock_plan")"
+check "unlock dry-run audit contains only allowlisted reads" \
+  $'diskutil info -plist UUID-123\ncurl -fsS --max-time 10 https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/info' \
+  "$(< "$action_log")"
+check_empty "unlock dry-run mutation log" "$mutation_log"
+check_empty "unlock dry-run hook log" "$hook_log"
+check_tree_unchanged "unlock dry-run leaves state tree unchanged" \
+  "$unlock_state_before" "$state_dir"
+check_tree_unchanged "unlock dry-run leaves APFS fixture unchanged" \
+  "$unlock_apfs_before" "$apfs_state"
+check_secret_absent "unlock dry-run hides hash" "$unlock_plan" "$fake_hash"
+check_secret_absent "unlock dry-run hides ciphertext" "$unlock_plan" "$fake_ciphertext"
+check_secret_absent "unlock dry-run hides passphrase" "$unlock_plan" "$fake_passphrase"
 
 exit "$fail"
