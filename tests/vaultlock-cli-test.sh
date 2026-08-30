@@ -31,31 +31,59 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
 
   fake_diskutil_info() {
     local plist=false locked mounted uuid device fixture_mount_point
+    local plist_mode=normal have_locked=false have_mount_point=false
+    local mount_point_type=string
     if [[ "${1:-}" == "-plist" ]]; then
       plist=true
       shift
     fi
     [[ $# -eq 1 ]] || exit 64
-    locked=$(fixture_read locked) || exit 1
-    mounted=$(fixture_read mounted) || exit 1
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/locked" ]]; then
+      have_locked=true
+      locked=$(fixture_read locked)
+    fi
+    mounted=$(fixture_read mounted) || mounted=false
     uuid=$(fixture_read uuid) || exit 1
     device=$(fixture_read device) || exit 1
-    fixture_mount_point=$(fixture_read mount_point) || exit 1
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/mount_point" ]]; then
+      have_mount_point=true
+      fixture_mount_point=$(fixture_read mount_point)
+    fi
+    plist_mode=$(fixture_read plist_mode) || plist_mode=normal
+    mount_point_type=$(fixture_read mount_point_type) || mount_point_type=string
 
     if [[ "$plist" == "true" ]]; then
+      if [[ "$plist_mode" == "fail" ]]; then
+        printf 'fixture diskutil failure\n' >&2
+        exit 1
+      fi
+      if [[ "$plist_mode" == "malformed" ]]; then
+        printf '<not-a-plist>\n'
+        exit 0
+      fi
       printf '%s\n' \
         '<?xml version="1.0" encoding="UTF-8"?>' \
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
-        '<plist version="1.0"><dict>' \
-        '<key>Locked</key>'
-      if [[ "$locked" == "true" ]]; then
-        printf '<true/>\n'
-      else
-        printf '<false/>\n'
+        '<plist version="1.0"><dict>'
+      if [[ "$have_locked" == "true" ]]; then
+        printf '<key>Locked</key>\n'
+        case "$locked" in
+          true) printf '<true/>\n' ;;
+          false) printf '<false/>\n' ;;
+          string:true) printf '<string>true</string>\n' ;;
+          string:false) printf '<string>false</string>\n' ;;
+          *) printf '<string>%s</string>\n' "$locked" ;;
+        esac
+      fi
+      if [[ "$have_mount_point" == "true" ]]; then
+        printf '<key>MountPoint</key>\n'
+        if [[ "$mount_point_type" == "string" ]]; then
+          printf '<string>%s</string>\n' "$fixture_mount_point"
+        else
+          printf '<integer>7</integer>\n'
+        fi
       fi
       printf '%s\n' \
-        '<key>MountPoint</key>' \
-        "<string>$fixture_mount_point</string>" \
         '<key>VolumeUUID</key>' \
         "<string>$uuid</string>" \
         '<key>DeviceIdentifier</key>' \
@@ -218,6 +246,17 @@ check_empty() { # description file
   fi
 }
 
+check_line() { # description expected output
+  local description=$1 expected=$2 output=$3
+  if grep -Fqx -- "$expected" <<< "$output"; then
+    printf 'ok   %s\n' "$description"
+  else
+    printf 'FAIL %s: missing line [%s] in [%s]\n' \
+      "$description" "$expected" "$output"
+    fail=1
+  fi
+}
+
 record_failure() { # description
   printf 'FAIL %s\n' "$1"
   fail=1
@@ -288,10 +327,66 @@ write_apfs_state() { # locked mounted uuid device
   printf '%s\n' "$uuid" > "$apfs_state/uuid"
   printf '%s\n' "$device" > "$apfs_state/device"
   printf '%s\n' "$fixture_mount_point" > "$apfs_state/mount_point"
+  printf '%s\n' normal > "$apfs_state/plist_mode"
+  printf '%s\n' string > "$apfs_state/mount_point_type"
+}
+
+write_recovery_state() { # plaintext ciphertext hash
+  local plaintext=$1 ciphertext=$2 hash=$3
+  rm -f "$state_dir/passphrase.txt" "$state_dir/passphrase.tle" \
+    "$state_dir/passphrase.sha256"
+  if [[ "$plaintext" == "true" ]]; then : > "$state_dir/passphrase.txt"; fi
+  if [[ "$ciphertext" == "true" ]]; then : > "$state_dir/passphrase.tle"; fi
+  if [[ "$hash" == "true" ]]; then : > "$state_dir/passphrase.sha256"; fi
+}
+
+assert_status_snapshot() { # description recorded apfs mount recovery assessment
+  local description=$1 recorded=$2 apfs=$3 mount=$4 recovery=$5 assessment=$6
+  local output status diskutil_calls
+  : > "$action_log"
+  if output=$(run_vaultlock status 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  check "$description exits successfully" 0 "$status"
+  check_line "$description recorded line" "Recorded: $recorded" "$output"
+  check_line "$description APFS line" "APFS: $apfs" "$output"
+  check_line "$description mount line" "Mount: $mount" "$output"
+  check_line "$description recovery line" "Recovery: $recovery" "$output"
+  check_line "$description assessment line" "Assessment: $assessment" "$output"
+  diskutil_calls=$(grep -c '^diskutil info -plist UUID-123$' \
+    "$action_log" || true)
+  check "$description reads APFS plist exactly once" 1 "$diskutil_calls"
+  check "$description performs no other system operation" \
+    'diskutil info -plist UUID-123' "$(< "$action_log")"
+}
+
+assert_invalid_snapshot() { # description
+  local description=$1 output status
+  : > "$action_log"
+  if output=$(run_vaultlock status 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  check "$description exits successfully" 0 "$status"
+  check_line "$description recorded line" \
+    'Recorded: unknown (state file fields are missing or malformed)' "$output"
+  check_line "$description APFS line" \
+    'APFS: unknown (not inspected: invalid state snapshot)' "$output"
+  check_line "$description mount line" \
+    "Mount: expected $mount_point, actual unknown" "$output"
+  check_line "$description recovery line" \
+    'Recovery: plaintext present, ciphertext absent, hash absent' "$output"
+  check_line "$description assessment line" \
+    'Assessment: inconsistent' "$output"
+  check_empty "$description performs no system operation" "$action_log"
 }
 
 write_json_state false null null null UUID-123
 write_apfs_state false true UUID-123 disk9s1
+write_recovery_state true false false
 
 check_contains "harness uses Bash 3.2" "3.2." "$BASH_VERSION"
 
@@ -306,9 +401,192 @@ fake_dispatch_version=$(
 check_contains "fake dispatcher uses Bash 3.2" "3.2." \
   "$fake_dispatch_version"
 
-output=$(run_vaultlock status)
-check_contains "status uses injected mount listing" \
-  "UNLOCKED (mounted at $mount_point)" "$output"
+assert_status_snapshot "usable unlocked vault" \
+  unlocked \
+  'unlocked (UUID UUID-123, device disk9s1)' \
+  "expected $mount_point, actual $mount_point" \
+  'plaintext present, ciphertext absent, hash absent' \
+  usable
+
+write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+rm -f "$apfs_state/mount_point"
+write_recovery_state false true true
+assert_status_snapshot "securely locked vault" \
+  'locked until 2099-01-02T03:04:00+0100' \
+  'locked (UUID UUID-123, device disk9s1)' \
+  "expected $mount_point, actual not mounted" \
+  'plaintext absent, ciphertext present, hash present' \
+  'securely locked'
+locked_output=$(run_vaultlock status)
+check_contains "locked status preserves remaining output" \
+  'remaining: ' "$locked_output"
+check_contains "locked status preserves target round" \
+  'drand round: target 792731235, current ' "$locked_output"
+check_line "locked status preserves unlock instruction" \
+  'when the deadline passes: vaultlock unlock (needs internet)' "$locked_output"
+
+write_json_state false null null null UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_recovery_state true false true
+assert_status_snapshot "recorded unlock repair" \
+  unlocked \
+  'locked (UUID UUID-123, device disk9s1)' \
+  "expected $mount_point, actual not mounted" \
+  'plaintext present, ciphertext absent, hash present' \
+  'repairable: run vaultlock unlock'
+
+write_json_state false null null null UUID-123
+write_apfs_state false false UUID-123 disk9s1
+write_recovery_state true false false
+assert_status_snapshot "unmounted unlock repair" \
+  unlocked \
+  'unlocked (UUID UUID-123, device disk9s1)' \
+  "expected $mount_point, actual not mounted" \
+  'plaintext present, ciphertext absent, hash absent' \
+  'repairable: run diskutil mount disk9s1'
+
+write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_recovery_state false true true
+assert_status_snapshot "recorded locked but APFS unlocked" \
+  'locked until 2099-01-02T03:04:00+0100' \
+  'unlocked (UUID UUID-123, device disk9s1)' \
+  "expected $mount_point, actual $mount_point" \
+  'plaintext absent, ciphertext present, hash present' \
+  inconsistent
+
+write_apfs_state true true UUID-123 disk9s1
+assert_status_snapshot "APFS locked but mounted" \
+  'locked until 2099-01-02T03:04:00+0100' \
+  'locked (UUID UUID-123, device disk9s1)' \
+  "expected $mount_point, actual $mount_point" \
+  'plaintext absent, ciphertext present, hash present' \
+  inconsistent
+
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-OTHER disk9s1
+write_recovery_state true false false
+assert_status_snapshot "UUID mismatch" \
+  unlocked \
+  'unknown (volume UUID mismatch: expected UUID-123, actual UUID-OTHER)' \
+  "expected $mount_point, actual $mount_point" \
+  'plaintext present, ciphertext absent, hash absent' \
+  inconsistent
+
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_recovery_state false true true
+assert_status_snapshot "unlocked missing plaintext" \
+  unlocked \
+  'unlocked (UUID UUID-123, device disk9s1)' \
+  "expected $mount_point, actual $mount_point" \
+  'plaintext absent, ciphertext present, hash present' \
+  inconsistent
+
+write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_recovery_state false false true
+assert_status_snapshot "locked missing ciphertext" \
+  'locked until 2099-01-02T03:04:00+0100' \
+  'locked (UUID UUID-123, device disk9s1)' \
+  "expected $mount_point, actual not mounted" \
+  'plaintext absent, ciphertext absent, hash present' \
+  inconsistent
+
+write_recovery_state false true false
+assert_status_snapshot "locked missing hash" \
+  'locked until 2099-01-02T03:04:00+0100' \
+  'locked (UUID UUID-123, device disk9s1)' \
+  "expected $mount_point, actual not mounted" \
+  'plaintext absent, ciphertext present, hash absent' \
+  inconsistent
+
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+printf '%s\n' "$test_root/Volumes/wrong-vault" > "$apfs_state/mount_point"
+write_recovery_state true false false
+assert_status_snapshot "wrong mount path" \
+  unlocked \
+  'unlocked (UUID UUID-123, device disk9s1)' \
+  "expected $mount_point, actual $test_root/Volumes/wrong-vault" \
+  'plaintext present, ciphertext absent, hash absent' \
+  inconsistent
+
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+printf '%s\n' surprise > "$apfs_state/locked"
+write_recovery_state true false false
+assert_status_snapshot "malformed APFS Locked" \
+  unlocked \
+  'unknown (APFS Locked is missing or malformed)' \
+  "expected $mount_point, actual $mount_point" \
+  'plaintext present, ciphertext absent, hash absent' \
+  inconsistent
+
+write_apfs_state false true UUID-123 disk9s1
+printf '%s\n' string:false > "$apfs_state/locked"
+assert_status_snapshot "wrong-typed false APFS Locked" \
+  unlocked \
+  'unknown (APFS Locked is missing or malformed)' \
+  "expected $mount_point, actual $mount_point" \
+  'plaintext present, ciphertext absent, hash absent' \
+  inconsistent
+
+write_apfs_state false true UUID-123 disk9s1
+printf '%s\n' integer > "$apfs_state/mount_point_type"
+assert_status_snapshot "wrong-typed APFS MountPoint" \
+  unlocked \
+  'unknown (APFS MountPoint is malformed)' \
+  "expected $mount_point, actual unknown" \
+  'plaintext present, ciphertext absent, hash absent' \
+  inconsistent
+
+write_apfs_state false true UUID-123 disk9s1
+rm -f "$apfs_state/locked"
+assert_status_snapshot "missing APFS Locked" \
+  unlocked \
+  'unknown (APFS Locked is missing or malformed)' \
+  "expected $mount_point, actual $mount_point" \
+  'plaintext present, ciphertext absent, hash absent' \
+  inconsistent
+
+write_apfs_state false true UUID-123 disk9s1
+printf '%s\n' fail > "$apfs_state/plist_mode"
+assert_status_snapshot "diskutil inspection failure" \
+  unlocked \
+  'unknown (diskutil info failed)' \
+  "expected $mount_point, actual unknown" \
+  'plaintext present, ciphertext absent, hash absent' \
+  inconsistent
+
+write_apfs_state false true UUID-123 disk9s1
+printf '%s\n' '{"locked":"true","volume_uuid":"UUID-123","deadline":null,"deadline_epoch":null,"round":null}' \
+  > "$state_dir/state.json"
+assert_invalid_snapshot "wrong-typed JSON"
+
+printf '%s\n' '{not-json' > "$state_dir/state.json"
+assert_invalid_snapshot "malformed JSON"
+
+write_json_state false null null null UUID-123
+chmod 000 "$state_dir/state.json"
+: > "$action_log"
+if output=$(run_vaultlock status 2>&1); then
+  status=0
+else
+  status=$?
+fi
+chmod 600 "$state_dir/state.json"
+check "unreadable state exits successfully" 0 "$status"
+check_line "unreadable state reports boundary failure" \
+  'Recorded: unknown (state file is unreadable)' "$output"
+check_line "unreadable state is inconsistent" \
+  'Assessment: inconsistent' "$output"
+check_empty "unreadable state performs no system operation" "$action_log"
+
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_recovery_state true false false
 
 host_bin="$test_root/host-bin"
 mkdir -p "$host_bin"
@@ -326,8 +604,8 @@ write_apfs_state false true UUID-123 disk9s1
 printf '%s\n' "$test_root/Volumes/vaultXtest" \
   > "$apfs_state/mount_point"
 output=$(run_vaultlock status)
-check_contains "mount point matching is literal" \
-  "UNLOCKED (not mounted)" "$output"
+check_line "mount point matching is literal" \
+  'Assessment: inconsistent' "$output"
 
 check "lock option order" \
   $'dry_run=true\nyes=true\nhooks=false\noperands=2:00 +2d' \

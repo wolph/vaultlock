@@ -292,6 +292,270 @@ parse_deadline() {
 state_get() { jq -r "$1" "$state_file"; }
 vol_uuid() { state_get .volume_uuid; }
 
+SNAPSHOT_RECORDED_LOCKED=unknown
+SNAPSHOT_APFS_LOCKED=unknown
+SNAPSHOT_APFS_MOUNTED=unknown
+SNAPSHOT_EXPECTED_UUID=unknown
+SNAPSHOT_ACTUAL_UUID=unknown
+SNAPSHOT_DEVICE=unknown
+SNAPSHOT_ACTUAL_MOUNT_POINT=unknown
+SNAPSHOT_DEADLINE=null
+SNAPSHOT_DEADLINE_EPOCH=null
+SNAPSHOT_ROUND=null
+SNAPSHOT_PLAINTEXT_PRESENT=false
+SNAPSHOT_CIPHERTEXT_PRESENT=false
+SNAPSHOT_HASH_PRESENT=false
+SNAPSHOT_STATE_VALID=false
+SNAPSHOT_APFS_VALID=false
+SNAPSHOT_APFS_INSPECTED=false
+SNAPSHOT_VALID=false
+SNAPSHOT_ERROR="state has not been inspected"
+RUNTIME_ASSESSMENT=inconsistent
+
+inspect_runtime_state() {
+  local state_json state_fields apfs_plist locked_value uuid_value
+  local device_value mount_value mount_type
+  local locked_valid=false mount_valid=true
+
+  SNAPSHOT_RECORDED_LOCKED=unknown
+  SNAPSHOT_APFS_LOCKED=unknown
+  SNAPSHOT_APFS_MOUNTED=unknown
+  SNAPSHOT_EXPECTED_UUID=unknown
+  SNAPSHOT_ACTUAL_UUID=unknown
+  SNAPSHOT_DEVICE=unknown
+  SNAPSHOT_ACTUAL_MOUNT_POINT=unknown
+  SNAPSHOT_DEADLINE=null
+  SNAPSHOT_DEADLINE_EPOCH=null
+  SNAPSHOT_ROUND=null
+  SNAPSHOT_PLAINTEXT_PRESENT=false
+  SNAPSHOT_CIPHERTEXT_PRESENT=false
+  SNAPSHOT_HASH_PRESENT=false
+  SNAPSHOT_STATE_VALID=false
+  SNAPSHOT_APFS_VALID=false
+  SNAPSHOT_APFS_INSPECTED=false
+  SNAPSHOT_VALID=false
+  SNAPSHOT_ERROR="state file fields are missing or malformed"
+
+  [[ -f "$STATE_DIR/passphrase.txt" ]] \
+    && SNAPSHOT_PLAINTEXT_PRESENT=true
+  [[ -f "$STATE_DIR/passphrase.tle" ]] \
+    && SNAPSHOT_CIPHERTEXT_PRESENT=true
+  [[ -f "$STATE_DIR/passphrase.sha256" ]] \
+    && SNAPSHOT_HASH_PRESENT=true
+
+  [[ -f "$state_file" ]] || {
+    SNAPSHOT_ERROR="state file is missing"
+    return 0
+  }
+  [[ -r "$state_file" ]] || {
+    SNAPSHOT_ERROR="state file is unreadable"
+    return 0
+  }
+  if ! state_json=$(< "$state_file") 2>/dev/null; then
+    SNAPSHOT_ERROR="state file is unreadable"
+    return 0
+  fi
+  state_fields=$(printf '%s' "$state_json" | jq -er '
+    def plain_string:
+      if type == "string" then
+        length > 0 and (test("[[:cntrl:]]") | not)
+      else false end;
+    def optional_string: . == null or plain_string;
+    def optional_uint:
+      if type == "number" then
+        . >= 0 and . <= 999999999999999999 and floor == .
+      else . == null end;
+    if type == "object"
+      and (.locked | type == "boolean")
+      and (.volume_uuid | plain_string)
+      and (.deadline | optional_string)
+      and (.deadline_epoch | optional_uint)
+      and (.round | optional_uint)
+      and (if .locked then
+        (.deadline | plain_string)
+        and (.deadline_epoch | type == "number")
+        and (.round | type == "number")
+      else true end)
+    then [
+      (.locked | tostring),
+      .volume_uuid,
+      (if .deadline == null then "null" else .deadline end),
+      (if .deadline_epoch == null then "null"
+        else (.deadline_epoch | tostring) end),
+      (if .round == null then "null" else (.round | tostring) end)
+    ] | @tsv
+    else error("invalid state") end
+  ' 2>/dev/null) || return 0
+
+  IFS=$'\t' read -r SNAPSHOT_RECORDED_LOCKED SNAPSHOT_EXPECTED_UUID \
+    SNAPSHOT_DEADLINE SNAPSHOT_DEADLINE_EPOCH SNAPSHOT_ROUND \
+    <<< "$state_fields"
+  SNAPSHOT_STATE_VALID=true
+
+  if ! apfs_plist=$(diskutil info -plist "$SNAPSHOT_EXPECTED_UUID" 2>/dev/null); then
+    SNAPSHOT_ERROR="diskutil info failed"
+    return 0
+  fi
+  SNAPSHOT_APFS_INSPECTED=true
+
+  if locked_value=$(printf '%s' "$apfs_plist" \
+      | plutil -extract Locked raw -expect bool -o - - 2>/dev/null); then
+    locked_valid=true
+  else
+    locked_value=unknown
+  fi
+  uuid_value=$(printf '%s' "$apfs_plist" \
+    | plutil -extract VolumeUUID raw -expect string -o - - 2>/dev/null) \
+    || uuid_value=""
+  device_value=$(printf '%s' "$apfs_plist" \
+    | plutil -extract DeviceIdentifier raw -expect string -o - - 2>/dev/null) \
+    || device_value=""
+  if mount_type=$(printf '%s' "$apfs_plist" \
+      | plutil -type MountPoint -o - - 2>/dev/null); then
+    if [[ "$mount_type" == "string" ]]; then
+      mount_value=$(printf '%s' "$apfs_plist" \
+        | plutil -extract MountPoint raw -expect string -o - - 2>/dev/null) \
+        || mount_valid=false
+    else
+      mount_valid=false
+    fi
+  else
+    mount_value=""
+  fi
+
+  SNAPSHOT_ACTUAL_UUID=${uuid_value:-unknown}
+  SNAPSHOT_DEVICE=${device_value:-unknown}
+  if [[ "$mount_valid" == "true" ]]; then
+    SNAPSHOT_ACTUAL_MOUNT_POINT=$mount_value
+    if [[ -n "$mount_value" ]]; then
+      SNAPSHOT_APFS_MOUNTED=true
+    else
+      SNAPSHOT_APFS_MOUNTED=false
+    fi
+  else
+    SNAPSHOT_ACTUAL_MOUNT_POINT=unknown
+    SNAPSHOT_APFS_MOUNTED=unknown
+  fi
+
+  if [[ "$locked_valid" != "true" \
+      || ( "$locked_value" != "true" && "$locked_value" != "false" ) ]]; then
+    SNAPSHOT_ERROR="APFS Locked is missing or malformed"
+    return 0
+  fi
+  SNAPSHOT_APFS_LOCKED=$locked_value
+  if [[ -z "$uuid_value" ]]; then
+    SNAPSHOT_ERROR="APFS volume UUID is missing"
+    return 0
+  fi
+  if [[ "$uuid_value" != "$SNAPSHOT_EXPECTED_UUID" ]]; then
+    SNAPSHOT_ERROR="volume UUID mismatch: expected $SNAPSHOT_EXPECTED_UUID, actual $uuid_value"
+    return 0
+  fi
+  if [[ ! "$device_value" =~ ^disk[[:alnum:]]+$ ]]; then
+    SNAPSHOT_ERROR="APFS device identifier is missing or malformed"
+    return 0
+  fi
+  if [[ "$mount_valid" != "true" ]]; then
+    SNAPSHOT_ERROR="APFS MountPoint is malformed"
+    return 0
+  fi
+
+  SNAPSHOT_APFS_VALID=true
+  SNAPSHOT_VALID=true
+  SNAPSHOT_ERROR=""
+}
+
+classify_runtime_state() {
+  RUNTIME_ASSESSMENT=inconsistent
+  [[ "$SNAPSHOT_VALID" == "true" ]] || return 0
+
+  if [[ "$SNAPSHOT_APFS_LOCKED" == "true" \
+      && "$SNAPSHOT_APFS_MOUNTED" == "true" ]]; then
+    return 0
+  fi
+  if [[ "$SNAPSHOT_APFS_MOUNTED" == "true" \
+      && "$SNAPSHOT_ACTUAL_MOUNT_POINT" != "$MOUNT_POINT" ]]; then
+    return 0
+  fi
+
+  if [[ "$SNAPSHOT_RECORDED_LOCKED" == "false" ]]; then
+    if [[ "$SNAPSHOT_APFS_LOCKED" == "false" \
+        && "$SNAPSHOT_APFS_MOUNTED" == "true" \
+        && "$SNAPSHOT_PLAINTEXT_PRESENT" == "true" ]]; then
+      RUNTIME_ASSESSMENT=usable
+    elif [[ "$SNAPSHOT_APFS_LOCKED" == "false" \
+        && "$SNAPSHOT_APFS_MOUNTED" == "false" \
+        && "$SNAPSHOT_PLAINTEXT_PRESENT" == "true" ]]; then
+      RUNTIME_ASSESSMENT="repairable: run diskutil mount $SNAPSHOT_DEVICE"
+    elif [[ "$SNAPSHOT_APFS_LOCKED" == "true" \
+        && "$SNAPSHOT_APFS_MOUNTED" == "false" \
+        && "$SNAPSHOT_PLAINTEXT_PRESENT" == "true" \
+        && "$SNAPSHOT_HASH_PRESENT" == "true" ]]; then
+      RUNTIME_ASSESSMENT="repairable: run vaultlock unlock"
+    fi
+    return 0
+  fi
+
+  if [[ "$SNAPSHOT_RECORDED_LOCKED" == "true" \
+      && "$SNAPSHOT_APFS_LOCKED" == "true" \
+      && "$SNAPSHOT_APFS_MOUNTED" == "false" \
+      && "$SNAPSHOT_CIPHERTEXT_PRESENT" == "true" \
+      && "$SNAPSHOT_HASH_PRESENT" == "true" \
+      && "$SNAPSHOT_PLAINTEXT_PRESENT" == "false" ]]; then
+    RUNTIME_ASSESSMENT="securely locked"
+  fi
+}
+
+render_runtime_summary() {
+  local actual_mount=unknown plaintext=absent ciphertext=absent hash=absent
+
+  if [[ "$SNAPSHOT_STATE_VALID" == "true" ]]; then
+    if [[ "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
+      note "Recorded: locked until $SNAPSHOT_DEADLINE"
+    else
+      note "Recorded: unlocked"
+    fi
+  else
+    note "Recorded: unknown ($SNAPSHOT_ERROR)"
+  fi
+
+  if [[ "$SNAPSHOT_APFS_VALID" == "true" ]]; then
+    if [[ "$SNAPSHOT_APFS_LOCKED" == "true" ]]; then
+      note "APFS: locked (UUID $SNAPSHOT_ACTUAL_UUID, device $SNAPSHOT_DEVICE)"
+    else
+      note "APFS: unlocked (UUID $SNAPSHOT_ACTUAL_UUID, device $SNAPSHOT_DEVICE)"
+    fi
+  elif [[ "$SNAPSHOT_APFS_INSPECTED" == "true" ]]; then
+    note "APFS: unknown ($SNAPSHOT_ERROR)"
+  elif [[ "$SNAPSHOT_STATE_VALID" == "true" ]]; then
+    note "APFS: unknown ($SNAPSHOT_ERROR)"
+  else
+    note "APFS: unknown (not inspected: invalid state snapshot)"
+  fi
+
+  if [[ "$SNAPSHOT_APFS_INSPECTED" == "true" ]]; then
+    if [[ -n "$SNAPSHOT_ACTUAL_MOUNT_POINT" ]]; then
+      actual_mount=$SNAPSHOT_ACTUAL_MOUNT_POINT
+    else
+      actual_mount="not mounted"
+    fi
+  fi
+  note "Mount: expected $MOUNT_POINT, actual $actual_mount"
+
+  [[ "$SNAPSHOT_PLAINTEXT_PRESENT" == "true" ]] && plaintext=present
+  [[ "$SNAPSHOT_CIPHERTEXT_PRESENT" == "true" ]] && ciphertext=present
+  [[ "$SNAPSHOT_HASH_PRESENT" == "true" ]] && hash=present
+  note "Recovery: plaintext $plaintext, ciphertext $ciphertext, hash $hash"
+  note "Assessment: $RUNTIME_ASSESSMENT"
+
+  if [[ "$SNAPSHOT_STATE_VALID" == "true" \
+      && "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
+    note "remaining: $(remaining_human "$SNAPSHOT_DEADLINE_EPOCH")"
+    note "drand round: target $SNAPSHOT_ROUND, current $(current_round)"
+    note "when the deadline passes: vaultlock unlock (needs internet)"
+  fi
+}
+
 # Resolve the volume's current device node (diskXsY) from its stable UUID.
 # Device numbers can change across reboots, the UUID cannot.
 vol_device() {
@@ -678,26 +942,9 @@ cmd_unlock() {
 }
 
 cmd_status() {
-  [[ -f "$state_file" ]] || die "no state, run vaultlock init first"
-  local locked deadline round dev
-  locked=$(state_get .locked)
-  deadline=$(state_get .deadline)
-  round=$(state_get .round)
-  dev=$(vol_device) || dev=""
-  if [[ "$locked" == "true" ]]; then
-    note "LOCKED until $deadline"
-    note "remaining: $(remaining_human "$(state_get .deadline_epoch)")"
-    note "drand round: target $round, current $(current_round)"
-    note "when the deadline passes: vaultlock unlock (needs internet)"
-  else
-    if "$MOUNT_COMMAND" | grep -Fq -- "on $MOUNT_POINT ("; then
-      note "UNLOCKED (mounted at $MOUNT_POINT)"
-    else
-      note "UNLOCKED (not mounted)"
-    fi
-    [[ "$deadline" != "null" ]] && note "previous deadline: $deadline"
-  fi
-  [[ -n "$dev" ]] && diskutil info "$dev" | grep -E 'Volume Name|FileVault|Mounted' || true
+  inspect_runtime_state
+  classify_runtime_state
+  render_runtime_summary
 }
 
 usage() {
