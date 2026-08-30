@@ -27,8 +27,92 @@ CONFIRM_DEVICE=${VAULTLOCK_CONFIRM_DEVICE:-/dev/tty}
 KEYCHAIN_SERVICE="vaultlock-$VOLUME"
 state_file="$STATE_DIR/state.json"
 
+OPTION_DRY_RUN=false
+OPTION_YES=false
+OPTION_HOOKS=true
+OPTION_OPERANDS=""
+
 die() { printf 'vaultlock: %s\n' "$*" >&2; exit 1; }
+die_usage() { printf 'vaultlock: %s\n' "$*" >&2; exit 64; }
 note() { printf '%s\n' "$*"; }
+
+validate_command_options() { # command operands
+  local command=$1
+  shift
+
+  case "$command" in
+    init)
+      [[ "$OPTION_HOOKS" == "true" ]] \
+        || die_usage "--no-hooks is not valid for init"
+      [[ $# -eq 0 ]] \
+        || die_usage "usage: vaultlock init [--dry-run] [--yes]"
+      ;;
+    adopt)
+      [[ "$OPTION_HOOKS" == "true" ]] \
+        || die_usage "--no-hooks is not valid for adopt"
+      [[ $# -eq 1 ]] \
+        || die_usage "usage: vaultlock adopt [--dry-run] [--yes] <directory>"
+      OPTION_OPERANDS=$1
+      ;;
+    lock)
+      [[ $# -gt 0 ]] \
+        || die_usage "usage: vaultlock lock [--dry-run] [--yes] [--no-hooks] <deadline>"
+      OPTION_OPERANDS=$*
+      ;;
+    unlock)
+      [[ "$OPTION_YES" == "false" ]] \
+        || die_usage "--yes is not valid for unlock"
+      [[ $# -eq 0 ]] \
+        || die_usage "usage: vaultlock unlock [--dry-run] [--no-hooks]"
+      ;;
+    *)
+      die_usage "unknown command: $command"
+      ;;
+  esac
+}
+
+parse_command_options() { # command argv
+  local command=$1 argument
+  shift
+  OPTION_DRY_RUN=false
+  OPTION_YES=false
+  OPTION_HOOKS=true
+  OPTION_OPERANDS=""
+
+  while [[ $# -gt 0 && $1 == --* ]]; do
+    argument=$1
+    shift
+    case "$argument" in
+      --dry-run) OPTION_DRY_RUN=true ;;
+      --yes) OPTION_YES=true ;;
+      --no-hooks) OPTION_HOOKS=false ;;
+      *) die_usage "unknown $command option: $argument" ;;
+    esac
+  done
+
+  for argument in "$@"; do
+    [[ "$argument" != --* ]] \
+      || die_usage "options must precede $command operands: $argument"
+  done
+  validate_command_options "$command" "$@"
+}
+
+confirmation_accepts() { # response
+  local response
+  response=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  [[ "$response" == "y" || "$response" == "yes" ]]
+}
+
+confirm_plan() {
+  local response
+  [[ "$OPTION_DRY_RUN" == "false" ]] || return 0
+  [[ "$OPTION_YES" == "false" ]] || return 0
+  [[ -r "$CONFIRM_DEVICE" && -w "$CONFIRM_DEVICE" ]] \
+    || die "confirmation requires a terminal, rerun with --yes"
+  printf 'Proceed? [y/N] ' >"$CONFIRM_DEVICE"
+  IFS= read -r response <"$CONFIRM_DEVICE" || response=""
+  confirmation_accepts "$response" || die "cancelled, no changes made"
+}
 
 tle_bin() {
   if command -v tle; then return 0; fi
@@ -638,6 +722,30 @@ EOF
 case "${1:-}" in
   __round) round_for_epoch "$2" ;;
   __parse) parse_deadline "$2" ;;
+  __options)
+    [[ $# -ge 2 ]] \
+      || die_usage "usage: vaultlock __options <command> [arguments...]"
+    shift
+    parse_command_options "$@"
+    printf 'dry_run=%s\nyes=%s\nhooks=%s\noperands=%s\n' \
+      "$OPTION_DRY_RUN" "$OPTION_YES" "$OPTION_HOOKS" "$OPTION_OPERANDS"
+    ;;
+  __confirm_response)
+    [[ $# -eq 2 ]] \
+      || die_usage "usage: vaultlock __confirm_response <response>"
+    if confirmation_accepts "$2"; then
+      note true
+    else
+      note false
+    fi
+    ;;
+  __confirm_plan)
+    [[ $# -eq 3 ]] \
+      || die_usage "usage: vaultlock __confirm_plan <dry_run> <yes>"
+    OPTION_DRY_RUN=$2
+    OPTION_YES=$3
+    confirm_plan
+    ;;
   __deadline)
     now=${2:?usage: vaultlock __deadline <now_epoch> <expression>}
     shift 2

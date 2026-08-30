@@ -169,7 +169,7 @@ for fake_command in diskutil security sudo tle tmutil curl mount \
   ln -s "$TEST_SELF" "$fake_bin/$fake_command"
 done
 
-for read_only_utility in jq plutil grep; do
+for read_only_utility in cat jq plutil grep tr; do
   utility_path=$(command -v "$read_only_utility") \
     || { printf 'missing test utility: %s\n' "$read_only_utility" >&2; exit 1; }
   case "$utility_path" in
@@ -218,6 +218,11 @@ check_empty() { # description file
   fi
 }
 
+record_failure() { # description
+  printf 'FAIL %s\n' "$1"
+  fail=1
+}
+
 run_vaultlock() {
   HOME="$test_home" \
   PATH="$fake_bin" \
@@ -230,6 +235,21 @@ run_vaultlock() {
   VAULTLOCK_TEST_ACTION_LOG="$action_log" \
   VAULTLOCK_TEST_APFS_STATE="$apfs_state" \
     /bin/bash "$VL" "$@"
+}
+
+reject_options() { # description command argv
+  local description=$1 command=$2 status
+  shift 2
+  if run_vaultlock __options "$command" "$@" \
+      >"$test_root/options-output" 2>"$test_root/options-error"; then
+    record_failure "$description: unexpectedly accepted"
+    return
+  else
+    status=$?
+  fi
+  check "$description exits with usage status" 64 "$status"
+  check_contains "$description reports a parser error" "vaultlock:" \
+    "$(< "$test_root/options-error")"
 }
 
 write_json_state() { # locked deadline deadline_epoch round uuid
@@ -296,5 +316,67 @@ printf '%s\n' "$test_root/Volumes/vaultXtest" \
 output=$(run_vaultlock status)
 check_contains "mount point matching is literal" \
   "UNLOCKED (not mounted)" "$output"
+
+check "lock option order" \
+  $'dry_run=true\nyes=true\nhooks=false\noperands=2:00 +2d' \
+  "$(run_vaultlock __options lock --yes --no-hooks --dry-run 2:00 +2d)"
+
+check "init accepts yes and dry-run" \
+  $'dry_run=true\nyes=true\nhooks=true\noperands=' \
+  "$(run_vaultlock __options init --yes --dry-run)"
+check "lock accepts yes and dry-run" \
+  $'dry_run=true\nyes=true\nhooks=true\noperands=20h' \
+  "$(run_vaultlock __options lock --dry-run --yes 20h)"
+check "adopt accepts dry-run and yes" \
+  $'dry_run=true\nyes=true\nhooks=true\noperands=source directory' \
+  "$(run_vaultlock __options adopt --dry-run --yes 'source directory')"
+check "unlock accepts dry-run and no-hooks" \
+  $'dry_run=true\nyes=false\nhooks=false\noperands=' \
+  "$(run_vaultlock __options unlock --no-hooks --dry-run)"
+
+reject_options "unlock rejects yes" unlock --yes
+reject_options "adopt rejects option after operand" adopt source --dry-run
+reject_options "init rejects operands" init extra
+reject_options "unlock rejects operands" unlock extra
+reject_options "init rejects unknown options" init --unknown
+reject_options "adopt rejects extra operands" adopt source extra
+reject_options "init rejects no-hooks" init --no-hooks
+reject_options "adopt rejects no-hooks" adopt --no-hooks source
+
+check "confirmation accepts y" true \
+  "$(run_vaultlock __confirm_response y)"
+check "confirmation accepts yes case-insensitively" true \
+  "$(run_vaultlock __confirm_response YES)"
+check "confirmation rejects empty" false \
+  "$(run_vaultlock __confirm_response '')"
+
+missing_confirm_device="$test_root/missing-confirm-device"
+if HOME="$test_home" PATH="$fake_bin" \
+    VAULTLOCK_CONFIRM_DEVICE="$missing_confirm_device" \
+    /bin/bash "$VL" __confirm_plan false false \
+      >"$test_root/confirm-output" 2>"$test_root/confirm-error"; then
+  record_failure "confirmation without a device must fail"
+else
+  check_contains "non-interactive confirmation hint" "rerun with --yes" \
+    "$(< "$test_root/confirm-error")"
+fi
+
+if HOME="$test_home" PATH="$fake_bin" \
+    VAULTLOCK_CONFIRM_DEVICE="$missing_confirm_device" \
+    /bin/bash "$VL" __confirm_plan true false \
+      >"$test_root/confirm-output" 2>"$test_root/confirm-error"; then
+  printf 'ok   dry-run bypasses confirmation device\n'
+else
+  record_failure "dry-run must bypass confirmation device"
+fi
+
+if HOME="$test_home" PATH="$fake_bin" \
+    VAULTLOCK_CONFIRM_DEVICE="$missing_confirm_device" \
+    /bin/bash "$VL" __confirm_plan false true \
+      >"$test_root/confirm-output" 2>"$test_root/confirm-error"; then
+  printf 'ok   yes bypasses confirmation device\n'
+else
+  record_failure "yes must bypass confirmation device"
+fi
 
 exit "$fail"
