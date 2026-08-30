@@ -888,6 +888,16 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       /bin/mkdir "$@" || exit 1
       fixture_mkdir_path=""
       for fixture_argument in "$@"; do fixture_mkdir_path=$fixture_argument; done
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/inherit_operation_lock_acl" \
+          && "$fixture_mkdir_path" == "$HOME/.vaultlock-operation.lock" ]]; then
+        /bin/chmod +a 'everyone allow read,file_inherit,directory_inherit' \
+          "$fixture_mkdir_path" || exit 1
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/inherit_adopt_reservation_acl" \
+          && "$fixture_mkdir_path" == *.vaultlock-backup ]]; then
+        /bin/chmod +a 'everyone allow read,file_inherit,directory_inherit' \
+          "$fixture_mkdir_path" || exit 1
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_operation_lock_mkdir" \
           && "$fixture_mkdir_path" == "$HOME/.vaultlock-operation.lock" ]]; then
         fixture_mkdir_signal=$(< \
@@ -914,7 +924,37 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           && "$fixture_chmod_path" == "$VAULTLOCK_STATE_DIR"/.passphrase.* ]]; then
         exit 1
       fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_operation_lock_acl_removal" \
+          && "$fixture_chmod_mode" == "-N" \
+          && "$fixture_chmod_path" == "$HOME/.vaultlock-operation.lock" ]]; then
+        exit 1
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_adopt_reservation_acl_removal" \
+          && "$fixture_chmod_mode" == "-N" \
+          && "$fixture_chmod_path" == *.vaultlock-backup ]]; then
+        exit 1
+      fi
       /bin/chmod "$@"
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/tamper_hardlink_metadata_acl" \
+          && "$fixture_chmod_mode" == "-N" \
+          && "$fixture_chmod_path" == */vaultlock-hardlinks.* ]]; then
+        fixture_hardlink_artifact=$(< \
+          "$VAULTLOCK_TEST_APFS_STATE/tamper_hardlink_metadata_acl")
+        fixture_hardlink_match=false
+        case "$fixture_hardlink_artifact:$fixture_chmod_path" in
+          map:*vaultlock-hardlinks.*.raw|map:*vaultlock-hardlinks.*.sorted|map:*vaultlock-hardlinks.*.grouped) ;;
+          map:*) fixture_hardlink_match=true ;;
+          raw:*.raw|sorted:*.sorted|grouped:*.grouped)
+            fixture_hardlink_match=true
+            ;;
+        esac
+        if [[ "$fixture_hardlink_match" == true ]]; then
+          /bin/chmod +a 'everyone allow read' "$fixture_chmod_path" \
+            || exit 1
+          printf '%s\n' "$fixture_chmod_path" \
+            > "$VAULTLOCK_TEST_APFS_STATE/tampered_hardlink_metadata_path"
+        fi
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/quarantine_made_nonprivate" \
           && "$fixture_chmod_mode" == "700" \
           && "$fixture_chmod_path" == "$VAULTLOCK_STATE_DIR"/.state-quarantine.* ]]; then
@@ -928,6 +968,16 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     if [[ -f "$VAULTLOCK_TEST_APFS_STATE/inherit_recovery_acl" \
       && "$fixture_mktemp_path" == "$VAULTLOCK_STATE_DIR/.passphrase."* ]]; then
       /bin/chmod +a 'everyone allow read' "$fixture_mktemp_path" || exit 1
+    fi
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/inherit_operation_owner_acl" \
+        && "$fixture_mktemp_path" == "$HOME/.vaultlock-operation.lock/.owner."* ]]; then
+      /bin/chmod +a 'everyone allow read' "$fixture_mktemp_path" || exit 1
+    fi
+    if [[ -f "$VAULTLOCK_TEST_APFS_STATE/inherit_adopt_quarantine_acl" \
+        && -d "$fixture_mktemp_path" \
+        && "$fixture_mktemp_path" == *.vaultlock-quarantine.* ]]; then
+      /bin/chmod +a 'everyone allow read,file_inherit,directory_inherit' \
+        "$fixture_mktemp_path" || exit 1
     fi
     printf '%s\n' "$fixture_mktemp_path"
     if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_operation_owner_mktemp" \
@@ -995,6 +1045,26 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
             "$fixture_subject/.vaultlock"
           /bin/ln -s "$fixture_subject/.vaultlock" \
             "$VAULTLOCK_STATE_DIR"
+          ;;
+        operation_lock_acl_tamper)
+          /bin/chmod +a 'everyone allow read' "$fixture_subject"
+          ;;
+        adopt_quarantine_acl_tamper)
+          /bin/chmod +a 'everyone allow read' "$fixture_subject"
+          ;;
+        adopt_skeleton_acl_inherit|adopt_skeleton_acl_tamper)
+          /bin/chmod +a 'everyone allow read' "$fixture_subject"
+          ;;
+        adopt_current_snapshot_acl_tamper)
+          /bin/chmod +a 'everyone allow read' "$fixture_subject"
+          printf 'tampered current snapshot\n' >> "$fixture_subject"
+          printf '%s\n' "$fixture_subject" \
+            > "$VAULTLOCK_TEST_APFS_STATE/tampered_current_snapshot_path"
+          ;;
+        state_file_retarget_into_source)
+          /bin/rm -f "$VAULTLOCK_STATE_DIR/state.json"
+          /bin/ln -s "$fixture_subject/retarget-state.json" \
+            "$VAULTLOCK_STATE_DIR/state.json"
           ;;
       owner_identity_swap)
         /bin/mv "$fixture_subject" "$fixture_subject.pre-transition"
@@ -1399,6 +1469,9 @@ reset_operation_lock_fixture() {
     "$apfs_state/token_generated_twice" \
     "$apfs_state/ps_ambiguous" \
     "$apfs_state/ps_timezone_sensitive" \
+    "$apfs_state/inherit_operation_lock_acl" \
+    "$apfs_state/inherit_operation_owner_acl" \
+    "$apfs_state/fail_operation_lock_acl_removal" \
     "$apfs_state/signal_ditto" \
     "$apfs_state/signal_operation_lock_mkdir" \
     "$apfs_state/signal_operation_owner_mktemp" \
@@ -2396,6 +2469,12 @@ reset_adopt_fixture() {
     "$apfs_state/drop_copy_acl" "$apfs_state/break_copy_hardlink" \
     "$apfs_state/normalize_copy_directory_metadata" \
     "$apfs_state/drop_copy_birthtime" \
+    "$apfs_state/inherit_adopt_reservation_acl" \
+    "$apfs_state/fail_adopt_reservation_acl_removal" \
+    "$apfs_state/inherit_adopt_quarantine_acl" \
+    "$apfs_state/tamper_hardlink_metadata_acl" \
+    "$apfs_state/tampered_hardlink_metadata_path" \
+    "$apfs_state/tampered_current_snapshot_path" \
     "$apfs_state/count_directory_traversals" \
     "$apfs_state/directory_traversal_count" \
     "$apfs_state/rename_copy_trailing_newline" \
@@ -2412,6 +2491,7 @@ reset_adopt_fixture() {
     "$apfs_state/swap_mount_device_after_copy" \
     "$apfs_state/transition_adopt_copy_before_source_identity_check" \
     "$apfs_state/transition_adopt_verify_before_destination_identity_check" \
+    "$apfs_state/transition_adopt_before_current_directory_snapshot_cleanup" \
     "$apfs_state/named_source_identity_swap" \
     "$apfs_state/named_destination_identity_swap" \
     "$apfs_state/fail_ln" \
@@ -2611,6 +2691,39 @@ external_hardlink_source=$(new_adopt_source external-hardlink)
 expect_adopt_precopy_manifest_refusal \
   "adopt rejects hardlinks outside the source tree" - \
   "$external_hardlink_source"
+
+for hardlink_metadata_artifact in map raw sorted grouped; do
+  reset_adopt_fixture
+  hardlink_metadata_source=$(new_adopt_source \
+    "hardlink-metadata-$hardlink_metadata_artifact")
+  printf '%s\n' "$hardlink_metadata_artifact" \
+    > "$apfs_state/tamper_hardlink_metadata_acl"
+  expect_adopt_precopy_manifest_refusal \
+    "adopt rejects $hardlink_metadata_artifact hardlink metadata ACL tamper" \
+    - "$hardlink_metadata_source"
+  if [[ -f "$apfs_state/tampered_hardlink_metadata_path" ]]; then
+    hardlink_metadata_retained=$(< \
+      "$apfs_state/tampered_hardlink_metadata_path")
+    if [[ -f "$hardlink_metadata_retained" \
+        && ! -L "$hardlink_metadata_retained" \
+        && "$hardlink_metadata_retained" == */vaultlock-hardlinks.* ]]; then
+      hardlink_metadata_acl_count=$(/bin/ls -ldeB \
+        "$hardlink_metadata_retained" | /usr/bin/tail -n +2 \
+        | /usr/bin/wc -l | /usr/bin/tr -d '[:space:]')
+      [[ "$hardlink_metadata_acl_count" -ge 1 ]] \
+        || record_failure \
+          "adopt retains ACL-tampered $hardlink_metadata_artifact hardlink metadata"
+      /bin/chmod -N "$hardlink_metadata_retained"
+      /bin/rm -f -- "$hardlink_metadata_retained"
+    else
+      record_failure \
+        "adopt retains ACL-tampered $hardlink_metadata_artifact hardlink metadata"
+    fi
+  else
+    record_failure \
+      "adopt retains ACL-tampered $hardlink_metadata_artifact hardlink metadata"
+  fi
+done
 
 reset_adopt_fixture
 trailing_newline_source=$(new_adopt_source trailing-newline-loss)
@@ -4293,7 +4406,8 @@ if reserved_drift_output=$(run_vaultlock adopt --yes \
   record_failure "adopt rejects reserved relationship drift after operation lock"
 else
   check_contains "adopt reserved relationship drift reports cause" \
-    'contains reserved vaultlock control path' "$reserved_drift_output"
+    'reserved state directory must be a real directory' \
+    "$reserved_drift_output"
 fi
 check_count "adopt reserved relationship drift reaches no copy" 0 \
   'ditto ' "$mutation_log"
@@ -4425,6 +4539,301 @@ for release_boundary in owner-unlink directory-remove; do
         "operation release $release_boundary completes after $release_signal"
   done
 done
+
+# Approval-review regressions: private ACLs and canonical state leaves.
+reset_operation_lock_fixture
+reset_adopt_fixture
+acl_lock_source=$(new_adopt_source adopt-acl-operation-lock)
+: > "$apfs_state/inherit_operation_lock_acl"
+: > "$apfs_state/inherit_operation_owner_acl"
+: > "$apfs_state/hold_ditto"
+start_vaultlock_background "$test_root/acl-lock-output" \
+  adopt --yes "$acl_lock_source"
+acl_lock_pid=$BACKGROUND_VAULTLOCK_PID
+if ! wait_for_fixture "$apfs_state/ditto_entered"; then
+  record_failure "ACL lock fixture reaches held operation"
+fi
+acl_lock_dir_count=$(/bin/ls -ldeB "$operation_lock_dir" \
+  | /usr/bin/sed -n '2,$p' | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+acl_lock_owner_count=$(/bin/ls -ldeB "$operation_lock_dir/owner" \
+  | /usr/bin/sed -n '2,$p' | /usr/bin/wc -l | /usr/bin/tr -d ' ')
+check "operation lock creation removes inherited directory ACL" 0 \
+  "$acl_lock_dir_count"
+check "operation lock creation removes inherited owner ACL" 0 \
+  "$acl_lock_owner_count"
+: > "$apfs_state/release_ditto"
+if wait "$acl_lock_pid"; then
+  :
+else
+  record_failure "ACL lock fixture completes after release"
+fi
+/bin/rm -rf -- "${acl_lock_source:?}" \
+  "${mount_point:?}/adopt-acl-operation-lock"
+
+reset_operation_lock_fixture
+reset_init_fixture
+: > "$apfs_state/inherit_operation_lock_acl"
+: > "$apfs_state/fail_operation_lock_acl_removal"
+if lock_acl_removal_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "operation lock ACL removal failure exits nonzero"
+else
+  check_contains "operation lock ACL removal failure reports cause" \
+    'cannot remove operation lock directory ACL' "$lock_acl_removal_output"
+fi
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "operation lock ACL removal failure retains directory"
+check_count "operation lock ACL removal failure reaches no APFS mutation" 0 \
+  'diskutil apfs addVolume' "$mutation_log"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+acl_inspect_source=$(new_adopt_source adopt-acl-lock-inspect)
+create_operation_lock 12345 "$fake_process_start" adopt "$fake_operation_token"
+/bin/chmod +a 'everyone allow read' "$operation_lock_dir"
+/bin/chmod +a 'everyone allow read' "$operation_lock_dir/owner"
+if acl_inspect_output=$(run_vaultlock adopt --yes "$acl_inspect_source" 2>&1); then
+  record_failure "operation lock inspection rejects ACL-bearing owner"
+else
+  check_contains "operation lock inspection reports malformed ACL owner" \
+    'malformed operation lock owner' "$acl_inspect_output"
+fi
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "operation lock inspection preserves ACL-bearing lock"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+acl_stale_source=$(new_adopt_source adopt-acl-stale-quarantine)
+create_operation_lock 999999 "$fake_process_start" adopt "$fake_operation_token"
+printf 'operation_lock_acl_tamper\n' \
+  > "$apfs_state/transition_operation_lock_after_quarantine_move"
+if acl_stale_output=$(run_vaultlock adopt --yes "$acl_stale_source" 2>&1); then
+  record_failure "stale operation quarantine rejects ACL tamper"
+else
+  check_contains "stale operation quarantine reports ACL tamper" \
+    'stale operation lock quarantine changed after move' "$acl_stale_output"
+fi
+acl_stale_quarantine=$(find "$test_home" -maxdepth 1 -type d \
+  -name '.vaultlock-operation.lock.quarantine.*' -print -quit)
+[[ -n "$acl_stale_quarantine" ]] \
+  || record_failure "stale operation ACL quarantine is retained"
+/bin/rm -rf -- "${acl_stale_source:?}" \
+  "${mount_point:?}/adopt-acl-stale-quarantine"
+
+reset_operation_lock_fixture
+reset_init_fixture
+printf 'operation_lock_acl_tamper\n' \
+  > "$apfs_state/transition_operation_lock_before_release"
+if acl_release_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "operation lock release rejects ACL tamper"
+else
+  check_contains "operation lock release reports retained ACL lock" \
+    'operation lock retained' "$acl_release_output"
+fi
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "operation lock release retains ACL-tampered lock"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+acl_reservation_source=$(new_adopt_source adopt-acl-reservation)
+: > "$apfs_state/inherit_adopt_reservation_acl"
+printf 'TERM\n' > "$apfs_state/signal_adopt_reservation_creation"
+if acl_reservation_output=$(run_vaultlock adopt --yes \
+    "$acl_reservation_source" 2>&1); then
+  acl_reservation_status=0
+else
+  acl_reservation_status=$?
+fi
+: "$acl_reservation_output"
+check "adopt inherited reservation ACL preserves TERM status" 143 \
+  "$acl_reservation_status"
+if ! grep -E 'chmod -N .*adopt-acl-reservation\.vaultlock-backup' \
+    "$action_log" >/dev/null; then
+  record_failure "adopt removes inherited backup reservation ACL"
+fi
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+acl_reservation_failure_source=$(new_adopt_source \
+  adopt-acl-reservation-failure)
+: > "$apfs_state/inherit_adopt_reservation_acl"
+: > "$apfs_state/fail_adopt_reservation_acl_removal"
+if acl_reservation_failure_output=$(run_vaultlock adopt --yes \
+    "$acl_reservation_failure_source" 2>&1); then
+  record_failure "adopt reservation ACL removal failure exits nonzero"
+else
+  check_contains "adopt reservation ACL removal failure reports cause" \
+    'cannot remove backup reservation ACL' \
+    "$acl_reservation_failure_output"
+fi
+[[ -d "$acl_reservation_failure_source" \
+    && ! -L "$acl_reservation_failure_source" ]] \
+  || record_failure "adopt reservation ACL failure preserves source"
+[[ -d "$acl_reservation_failure_source.vaultlock-backup" ]] \
+  || record_failure "adopt reservation ACL failure retains reservation"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+acl_quarantine_source=$(new_adopt_source adopt-acl-quarantine)
+: > "$apfs_state/inherit_adopt_quarantine_acl"
+if acl_quarantine_output=$(run_vaultlock adopt --yes \
+    "$acl_quarantine_source" 2>&1); then
+  :
+else
+  record_failure "adopt removes inherited quarantine ACL: $acl_quarantine_output"
+fi
+if ! grep -E 'chmod -N .*\.vaultlock-quarantine\.' \
+    "$action_log" >/dev/null; then
+  record_failure "adopt removes inherited backup quarantine ACL"
+fi
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+acl_quarantine_tamper_source=$(new_adopt_source \
+  adopt-acl-quarantine-tamper)
+printf 'adopt_quarantine_acl_tamper\n' \
+  > "$apfs_state/transition_adopt_after_backup_quarantine_move"
+if acl_quarantine_tamper_output=$(run_vaultlock adopt --yes \
+    "$acl_quarantine_tamper_source" 2>&1); then
+  record_failure "adopt quarantine rejects ACL tamper"
+else
+  check_contains "adopt quarantine ACL tamper reports retained backup" \
+    'backup quarantine verification failed' \
+    "$acl_quarantine_tamper_output"
+fi
+acl_quarantine_tamper_path=$(find "$test_root" -maxdepth 1 -type d \
+  -name 'adopt-acl-quarantine-tamper.vaultlock-quarantine.*' \
+  -print -quit)
+[[ -n "$acl_quarantine_tamper_path" ]] \
+  || record_failure "adopt ACL-tampered quarantine is retained"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+acl_skeleton_source=$(new_adopt_source adopt-acl-skeleton)
+printf 'adopt_skeleton_acl_inherit\n' \
+  > "$apfs_state/transition_adopt_after_directory_skeleton_created"
+if acl_skeleton_output=$(run_vaultlock adopt --yes \
+    "$acl_skeleton_source" 2>&1); then
+  :
+else
+  record_failure "adopt removes inherited skeleton ACL: $acl_skeleton_output"
+fi
+if ! grep -E 'chmod -N .*\.directory-skeleton' \
+    "$action_log" >/dev/null; then
+  record_failure "adopt removes directory skeleton ACL"
+fi
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+acl_skeleton_tamper_source=$(new_adopt_source \
+  adopt-acl-skeleton-tamper)
+printf 'adopt_skeleton_acl_tamper\n' \
+  > "$apfs_state/transition_adopt_before_directory_skeleton_cleanup"
+if acl_skeleton_tamper_output=$(run_vaultlock adopt --yes \
+    "$acl_skeleton_tamper_source" 2>&1); then
+  record_failure "adopt skeleton cleanup rejects ACL tamper"
+else
+  check_contains "adopt skeleton ACL tamper reports retained quarantine" \
+    'directory skeleton changed' "$acl_skeleton_tamper_output"
+fi
+acl_skeleton_tamper_path=$(find "$test_root" -maxdepth 1 -type d \
+  -name 'adopt-acl-skeleton-tamper.vaultlock-quarantine.*' \
+  -print -quit)
+[[ -n "$acl_skeleton_tamper_path" ]] \
+  || record_failure "adopt skeleton ACL quarantine is retained"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+acl_current_snapshot_source=$(new_adopt_source \
+  adopt-acl-current-snapshot-tamper)
+printf 'adopt_current_snapshot_acl_tamper\n' \
+  > "$apfs_state/transition_adopt_before_current_directory_snapshot_cleanup"
+if acl_current_snapshot_output=$(run_vaultlock adopt --yes \
+    "$acl_current_snapshot_source" 2>&1); then
+  record_failure "adopt current snapshot cleanup rejects ACL tamper"
+else
+  check_contains "adopt current snapshot ACL tamper reports retained snapshot" \
+    'current directory snapshot changed' "$acl_current_snapshot_output"
+fi
+if [[ -f "$apfs_state/tampered_current_snapshot_path" ]]; then
+  acl_current_snapshot_path=$(< \
+    "$apfs_state/tampered_current_snapshot_path")
+  [[ -f "$acl_current_snapshot_path" && ! -L "$acl_current_snapshot_path" ]] \
+    || record_failure "adopt ACL-tampered current snapshot is retained"
+  acl_current_snapshot_count=$(/bin/ls -ldeB "$acl_current_snapshot_path" \
+    | /usr/bin/tail -n +2 | /usr/bin/wc -l \
+    | /usr/bin/tr -d '[:space:]')
+  [[ "$acl_current_snapshot_count" -ge 1 ]] \
+    || record_failure "adopt retained current snapshot keeps tampered ACL"
+  acl_current_snapshot_quarantine=${acl_current_snapshot_path%/*}
+  /bin/chmod -RN "$acl_current_snapshot_quarantine"
+  /bin/rm -rf -- "$acl_current_snapshot_quarantine"
+else
+  record_failure "adopt ACL-tampered current snapshot is retained"
+fi
+/bin/rm -rf -- "${acl_current_snapshot_source:?}" \
+  "${mount_point:?}/adopt-acl-current-snapshot-tamper"
+
+for state_symlink_case in direct canonical-alias; do
+  reset_operation_lock_fixture
+  reset_adopt_fixture
+  state_symlink_source=$(new_adopt_source \
+    "adopt-state-symlink-$state_symlink_case")
+  /bin/mv "$state_dir/state.json" "$state_symlink_source/control-state.json"
+  if [[ "$state_symlink_case" == canonical-alias ]]; then
+    /bin/ln -s "$state_symlink_source" "$test_root/state-target-alias"
+    state_symlink_target=$test_root/state-target-alias/control-state.json
+  else
+    state_symlink_target=$state_symlink_source/control-state.json
+  fi
+  /bin/ln -s "$state_symlink_target" "$state_dir/state.json"
+  if state_symlink_output=$(run_vaultlock adopt --dry-run \
+      "$state_symlink_source" 2>&1); then
+    record_failure "adopt rejects $state_symlink_case state file symlink"
+  else
+    check_contains "adopt $state_symlink_case state symlink reports cause" \
+      'reserved state file must be a real file' "$state_symlink_output"
+  fi
+  /bin/rm -f "$state_dir/state.json" "$test_root/state-target-alias"
+  /bin/mv "$state_symlink_source/control-state.json" \
+    "$state_dir/state.json"
+  /bin/rm -rf -- "${state_symlink_source:?}"
+done
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+state_retarget_source=$(new_adopt_source adopt-state-retarget)
+/bin/cp "$state_dir/state.json" "$state_retarget_source/retarget-state.json"
+printf 'state_file_retarget_into_source\n' \
+  > "$apfs_state/transition_plan_revalidation_before_inspection"
+if state_retarget_output=$(run_vaultlock adopt --yes \
+    "$state_retarget_source" 2>&1); then
+  record_failure "adopt rejects state file retarget after operation lock"
+else
+  check_contains "adopt state retarget reports symlink cause" \
+    'reserved state file must be a real file' "$state_retarget_output"
+fi
+/bin/rm -f "$state_dir/state.json"
+/bin/mv "$state_retarget_source/retarget-state.json" "$state_dir/state.json"
+/bin/rm -rf -- "${state_retarget_source:?}" \
+  "${mount_point:?}/adopt-state-retarget"
+
+reset_operation_lock_fixture
+reset_adopt_fixture
+state_dir_real=$test_root/state-dir-real
+/bin/mv "$state_dir" "$state_dir_real"
+/bin/ln -s "$state_dir_real" "$state_dir"
+state_dir_symlink_source=$(new_adopt_source adopt-state-dir-symlink)
+if state_dir_symlink_output=$(run_vaultlock adopt --dry-run \
+    "$state_dir_symlink_source" 2>&1); then
+  record_failure "adopt rejects symlink state directory"
+else
+  check_contains "adopt state directory symlink reports cause" \
+    'reserved state directory must be a real directory' \
+    "$state_dir_symlink_output"
+fi
+/bin/rm -f "$state_dir"
+/bin/mv "$state_dir_real" "$state_dir"
+/bin/rm -rf -- "${state_dir_symlink_source:?}"
 
 reset_operation_lock_fixture
 

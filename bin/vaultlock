@@ -95,6 +95,7 @@ OPERATION_LOCK_TEMP_DIGEST=""
 OPERATION_SIGNAL_DEFERRED=false
 OPERATION_PENDING_SIGNAL=""
 INSPECTED_LOCK_DIR_IDENTITY=""
+INSPECTED_LOCK_DIR_LINK_COUNT=""
 INSPECTED_LOCK_OWNER_IDENTITY=""
 INSPECTED_LOCK_OWNER_DIGEST=""
 INSPECTED_LOCK_PID=""
@@ -131,6 +132,7 @@ ADOPT_COPY_VERIFIED=false
 ADOPT_STAGED_LINK=""
 ADOPT_STAGED_LINK_IDENTITY=""
 ADOPT_STAGED_LINK_TARGET=""
+ADOPT_STAGED_LINK_MODE=""
 ADOPT_BACKUP=""
 ADOPT_BACKUP_RESERVATION=""
 ADOPT_BACKUP_RESERVATION_IDENTITY=""
@@ -690,6 +692,46 @@ run_named_transition() { # transition subject
     || "$TRANSITION_COMMAND" "$1" "$2"
 }
 
+private_path_acl_is_absent() { # path
+  local listing
+  listing=$(LC_ALL=C "$BSD_LS" -ldeB -- "$1" 2>/dev/null) || return 1
+  [[ "$listing" != *$'\n'* ]]
+}
+
+private_directory_is_valid() { # path identity mode
+  local path=$1 expected_identity=$2 expected_mode=$3 metadata
+  local device inode mode owner link_count
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- "$path" 2>/dev/null) \
+    || return 1
+  IFS=: read -r device inode mode owner link_count <<< "$metadata"
+  [[ "$device:$inode" == "$expected_identity" \
+      && "$mode" == "$expected_mode" && "$owner" == "$UID" \
+      && "$link_count" =~ ^[1-9][0-9]*$ ]] || return 1
+  private_path_acl_is_absent "$path"
+}
+
+private_file_is_valid() { # path identity mode link_count
+  local path=$1 expected_identity=$2 expected_mode=$3 expected_links=$4
+  local metadata device inode mode owner link_count
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- "$path" 2>/dev/null) \
+    || return 1
+  IFS=: read -r device inode mode owner link_count <<< "$metadata"
+  [[ "$device:$inode" == "$expected_identity" \
+      && "$mode" == "$expected_mode" && "$owner" == "$UID" \
+      && "$link_count" == "$expected_links" ]] || return 1
+  private_path_acl_is_absent "$path"
+}
+
+protect_private_file() { # path
+  local path=$1 identity
+  identity=$(operation_path_identity "$path") || return 1
+  "$CHMOD_COMMAND" -N "$path" || return 1
+  "$CHMOD_COMMAND" 600 "$path" || return 1
+  private_file_is_valid "$path" "$identity" 600 1
+}
+
 operation_owner_digest() { # path
   local output
   output=$(/usr/bin/shasum -a 256 -- "$1" 2>/dev/null) || return 1
@@ -712,15 +754,18 @@ valid_process_start_identity() { # value
 
 inspect_operation_lock() {
   local directory_metadata owner_metadata line1 line2 line3 line4 line5 extra
+  local directory_link_count
   [[ -d "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" ]] \
     || return 1
   directory_metadata=$(
-    "$BSD_STAT" -f '%d:%i:%Lp:%u' -- "$OPERATION_LOCK_DIR" 2>/dev/null
+    "$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- "$OPERATION_LOCK_DIR" 2>/dev/null
   ) || return 1
   IFS=: read -r directory_device directory_inode directory_mode directory_uid \
-    <<< "$directory_metadata"
-  [[ "$directory_mode" == "700" && "$directory_uid" == "$UID" ]] \
+    directory_link_count <<< "$directory_metadata"
+  [[ "$directory_mode" == "700" && "$directory_uid" == "$UID" \
+      && "$directory_link_count" =~ ^[1-9][0-9]*$ ]] \
     || return 1
+  private_path_acl_is_absent "$OPERATION_LOCK_DIR" || return 1
   [[ -f "$OPERATION_LOCK_DIR/owner" \
     && ! -L "$OPERATION_LOCK_DIR/owner" ]] || return 1
   owner_metadata=$(
@@ -731,6 +776,7 @@ inspect_operation_lock() {
     <<< "$owner_metadata"
   [[ "$owner_mode" == "600" && "$owner_uid" == "$UID" \
     && "$owner_nlink" == "1" ]] || return 1
+  private_path_acl_is_absent "$OPERATION_LOCK_DIR/owner" || return 1
   {
     IFS= read -r line1
     IFS= read -r line2
@@ -746,6 +792,7 @@ inspect_operation_lock() {
     && "$line5" =~ ^token=([0-9a-f]{64})$ ]] || return 1
   valid_process_start_identity "${line3#start=}" || return 1
   INSPECTED_LOCK_DIR_IDENTITY=$directory_device:$directory_inode
+  INSPECTED_LOCK_DIR_LINK_COUNT=$directory_link_count
   INSPECTED_LOCK_OWNER_IDENTITY=$owner_device:$owner_inode
   INSPECTED_LOCK_OWNER_DIGEST=$(operation_owner_digest \
     "$OPERATION_LOCK_DIR/owner") || return 1
@@ -760,10 +807,12 @@ revalidate_inspected_operation_lock() {
   local expected_owner=$INSPECTED_LOCK_OWNER_IDENTITY
   local expected_digest=$INSPECTED_LOCK_OWNER_DIGEST
   local expected_token=$INSPECTED_LOCK_TOKEN
+  local expected_directory_links=$INSPECTED_LOCK_DIR_LINK_COUNT
   inspect_operation_lock \
     && [[ "$INSPECTED_LOCK_DIR_IDENTITY" == "$expected_directory" \
       && "$INSPECTED_LOCK_OWNER_IDENTITY" == "$expected_owner" \
       && "$INSPECTED_LOCK_OWNER_DIGEST" == "$expected_digest" \
+      && "$INSPECTED_LOCK_DIR_LINK_COUNT" == "$expected_directory_links" \
       && "$INSPECTED_LOCK_TOKEN" == "$expected_token" ]]
 }
 
@@ -825,16 +874,19 @@ generate_operation_token() {
 
 partial_operation_lock_directory_matches() {
   local metadata directory_device directory_inode directory_mode directory_uid
+  local directory_link_count
   [[ "$OPERATION_LOCK_PARTIAL" == true \
     && -n "$OPERATION_LOCK_DIR_IDENTITY" \
     && -d "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" ]] \
     || return 1
-  metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u' -- \
+  metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- \
     "$OPERATION_LOCK_DIR" 2>/dev/null) || return 1
   IFS=: read -r directory_device directory_inode directory_mode directory_uid \
-    <<< "$metadata"
+    directory_link_count <<< "$metadata"
   [[ "$directory_device:$directory_inode" == "$OPERATION_LOCK_DIR_IDENTITY" \
-    && "$directory_mode" == 700 && "$directory_uid" == "$UID" ]]
+      && "$directory_mode" == 700 && "$directory_uid" == "$UID" \
+      && "$directory_link_count" =~ ^[1-9][0-9]*$ ]] \
+    && private_path_acl_is_absent "$OPERATION_LOCK_DIR"
 }
 
 partial_operation_lock_file_matches() { # path identity digest
@@ -849,6 +901,7 @@ partial_operation_lock_file_matches() { # path identity digest
   [[ "$file_device:$file_inode" == "$expected_identity" \
     && "$file_mode" == 600 && "$file_uid" == "$UID" \
     && ( "$file_nlink" == 1 || "$file_nlink" == 2 ) ]] || return 1
+  private_path_acl_is_absent "$path" || return 1
   if [[ -n "$expected_digest" ]]; then
     actual_digest=$(operation_owner_digest "$path") || return 1
     [[ "$actual_digest" == "$expected_digest" ]] || return 1
@@ -925,6 +978,8 @@ cleanup_partial_operation_lock() {
 release_owned_operation_lock() {
   local directory_identity owner_identity owner_digest
   [[ "$OPERATION_LOCK_ACTIVE" == true ]] || return 0
+  run_named_transition operation_lock_before_release \
+    "$OPERATION_LOCK_DIR/owner"
   [[ -d "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" \
     && -f "$OPERATION_LOCK_DIR/owner" \
     && ! -L "$OPERATION_LOCK_DIR/owner" ]] || return 1
@@ -1029,11 +1084,17 @@ create_owned_operation_lock() {
   OPERATION_LOCK_TEMP=$temporary
   OPERATION_LOCK_TEMP_IDENTITY=$(operation_path_identity "$temporary") \
     || die "cannot capture operation lock owner staging identity"
+  "$CHMOD_COMMAND" -N "$temporary" \
+    || die "cannot remove operation lock owner staging ACL"
   "$CHMOD_COMMAND" 600 "$temporary" \
     || die "cannot protect operation lock owner staging file"
+  private_file_is_valid "$temporary" "$OPERATION_LOCK_TEMP_IDENTITY" 600 1 \
+    || die "operation lock owner staging metadata is unsafe"
   printf 'version=1\npid=%s\nstart=%s\ncommand=%s\ntoken=%s\n' \
     "$$" "$start" "$OPERATION_LOCK_COMMAND" "$OPERATION_LOCK_TOKEN" \
     > "$temporary"
+  private_file_is_valid "$temporary" "$OPERATION_LOCK_TEMP_IDENTITY" 600 1 \
+    || die "operation lock owner staging metadata changed"
   OPERATION_LOCK_TEMP_DIGEST=$(operation_owner_digest "$temporary") \
     || die "cannot fingerprint operation lock owner staging file"
   "$LN_COMMAND" -- "$temporary" "$OPERATION_LOCK_DIR/owner" \
@@ -1060,6 +1121,7 @@ quarantine_inspected_stale_operation_lock() {
   local suffix quarantine original_lock_dir
   local expected_directory expected_owner expected_digest expected_pid
   local expected_start expected_command expected_token
+  local expected_directory_links
   expected_directory=$INSPECTED_LOCK_DIR_IDENTITY
   expected_owner=$INSPECTED_LOCK_OWNER_IDENTITY
   expected_digest=$INSPECTED_LOCK_OWNER_DIGEST
@@ -1067,6 +1129,7 @@ quarantine_inspected_stale_operation_lock() {
   expected_start=$INSPECTED_LOCK_START
   expected_command=$INSPECTED_LOCK_COMMAND
   expected_token=$INSPECTED_LOCK_TOKEN
+  expected_directory_links=$INSPECTED_LOCK_DIR_LINK_COUNT
   run_named_transition operation_lock_final_check \
     "$OPERATION_LOCK_DIR/owner"
   revalidate_inspected_operation_lock \
@@ -1094,6 +1157,7 @@ quarantine_inspected_stale_operation_lock() {
     || [[ "$INSPECTED_LOCK_DIR_IDENTITY" != "$expected_directory" \
     || "$INSPECTED_LOCK_OWNER_IDENTITY" != "$expected_owner" \
     || "$INSPECTED_LOCK_OWNER_DIGEST" != "$expected_digest" \
+    || "$INSPECTED_LOCK_DIR_LINK_COUNT" != "$expected_directory_links" \
     || "$INSPECTED_LOCK_PID" != "$expected_pid" \
     || "$INSPECTED_LOCK_START" != "$expected_start" \
     || "$INSPECTED_LOCK_COMMAND" != "$expected_command" \
@@ -1117,6 +1181,18 @@ acquire_operation_lock() { # command
       OPERATION_LOCK_PARTIAL=true
       if captured_identity=$(operation_path_identity "$OPERATION_LOCK_DIR"); then
         OPERATION_LOCK_DIR_IDENTITY=$captured_identity
+        if ! "$CHMOD_COMMAND" -N "$OPERATION_LOCK_DIR"; then
+          OPERATION_LOCK_PARTIAL=false
+          end_operation_signal_deferral
+          die "cannot remove operation lock directory ACL, operation lock retained at $OPERATION_LOCK_DIR"
+        fi
+        if ! "$CHMOD_COMMAND" 700 "$OPERATION_LOCK_DIR" \
+            || ! private_directory_is_valid "$OPERATION_LOCK_DIR" \
+              "$OPERATION_LOCK_DIR_IDENTITY" 700; then
+          OPERATION_LOCK_PARTIAL=false
+          end_operation_signal_deferral
+          die "operation lock directory metadata is unsafe, operation lock retained at $OPERATION_LOCK_DIR"
+        fi
         end_operation_signal_deferral
       else
         if cleanup_identity=$(operation_path_identity "$OPERATION_LOCK_DIR"); then
@@ -2519,6 +2595,10 @@ canonical_path_without_following_leaf() { # path
 }
 
 capture_adopt_reserved_control_paths() {
+  [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] \
+    || die "reserved state directory must be a real directory"
+  [[ -f "$state_file" && ! -L "$state_file" ]] \
+    || die "reserved state file must be a real file"
   ADOPT_RESERVED_STATE_DIR=$(cd -P -- "$STATE_DIR" 2>/dev/null && pwd -P) \
     || die "cannot canonicalize reserved state directory"
   ADOPT_RESERVED_STATE_FILE=$ADOPT_RESERVED_STATE_DIR/${state_file##*/}
@@ -2625,6 +2705,7 @@ inspect_adopt_state() {
   ADOPT_SOURCE_TREE_DIGEST=""
   ADOPT_STAGED_LINK_IDENTITY=""
   ADOPT_STAGED_LINK_TARGET=""
+  ADOPT_STAGED_LINK_MODE=""
   ADOPT_DESTINATION_IDENTITY=""
   ADOPT_DESTINATION_DEVICE=""
   ADOPT_DESTINATION_TREE_DIGEST=""
@@ -2778,15 +2859,16 @@ hex_string() { # string
   printf '%s' "$1" | /usr/bin/xxd -p | /usr/bin/tr -d '[:space:]'
 }
 
-build_hardlink_map() { # root expected_device map
-  local root=$1 expected_device=$2 map=$3 path metadata
+build_hardlink_map() { # root expected_device map identities...
+  local root=$1 expected_device=$2 map=$3 map_identity=$4 raw_identity=$5
+  local sorted_identity=$6 grouped_identity=$7 path metadata
   local device inode mode uid gid size mtime birthtime flags rdev nlink
   local relative path_hex raw sorted grouped identity current_identity=""
   local current_nlink="" anchor group_count=0 group_paths=() group_path
   raw=$map.raw
   sorted=$map.sorted
   grouped=$map.grouped
-  : > "$raw" || return 1
+  private_file_is_valid "$raw" "$raw_identity" 600 1 || return 1
   if ! LC_ALL=C "$BSD_FIND" -P -s -x "$root" -type f -print0 \
       | while IFS= read -r -d '' path; do
         metadata=$(path_stat_signature "$path") || return 1
@@ -2806,9 +2888,10 @@ build_hardlink_map() { # root expected_device map
       done; then
     return 1
   fi
+  private_file_is_valid "$raw" "$raw_identity" 600 1 || return 1
   LC_ALL=C /usr/bin/sort -t $'\t' -k1,1 -k2,2 "$raw" > "$sorted" \
     || return 1
-  : > "$grouped" || return 1
+  private_file_is_valid "$sorted" "$sorted_identity" 600 1 || return 1
   while IFS=$'\t' read -r identity path_hex nlink; do
     if [[ -n "$current_identity" && "$identity" != "$current_identity" ]]; then
       [[ "$group_count" -eq "$current_nlink" ]] || return 1
@@ -2836,17 +2919,20 @@ build_hardlink_map() { # root expected_device map
         || return 1
     done
   fi
+  private_file_is_valid "$grouped" "$grouped_identity" 600 1 || return 1
   LC_ALL=C /usr/bin/sort -t $'\t' -k1,1 "$grouped" > "$map" \
     || return 1
-  /bin/rm -f -- "$raw" "$sorted" "$grouped"
+  private_file_is_valid "$map" "$map_identity" 600 1
 }
 
-tree_manifest_stream_with_map() { # root expected_device hardlink_map
-  local root=$1 expected_device=$2 hardlink_map=$3 path relative type
+tree_manifest_stream_with_map() { # root expected_device map map_identity
+  local root=$1 expected_device=$2 hardlink_map=$3 map_identity=$4
+  local path relative type
   local metadata device inode mode uid gid size mtime birthtime flags rdev nlink
   local before after payload acl xattrs hardlink relative_hex
   local map_path map_anchor map_present=false manifest_size manifest_rdev
-  local LC_ALL=C
+  local status LC_ALL=C
+  private_file_is_valid "$hardlink_map" "$map_identity" 600 1 || return 1
   printf 'vaultlock-manifest-v3\0'
   LC_ALL=C "$BSD_FIND" -P -s -x "$root" -print0 \
     | (
@@ -2913,25 +2999,79 @@ tree_manifest_stream_with_map() { # root expected_device hardlink_map
       done
       [[ "$map_present" == false ]]
     )
+  status=$?
+  private_file_is_valid "$hardlink_map" "$map_identity" 600 1 || return 1
+  return "$status"
+}
+
+remove_verified_private_file() { # path identity
+  local path=$1 identity=$2
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    return 0
+  fi
+  [[ -n "$identity" ]] \
+    && private_file_is_valid "$path" "$identity" 600 1 \
+    && "$RM_COMMAND" -f -- "$path" \
+    && [[ ! -e "$path" && ! -L "$path" ]]
+}
+
+remove_verified_hardlink_metadata() { # path identity
+  local path=$1 identity=$2
+  if ! remove_verified_private_file "$path" "$identity"; then
+    printf 'vaultlock: hard-link metadata retained at %s\n' "$path" >&2
+    return 1
+  fi
+}
+
+remove_verified_hardlink_metadata_set() { # map identities...
+  local map=$1 map_identity=$2 raw_identity=$3 sorted_identity=$4
+  local grouped_identity=$5 status=0
+  remove_verified_hardlink_metadata "$map" "$map_identity" || status=1
+  remove_verified_hardlink_metadata "$map.raw" "$raw_identity" || status=1
+  remove_verified_hardlink_metadata "$map.sorted" "$sorted_identity" \
+    || status=1
+  remove_verified_hardlink_metadata "$map.grouped" "$grouped_identity" \
+    || status=1
+  return "$status"
 }
 
 tree_manifest_stream() { # root expected_device
-  local root=$1 expected_device=$2 hardlink_map status
-  hardlink_map=$(/usr/bin/mktemp \
+  local root=$1 expected_device=$2 hardlink_map status=1
+  local map_identity="" raw_identity="" sorted_identity=""
+  local grouped_identity=""
+  hardlink_map=$("$MKTEMP_COMMAND" \
     "${TMPDIR:-/tmp}/vaultlock-hardlinks.XXXXXX") || return 1
-  chmod 600 "$hardlink_map" || {
-    /bin/rm -f "$hardlink_map"
-    return 1
-  }
-  if build_hardlink_map "$root" "$expected_device" "$hardlink_map" \
-      && tree_manifest_stream_with_map "$root" "$expected_device" \
-        "$hardlink_map"; then
-    status=0
-  else
-    status=1
+  if map_identity=$(operation_path_identity "$hardlink_map") \
+      && "$CHMOD_COMMAND" -N "$hardlink_map" \
+      && "$CHMOD_COMMAND" 600 "$hardlink_map" \
+      && private_file_is_valid "$hardlink_map" "$map_identity" 600 1 \
+      && : > "$hardlink_map.raw" \
+      && raw_identity=$(operation_path_identity "$hardlink_map.raw") \
+      && "$CHMOD_COMMAND" -N "$hardlink_map.raw" \
+      && "$CHMOD_COMMAND" 600 "$hardlink_map.raw" \
+      && private_file_is_valid "$hardlink_map.raw" "$raw_identity" 600 1 \
+      && : > "$hardlink_map.sorted" \
+      && sorted_identity=$(operation_path_identity "$hardlink_map.sorted") \
+      && "$CHMOD_COMMAND" -N "$hardlink_map.sorted" \
+      && "$CHMOD_COMMAND" 600 "$hardlink_map.sorted" \
+      && private_file_is_valid "$hardlink_map.sorted" \
+        "$sorted_identity" 600 1 \
+      && : > "$hardlink_map.grouped" \
+      && grouped_identity=$(operation_path_identity "$hardlink_map.grouped") \
+      && "$CHMOD_COMMAND" -N "$hardlink_map.grouped" \
+      && "$CHMOD_COMMAND" 600 "$hardlink_map.grouped" \
+      && private_file_is_valid "$hardlink_map.grouped" \
+        "$grouped_identity" 600 1; then
+    if build_hardlink_map "$root" "$expected_device" "$hardlink_map" \
+        "$map_identity" "$raw_identity" "$sorted_identity" \
+        "$grouped_identity" \
+        && tree_manifest_stream_with_map "$root" "$expected_device" \
+          "$hardlink_map" "$map_identity"; then
+      status=0
+    fi
   fi
-  /bin/rm -f "$hardlink_map" "$hardlink_map.raw" \
-    "$hardlink_map.sorted" "$hardlink_map.grouped" || return 1
+  remove_verified_hardlink_metadata_set "$hardlink_map" "$map_identity" \
+    "$raw_identity" "$sorted_identity" "$grouped_identity" || status=1
   return "$status"
 }
 
@@ -3146,11 +3286,18 @@ execute_adopt_verify() {
 }
 
 adopt_staged_link_owned_at() { # path
-  local identity target
+  local identity target metadata device inode mode owner link_count
   [[ -n "$ADOPT_STAGED_LINK_IDENTITY" \
-    && -n "$ADOPT_STAGED_LINK_TARGET" && -L "$1" ]] || return 1
-  identity=$(path_identity "$1") || return 1
+      && -n "$ADOPT_STAGED_LINK_TARGET" \
+      && -n "$ADOPT_STAGED_LINK_MODE" && -L "$1" ]] || return 1
+  metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- "$1" 2>/dev/null) \
+    || return 1
+  IFS=: read -r device inode mode owner link_count <<< "$metadata"
+  identity=$device:$inode
   [[ "$identity" == "$ADOPT_STAGED_LINK_IDENTITY" ]] || return 1
+  [[ "$mode" == "$ADOPT_STAGED_LINK_MODE" \
+      && "$owner" == "$UID" && "$link_count" == 1 ]] || return 1
+  private_path_acl_is_absent "$1" || return 1
   target=$(/usr/bin/readlink -- "$1" 2>/dev/null) || return 1
   [[ "$target" == "$ADOPT_STAGED_LINK_TARGET" ]]
 }
@@ -3185,19 +3332,21 @@ adopt_original_tree_at() { # path
 
 adopt_backup_reservation_matches() {
   local metadata reservation_device reservation_inode reservation_mode
-  local reservation_uid
+  local reservation_uid reservation_link_count
   [[ -n "$ADOPT_BACKUP_RESERVATION" \
     && -n "$ADOPT_BACKUP_RESERVATION_IDENTITY" \
     && -d "$ADOPT_BACKUP_RESERVATION" \
     && ! -L "$ADOPT_BACKUP_RESERVATION" ]] || return 1
-  metadata=$(/usr/bin/stat -f '%d:%i:%Lp:%u' -- \
+  metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- \
     "$ADOPT_BACKUP_RESERVATION" 2>/dev/null) || return 1
   IFS=: read -r reservation_device reservation_inode reservation_mode \
-    reservation_uid <<< "$metadata"
+    reservation_uid reservation_link_count <<< "$metadata"
   [[ "$reservation_device:$reservation_inode" \
     == "$ADOPT_BACKUP_RESERVATION_IDENTITY" \
     && "$reservation_device" == "$ADOPT_BACKUP_RESERVATION_DEVICE" \
-    && "$reservation_mode" == 700 && "$reservation_uid" == "$UID" ]]
+      && "$reservation_mode" == 700 && "$reservation_uid" == "$UID" \
+      && "$reservation_link_count" =~ ^[1-9][0-9]*$ ]] \
+    && private_path_acl_is_absent "$ADOPT_BACKUP_RESERVATION"
 }
 
 remove_empty_adopt_backup_reservation() {
@@ -3422,9 +3571,8 @@ adopt_quarantine_envelope_matches() {
     || return 1
   [[ ! -L "$ADOPT_BACKUP_QUARANTINE" \
     && -d "$ADOPT_BACKUP_QUARANTINE" ]] || return 1
-  [[ "$(path_identity "$ADOPT_BACKUP_QUARANTINE")" \
-    == "$ADOPT_BACKUP_QUARANTINE_IDENTITY" ]] || return 1
-  [[ "$(path_mode "$ADOPT_BACKUP_QUARANTINE")" == "700" ]] || return 1
+  private_directory_is_valid "$ADOPT_BACKUP_QUARANTINE" \
+    "$ADOPT_BACKUP_QUARANTINE_IDENTITY" 700 || return 1
   adopt_link_matches || return 1
   adopt_destination_manifest_matches || return 1
   adopt_mount_identity_matches || return 1
@@ -3484,9 +3632,8 @@ verify_adopt_directory_skeleton() {
   adopt_quarantine_envelope_matches || return 1
   [[ -f "$ADOPT_DIRECTORY_SKELETON" \
     && ! -L "$ADOPT_DIRECTORY_SKELETON" ]] || return 1
-  [[ "$(path_identity "$ADOPT_DIRECTORY_SKELETON")" \
-    == "$ADOPT_DIRECTORY_SKELETON_IDENTITY" ]] || return 1
-  [[ "$(path_mode "$ADOPT_DIRECTORY_SKELETON")" == "600" ]] || return 1
+  private_file_is_valid "$ADOPT_DIRECTORY_SKELETON" \
+    "$ADOPT_DIRECTORY_SKELETON_IDENTITY" 600 1 || return 1
   digest=$(file_sha256_digest "$ADOPT_DIRECTORY_SKELETON") || return 1
   [[ "$digest" == "$ADOPT_DIRECTORY_SKELETON_DIGEST" ]]
 }
@@ -3520,14 +3667,21 @@ create_adopt_directory_skeleton() {
       2>/dev/null; then
     die "cannot create protected directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   fi
-  chmod 600 "$ADOPT_DIRECTORY_SKELETON" \
-    || die "cannot protect directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
-  if ! capture_adopt_directory_skeleton "$ADOPT_DIRECTORY_SKELETON"; then
-    die "cannot capture directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
-  fi
   ADOPT_DIRECTORY_SKELETON_IDENTITY=$(path_identity \
     "$ADOPT_DIRECTORY_SKELETON") \
     || die "cannot capture directory skeleton identity, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  run_named_transition adopt_after_directory_skeleton_created \
+    "$ADOPT_DIRECTORY_SKELETON"
+  "$CHMOD_COMMAND" -N "$ADOPT_DIRECTORY_SKELETON" \
+    || die "cannot remove directory skeleton ACL, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  "$CHMOD_COMMAND" 600 "$ADOPT_DIRECTORY_SKELETON" \
+    || die "cannot protect directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  private_file_is_valid "$ADOPT_DIRECTORY_SKELETON" \
+    "$ADOPT_DIRECTORY_SKELETON_IDENTITY" 600 1 \
+    || die "directory skeleton metadata is unsafe, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  if ! capture_adopt_directory_skeleton "$ADOPT_DIRECTORY_SKELETON"; then
+    die "cannot capture directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  fi
   ADOPT_DIRECTORY_SKELETON_DIGEST=$(file_sha256_digest \
     "$ADOPT_DIRECTORY_SKELETON") \
     || die "cannot digest directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
@@ -3537,21 +3691,43 @@ create_adopt_directory_skeleton() {
 
 delete_captured_adopt_directories() {
   local root=$ADOPT_BACKUP_QUARANTINE/backup relative identity mode path device
-  local current_skeleton
+  local current_skeleton current_skeleton_identity
+  run_named_transition adopt_before_directory_skeleton_cleanup \
+    "$ADOPT_DIRECTORY_SKELETON"
   verify_adopt_directory_skeleton \
     || die "directory skeleton changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
-  current_skeleton=$(mktemp \
+  current_skeleton=$("$MKTEMP_COMMAND" \
     "$ADOPT_BACKUP_QUARANTINE/.directory-current.XXXXXX") \
     || die "cannot create current directory snapshot, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
-  chmod 600 "$current_skeleton" \
+  current_skeleton_identity=$(path_identity "$current_skeleton") \
+    || die "cannot capture current directory snapshot identity, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  "$CHMOD_COMMAND" -N "$current_skeleton" \
+    || die "cannot remove current directory snapshot ACL, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  "$CHMOD_COMMAND" 600 "$current_skeleton" \
     || die "cannot protect current directory snapshot, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
-  if ! capture_adopt_directory_skeleton "$current_skeleton" \
-      || ! /usr/bin/cmp -s "$ADOPT_DIRECTORY_SKELETON" "$current_skeleton"; then
-    /bin/rm -f -- "$current_skeleton"
+  private_file_is_valid "$current_skeleton" "$current_skeleton_identity" \
+    600 1 \
+    || die "current directory snapshot metadata is unsafe, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  if ! capture_adopt_directory_skeleton "$current_skeleton"; then
+    remove_verified_private_file "$current_skeleton" \
+      "$current_skeleton_identity" \
+      || die "current directory snapshot changed, retained at $current_skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
     die "directory cleanup boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   fi
-  /bin/rm -f -- "$current_skeleton" \
-    || die "current directory snapshot cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  run_named_transition adopt_before_current_directory_snapshot_cleanup \
+    "$current_skeleton"
+  private_file_is_valid "$current_skeleton" "$current_skeleton_identity" \
+    600 1 \
+    || die "current directory snapshot changed, retained at $current_skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  if ! /usr/bin/cmp -s "$ADOPT_DIRECTORY_SKELETON" "$current_skeleton"; then
+    remove_verified_private_file "$current_skeleton" \
+      "$current_skeleton_identity" \
+      || die "current directory snapshot changed, retained at $current_skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+    die "directory cleanup boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  fi
+  remove_verified_private_file "$current_skeleton" \
+    "$current_skeleton_identity" \
+    || die "current directory snapshot cleanup failed, retained at $current_skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   while IFS= read -r -d '' relative \
       && IFS= read -r -d '' identity \
       && IFS= read -r -d '' mode; do
@@ -3581,11 +3757,13 @@ create_adopt_backup_quarantine() {
   quarantine=$(mktemp -d "$ADOPT_SOURCE.vaultlock-quarantine.XXXXXX") \
     || die "cannot create backup quarantine after replacement"
   ADOPT_BACKUP_QUARANTINE=$quarantine
-  chmod 700 "$ADOPT_BACKUP_QUARANTINE" \
-    || die "cannot protect backup quarantine, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   ADOPT_BACKUP_QUARANTINE_IDENTITY=$(path_identity \
     "$ADOPT_BACKUP_QUARANTINE") \
     || die "cannot capture backup quarantine identity, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  "$CHMOD_COMMAND" -N "$ADOPT_BACKUP_QUARANTINE" \
+    || die "cannot remove backup quarantine ACL, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  "$CHMOD_COMMAND" 700 "$ADOPT_BACKUP_QUARANTINE" \
+    || die "cannot protect backup quarantine, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   adopt_quarantine_envelope_matches \
     || die "backup quarantine verification failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
 }
@@ -3597,6 +3775,8 @@ quarantine_adopt_backup() {
   if ! mv -n -- "$ADOPT_BACKUP" "$quarantined"; then
     die "cannot quarantine backup, backup retained at $ADOPT_BACKUP, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   fi
+  run_named_transition adopt_after_backup_quarantine_move \
+    "$ADOPT_BACKUP_QUARANTINE"
   adopt_quarantined_backup_matches \
     || die "backup quarantine verification failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   ADOPT_TRANSACTION_PHASE=quarantined
@@ -3618,7 +3798,8 @@ delete_quarantined_adopt_backup() {
   delete_captured_adopt_directories
   [[ ! -e "$quarantined" && ! -L "$quarantined" ]] \
     || die "replacement succeeded but quarantined backup remains at $quarantined"
-  /bin/rm -f -- "$ADOPT_DIRECTORY_SKELETON" \
+  remove_verified_private_file "$ADOPT_DIRECTORY_SKELETON" \
+    "$ADOPT_DIRECTORY_SKELETON_IDENTITY" \
     || die "directory skeleton cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   [[ ! -e "$ADOPT_DIRECTORY_SKELETON" \
       && ! -L "$ADOPT_DIRECTORY_SKELETON" ]] \
@@ -3637,7 +3818,8 @@ delete_quarantined_adopt_backup() {
 
 execute_adopt_replace_source() {
   local link_target backup_digest backup_candidate move_status
-  local backup_identity backup_device
+  local backup_identity backup_device staged_metadata staged_device
+  local staged_inode staged_owner staged_link_count
   [[ "$ADOPT_COPY_VERIFIED" == "true" ]] \
     || die "adopt replacement requires verified copy"
   assert_adopt_source_manifest \
@@ -3654,9 +3836,21 @@ execute_adopt_replace_source() {
     dispatch_deferred_operation_signal
     die "cannot stage replacement symlink, source remains unchanged"
   }
-  ADOPT_STAGED_LINK_IDENTITY=$(path_identity "$ADOPT_STAGED_LINK") || {
+  "$CHMOD_COMMAND" -h -N "$ADOPT_STAGED_LINK" || {
+    dispatch_deferred_operation_signal
+    die "cannot remove staged link ACL, staged link retained at $ADOPT_STAGED_LINK"
+  }
+  staged_metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- \
+    "$ADOPT_STAGED_LINK" 2>/dev/null) || {
     dispatch_deferred_operation_signal
     die "cannot capture staged link identity, staged link retained at $ADOPT_STAGED_LINK"
+  }
+  IFS=: read -r staged_device staged_inode ADOPT_STAGED_LINK_MODE \
+    staged_owner staged_link_count <<< "$staged_metadata"
+  ADOPT_STAGED_LINK_IDENTITY=$staged_device:$staged_inode
+  [[ "$staged_owner" == "$UID" && "$staged_link_count" == 1 ]] || {
+    dispatch_deferred_operation_signal
+    die "staged link metadata is unsafe, staged link retained at $ADOPT_STAGED_LINK"
   }
   ADOPT_STAGED_LINK_TARGET=$(/usr/bin/readlink -- "$ADOPT_STAGED_LINK" \
     2>/dev/null) || {
@@ -3700,6 +3894,14 @@ execute_adopt_replace_source() {
     "$ADOPT_BACKUP_RESERVATION") || {
     dispatch_deferred_operation_signal
     die "cannot verify source backup reservation, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  }
+  "$CHMOD_COMMAND" -N "$ADOPT_BACKUP_RESERVATION" || {
+    dispatch_deferred_operation_signal
+    die "cannot remove backup reservation ACL, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
+  }
+  "$CHMOD_COMMAND" 700 "$ADOPT_BACKUP_RESERVATION" || {
+    dispatch_deferred_operation_signal
+    die "cannot protect backup reservation, source remains unchanged, reservation retained at $ADOPT_BACKUP_RESERVATION"
   }
   ADOPT_BACKUP_RESERVATION_DEVICE=$(
     "$BSD_STAT" -f '%d' -- "$ADOPT_BACKUP_RESERVATION" 2>/dev/null
