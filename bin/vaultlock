@@ -23,6 +23,16 @@ VOLUME=${VAULTLOCK_VOLUME:-vault}
 CONTAINER=${VAULTLOCK_CONTAINER:-disk3}
 MOUNT_POINT=${VAULTLOCK_MOUNT_POINT:-/Volumes/$VOLUME}
 MOUNT_COMMAND=${VAULTLOCK_MOUNT_COMMAND:-mount}
+BSD_FIND=/usr/bin/find
+BSD_LS=/bin/ls
+BSD_STAT=/usr/bin/stat
+DITTO_COMMAND=/usr/bin/ditto
+if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]]; then
+  BSD_FIND=${VAULTLOCK_TEST_BSD_FIND:-$BSD_FIND}
+  BSD_LS=${VAULTLOCK_TEST_BSD_LS:-$BSD_LS}
+  BSD_STAT=${VAULTLOCK_TEST_BSD_STAT:-$BSD_STAT}
+  DITTO_COMMAND=${VAULTLOCK_TEST_DITTO:-$DITTO_COMMAND}
+fi
 CONFIRM_DEVICE=${VAULTLOCK_CONFIRM_DEVICE:-/dev/tty}
 KEYCHAIN_SERVICE="vaultlock-$VOLUME"
 state_file="$STATE_DIR/state.json"
@@ -57,6 +67,7 @@ INIT_CREATED_UUID=""
 INIT_CREATED_DEVICE=""
 SNAPSHOT_INIT_ABSENT=false
 ADOPT_SOURCE=""
+ADOPT_SOURCE_DISPLAY=""
 ADOPT_DESTINATION=""
 ADOPT_SOURCE_IDENTITY=""
 ADOPT_DESTINATION_IDENTITY=""
@@ -71,9 +82,14 @@ ADOPT_BACKUP_DEVICE=""
 ADOPT_BACKUP_TREE_DIGEST=""
 ADOPT_COPY_VERIFIED=false
 ADOPT_STAGED_LINK=""
+ADOPT_STAGED_LINK_IDENTITY=""
+ADOPT_STAGED_LINK_TARGET=""
 ADOPT_BACKUP=""
 ADOPT_BACKUP_QUARANTINE=""
 ADOPT_BACKUP_QUARANTINE_IDENTITY=""
+ADOPT_DIRECTORY_SKELETON=""
+ADOPT_DIRECTORY_SKELETON_IDENTITY=""
+ADOPT_DIRECTORY_SKELETON_DIGEST=""
 
 DISCOVERED_HOOK_PATHS=()
 DISCOVERED_HOOK_SCOPES=()
@@ -1112,6 +1128,10 @@ require_command() { # command
   command -v "$1" >/dev/null 2>&1 || die "$1 is required"
 }
 
+require_executable() { # path description
+  [[ -x "$1" ]] || die "$2 is required at $1"
+}
+
 preflight_init_dependencies() {
   local command
   for command in security sudo head base64 mktemp; do
@@ -1122,7 +1142,16 @@ preflight_init_dependencies() {
 }
 
 preflight_adopt_dependencies() {
-  require_command ditto
+  require_executable "$DITTO_COMMAND" ditto
+  require_executable "$BSD_FIND" "BSD find"
+  require_executable "$BSD_LS" "BSD ls"
+  require_executable "$BSD_STAT" "BSD stat"
+  require_executable /usr/bin/shasum shasum
+  require_executable /usr/bin/sed sed
+  require_executable /usr/bin/sort sort
+  require_executable /usr/bin/tr tr
+  require_executable /usr/bin/xattr xattr
+  require_executable /usr/bin/xxd xxd
 }
 
 keychain_store_passphrase() { # passphrase
@@ -1567,8 +1596,8 @@ path_has_control_character() {
     && return 0
   LC_ALL=C printf '%s' "$1" | grep -q '[[:cntrl:]]'
 }
-path_identity() { stat -f '%d:%i' -- "$1" 2>/dev/null; }
-path_mode() { stat -f '%Lp' -- "$1" 2>/dev/null; }
+path_identity() { "$BSD_STAT" -f '%d:%i' -- "$1" 2>/dev/null; }
+path_mode() { "$BSD_STAT" -f '%Lp' -- "$1" 2>/dev/null; }
 
 assert_path_identity() { # path expected description
   local actual
@@ -1582,6 +1611,11 @@ inspect_adopt_state() {
   [[ -n "$raw" && "$raw" != "/" ]] || die "adopt source must not be empty or root"
   path_has_control_character "$raw" && die "adopt source contains control characters"
   while [[ "$raw" != "/" && "$raw" == */ ]]; do raw=${raw%/}; done
+  if [[ "$raw" == /* ]]; then
+    ADOPT_SOURCE_DISPLAY=$raw
+  else
+    ADOPT_SOURCE_DISPLAY=$PWD/$raw
+  fi
   parent=$(dirname -- "$raw") || die "cannot resolve adopt source parent"
   leaf=$(basename -- "$raw") || die "cannot resolve adopt source name"
   [[ "$leaf" != "." && "$leaf" != ".." ]] || die "adopt source name is not allowed"
@@ -1615,11 +1649,13 @@ inspect_adopt_state() {
     || die "adopt backup path already exists: $ADOPT_BACKUP"
   ADOPT_SOURCE_IDENTITY=$(path_identity "$ADOPT_SOURCE") \
     || die "cannot capture source identity"
-  ADOPT_SOURCE_DEVICE=$(stat -f '%d' -- "$ADOPT_SOURCE" 2>/dev/null) \
+  ADOPT_SOURCE_DEVICE=$("$BSD_STAT" -f '%d' -- "$ADOPT_SOURCE" 2>/dev/null) \
     || die "cannot capture source device"
   PLAN_CONTEXT_UUID=$SNAPSHOT_EXPECTED_UUID
   PLAN_CONTEXT_DEVICE=$SNAPSHOT_DEVICE
   ADOPT_SOURCE_TREE_DIGEST=""
+  ADOPT_STAGED_LINK_IDENTITY=""
+  ADOPT_STAGED_LINK_TARGET=""
   ADOPT_DESTINATION_IDENTITY=""
   ADOPT_DESTINATION_DEVICE=""
   ADOPT_DESTINATION_TREE_DIGEST=""
@@ -1628,6 +1664,9 @@ inspect_adopt_state() {
   ADOPT_BACKUP_TREE_DIGEST=""
   ADOPT_BACKUP_QUARANTINE=""
   ADOPT_BACKUP_QUARANTINE_IDENTITY=""
+  ADOPT_DIRECTORY_SKELETON=""
+  ADOPT_DIRECTORY_SKELETON_IDENTITY=""
+  ADOPT_DIRECTORY_SKELETON_DIGEST=""
   ADOPT_COPY_VERIFIED=false
 }
 
@@ -1664,7 +1703,8 @@ empty_payload_digest() {
 }
 
 path_stat_signature() { # path
-  stat -f '%d:%i:%Lp:%z:%r:%m:%c' -- "$1" 2>/dev/null
+  "$BSD_STAT" -f '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9Fc:%f:%r:%l' -- "$1" \
+    2>/dev/null
 }
 
 path_payload_digest() { # type path
@@ -1674,12 +1714,12 @@ path_payload_digest() { # type path
       empty_payload_digest
       ;;
     f)
-      output=$(/usr/bin/shasum -a 256 -- "$path" 2>/dev/null) \
+      output=$(/usr/bin/shasum -a 256 < "$path" 2>/dev/null) \
         || return 1
       sha256_output_digest "$output"
       ;;
     l)
-      output=$(readlink -n -- "$path" 2>/dev/null \
+      output=$(/usr/bin/readlink -n -- "$path" 2>/dev/null \
         | /usr/bin/shasum -a 256 2>/dev/null) || return 1
       sha256_output_digest "$output"
       ;;
@@ -1689,11 +1729,99 @@ path_payload_digest() { # type path
   esac
 }
 
-tree_manifest_stream() { # root expected_device
-  local root=$1 expected_device=$2 path relative type
-  local device mode size rdev before after payload
+path_acl_digest() { # path
+  local output
+  output=$(LC_ALL=C "$BSD_LS" -ldnePB -- "$1" 2>/dev/null \
+    | /usr/bin/sed -n '2,$p' \
+    | /usr/bin/shasum -a 256 2>/dev/null) || return 1
+  sha256_output_digest "$output"
+}
+
+path_xattr_listing() { # path
+  LC_ALL=C "$BSD_LS" -ldnP@B -- "$1" 2>/dev/null \
+    | /usr/bin/sed -n '2,$p' \
+    | LC_ALL=C /usr/bin/sort
+}
+
+path_xattr_manifest_stream() { # path
+  local path=$1 before after line escaped_name size_field size name value
+  before=$(path_xattr_listing "$path") || return 1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    [[ "$line" == $'\t'*$'\t'* ]] || return 1
+    line=${line#$'\t'}
+    escaped_name=${line%%$'\t'*}
+    size_field=${line#*$'\t'}
+    size=$(printf '%s' "$size_field" | /usr/bin/tr -d '[:space:]')
+    [[ "$size" =~ ^[0-9]+$ ]] || return 1
+    printf -v name '%b' "$escaped_name"
+    value=$(/usr/bin/xattr -psx -- "$name" "$path" 2>/dev/null \
+      | /usr/bin/tr -d '[:space:]') || return 1
+    [[ "$value" =~ ^[0-9A-Fa-f]*$ \
+      && $(( ${#value} % 2 )) -eq 0 \
+      && $(( ${#value} / 2 )) -eq "$size" ]] || return 1
+    printf '%s\0%s\0' "$escaped_name" "$value"
+  done <<< "$before"
+  after=$(path_xattr_listing "$path") || return 1
+  [[ "$after" == "$before" ]]
+}
+
+path_xattr_digest() { # path
+  local output
+  output=$(path_xattr_manifest_stream "$1" \
+    | /usr/bin/shasum -a 256 2>/dev/null) || return 1
+  sha256_output_digest "$output"
+}
+
+hex_string() { # string
+  printf '%s' "$1" | /usr/bin/xxd -p | /usr/bin/tr -d '[:space:]'
+}
+
+build_hardlink_map() { # root expected_device map
+  local root=$1 expected_device=$2 map=$3 path metadata
+  local device inode mode uid gid size mtime ctime flags rdev nlink
+  local relative path_hex
+  : > "$map" || return 1
+  while IFS= read -r -d '' path; do
+    metadata=$(path_stat_signature "$path") || return 1
+    IFS=: read -r device inode mode uid gid size mtime ctime flags rdev nlink \
+      <<< "$metadata"
+    [[ "$device" == "$expected_device" ]] || return 1
+    if [[ "$path" == "$root" ]]; then
+      relative=.
+    elif [[ "$path" == "$root/"* ]]; then
+      relative=${path#"$root/"}
+    else
+      return 1
+    fi
+    path_hex=$(hex_string "$relative") || return 1
+    printf '%s:%s\t%s\t%s\n' "$device" "$inode" "$path_hex" "$nlink" \
+      >> "$map" || return 1
+  done < <(LC_ALL=C "$BSD_FIND" -P -s -x "$root" -type f -print0)
+}
+
+hardlink_anchor_from_map() { # map identity nlink
+  local map=$1 wanted_identity=$2 expected_nlink=$3
+  local identity path_hex nlink anchor="" count=0
+  while IFS=$'\t' read -r identity path_hex nlink; do
+    [[ "$identity" == "$wanted_identity" ]] || continue
+    [[ "$nlink" == "$expected_nlink" ]] || return 1
+    count=$((count + 1))
+    if [[ -z "$anchor" || "$path_hex" < "$anchor" ]]; then
+      anchor=$path_hex
+    fi
+  done < "$map"
+  [[ "$count" == "$expected_nlink" ]] || return 1
+  printf '%s\n' "$anchor"
+}
+
+tree_manifest_stream_with_map() { # root expected_device hardlink_map
+  local root=$1 expected_device=$2 hardlink_map=$3 path relative type
+  local metadata device inode mode uid gid size mtime ctime flags rdev nlink
+  local before after payload acl xattrs hardlink relative_hex
   local LC_ALL=C
-  LC_ALL=C find -P -s -x "$root" -print0 \
+  printf 'vaultlock-manifest-v2\0'
+  LC_ALL=C "$BSD_FIND" -P -s -x "$root" -print0 \
     | while IFS= read -r -d '' path; do
       if [[ "$path" == "$root" ]]; then
         relative=.
@@ -1702,8 +1830,18 @@ tree_manifest_stream() { # root expected_device
       else
         return 1
       fi
-      device=$(stat -f '%d' -- "$path" 2>/dev/null) || return 1
+      relative_hex=$(hex_string "$relative") || return 1
+      before=$(path_stat_signature "$path") || return 1
+      metadata=$before
+      IFS=: read -r device inode mode uid gid size mtime ctime flags rdev nlink \
+        <<< "$metadata"
       [[ "$device" == "$expected_device" ]] || return 1
+      [[ "$flags" =~ ^[0-9]+$ ]] || return 1
+      (( (flags & 32) == 0 \
+        && (flags & 2) == 0 \
+        && (flags & 4) == 0 \
+        && (flags & 131072) == 0 \
+        && (flags & 262144) == 0 )) || return 1
       if [[ -L "$path" ]]; then
         type=l
       elif [[ -d "$path" ]]; then
@@ -1713,29 +1851,55 @@ tree_manifest_stream() { # root expected_device
       else
         return 1
       fi
-      before=$(path_stat_signature "$path") || return 1
-      mode=$(stat -f '%Lp' -- "$path" 2>/dev/null) || return 1
-      size=$(stat -f '%z' -- "$path" 2>/dev/null) || return 1
-      rdev=$(stat -f '%r' -- "$path" 2>/dev/null) || return 1
+      acl=$(path_acl_digest "$path") || return 1
+      xattrs=$(path_xattr_digest "$path") || return 1
+      if [[ "$type" == "f" ]]; then
+        hardlink=$(hardlink_anchor_from_map "$hardlink_map" \
+          "$device:$inode" "$nlink") || return 1
+      else
+        hardlink=-
+      fi
       payload=$(path_payload_digest "$type" "$path") || return 1
       after=$(path_stat_signature "$path") || return 1
       [[ "$before" == "$after" ]] || return 1
-      printf '%q\0%s\0%s\0%s\0%s\0%s\0' \
-        "$relative" "$type" "$mode" "$size" "$rdev" "$payload"
+      printf '%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0%s\0' \
+        "$relative_hex" "$type" "$mode" "$size" "$rdev" "$uid" "$gid" \
+        "$mtime" "$flags" "$acl" "$xattrs" "$hardlink" "$payload"
     done
+}
+
+tree_manifest_stream() { # root expected_device
+  local root=$1 expected_device=$2 hardlink_map status
+  hardlink_map=$(/usr/bin/mktemp \
+    "${TMPDIR:-/tmp}/vaultlock-hardlinks.XXXXXX") || return 1
+  chmod 600 "$hardlink_map" || {
+    /bin/rm -f "$hardlink_map"
+    return 1
+  }
+  if build_hardlink_map "$root" "$expected_device" "$hardlink_map" \
+      && tree_manifest_stream_with_map "$root" "$expected_device" \
+        "$hardlink_map"; then
+    status=0
+  else
+    status=1
+  fi
+  /bin/rm -f "$hardlink_map" || return 1
+  return "$status"
 }
 
 tree_digest_once() { # root expected_identity expected_device
   local root=$1 expected_identity=$2 expected_device=$3 output digest
   [[ ! -L "$root" && -d "$root" ]] || return 1
   [[ "$(path_identity "$root")" == "$expected_identity" ]] || return 1
-  [[ "$(stat -f '%d' -- "$root" 2>/dev/null)" == "$expected_device" ]] \
+  [[ "$("$BSD_STAT" -f '%d' -- "$root" 2>/dev/null)" \
+    == "$expected_device" ]] \
     || return 1
   output=$(tree_manifest_stream "$root" "$expected_device" \
     | /usr/bin/shasum -a 256 2>/dev/null) || return 1
   digest=$(sha256_output_digest "$output") || return 1
   [[ "$(path_identity "$root")" == "$expected_identity" ]] || return 1
-  [[ "$(stat -f '%d' -- "$root" 2>/dev/null)" == "$expected_device" ]] \
+  [[ "$("$BSD_STAT" -f '%d' -- "$root" 2>/dev/null)" \
+    == "$expected_device" ]] \
     || return 1
   printf '%s\n' "$digest"
 }
@@ -1781,7 +1945,8 @@ execute_adopt_copy() {
     "source parent"
   assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
   verify_adopt_mount_identity
-  ditto "$ADOPT_SOURCE" "$ADOPT_DESTINATION" \
+  /usr/bin/env -u DITTONORSRC "$DITTO_COMMAND" -X --rsrc --extattr --acl \
+    --qtn --preserveHFSCompression "$ADOPT_SOURCE" "$ADOPT_DESTINATION" \
     || die "copy failed, source remains at $ADOPT_SOURCE and partial copy may remain at $ADOPT_DESTINATION"
 }
 
@@ -1802,7 +1967,7 @@ execute_adopt_verify() {
     || die "cannot capture copied destination identity"
   assert_path_identity "$ADOPT_DESTINATION" "$ADOPT_DESTINATION_IDENTITY" \
     "destination"
-  ADOPT_DESTINATION_DEVICE=$(stat -f '%d' -- "$ADOPT_DESTINATION" \
+  ADOPT_DESTINATION_DEVICE=$("$BSD_STAT" -f '%d' -- "$ADOPT_DESTINATION" \
     2>/dev/null) || die "cannot capture copied destination device"
   destination_digest=$(stable_tree_digest "$ADOPT_DESTINATION" \
     "$ADOPT_DESTINATION_IDENTITY" "$ADOPT_DESTINATION_DEVICE") \
@@ -1818,20 +1983,79 @@ execute_adopt_verify() {
   ADOPT_COPY_VERIFIED=true
 }
 
+adopt_staged_link_owned_at() { # path
+  local identity target
+  [[ -n "$ADOPT_STAGED_LINK_IDENTITY" \
+    && -n "$ADOPT_STAGED_LINK_TARGET" && -L "$1" ]] || return 1
+  identity=$(path_identity "$1") || return 1
+  [[ "$identity" == "$ADOPT_STAGED_LINK_IDENTITY" ]] || return 1
+  target=$(/usr/bin/readlink -- "$1" 2>/dev/null) || return 1
+  [[ "$target" == "$ADOPT_STAGED_LINK_TARGET" ]]
+}
+
 cleanup_staged_link() {
-  if [[ -z "$ADOPT_STAGED_LINK" || ! -L "$ADOPT_STAGED_LINK" ]]; then
+  if [[ -z "$ADOPT_STAGED_LINK" \
+      || ( ! -e "$ADOPT_STAGED_LINK" && ! -L "$ADOPT_STAGED_LINK" ) ]]; then
     return 0
   fi
-  if ! rm -f -- "$ADOPT_STAGED_LINK"; then
+  if ! adopt_staged_link_owned_at "$ADOPT_STAGED_LINK"; then
+    printf 'vaultlock: staged link ownership changed, retained at %s\n' \
+      "$ADOPT_STAGED_LINK" >&2
+    return 1
+  fi
+  if ! rm -f -- "$ADOPT_STAGED_LINK" \
+      || [[ -e "$ADOPT_STAGED_LINK" || -L "$ADOPT_STAGED_LINK" ]]; then
     printf 'vaultlock: cannot remove staged link, retained at %s\n' \
       "$ADOPT_STAGED_LINK" >&2
     return 1
   fi
 }
 
+adopt_original_tree_at() { # path
+  local identity digest
+  [[ -d "$1" && ! -L "$1" ]] || return 1
+  identity=$(path_identity "$1") || return 1
+  [[ "$identity" == "$ADOPT_SOURCE_IDENTITY" ]] || return 1
+  digest=$(stable_tree_digest "$1" "$identity" "$ADOPT_SOURCE_DEVICE") \
+    || return 1
+  [[ "$digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]]
+}
+
+describe_adopt_rollback_locations() {
+  local detail=""
+  local display_backup=$ADOPT_SOURCE_DISPLAY.vaultlock-backup
+  local display_staged_link=$ADOPT_SOURCE_DISPLAY.vaultlock-link
+  if adopt_original_tree_at "$ADOPT_SOURCE"; then
+    detail="original source restored at $ADOPT_SOURCE_DISPLAY"
+  elif [[ -e "$ADOPT_SOURCE" || -L "$ADOPT_SOURCE" ]]; then
+    detail="replacement retained at $ADOPT_SOURCE_DISPLAY"
+  fi
+  if adopt_original_tree_at "$ADOPT_BACKUP"; then
+    [[ -z "$detail" ]] || detail="$detail; "
+    detail="${detail}data remains at $display_backup, backup retained at $display_backup"
+  elif [[ -e "$ADOPT_BACKUP" || -L "$ADOPT_BACKUP" ]]; then
+    [[ -z "$detail" ]] || detail="$detail; "
+    detail="${detail}unverified backup retained at $display_backup"
+  fi
+  if [[ -e "$ADOPT_STAGED_LINK" || -L "$ADOPT_STAGED_LINK" ]]; then
+    [[ -z "$detail" ]] || detail="$detail; "
+    detail="${detail}staged link retained at $display_staged_link"
+  fi
+  [[ -n "$detail" ]] \
+    || detail="no adopt source or backup location could be verified"
+  printf '%s\n' "$detail"
+}
+
 rollback_adopt_source() {
   local backup_identity backup_digest restored_identity restored_digest
-  if [[ -L "$ADOPT_SOURCE" ]]; then rm -f -- "$ADOPT_SOURCE" || return 1; fi
+  if [[ -e "$ADOPT_SOURCE" || -L "$ADOPT_SOURCE" ]]; then
+    adopt_staged_link_owned_at "$ADOPT_SOURCE" || return 1
+    [[ ! -e "$ADOPT_STAGED_LINK" && ! -L "$ADOPT_STAGED_LINK" ]] \
+      || return 1
+    mv -n -- "$ADOPT_SOURCE" "$ADOPT_STAGED_LINK" || return 1
+    [[ ! -e "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" ]] || return 1
+    adopt_staged_link_owned_at "$ADOPT_STAGED_LINK" || return 1
+  fi
   [[ ! -e "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" ]] || return 1
   [[ -d "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
   backup_identity=$(path_identity "$ADOPT_BACKUP") || return 1
@@ -1839,7 +2063,8 @@ rollback_adopt_source() {
   backup_digest=$(stable_tree_digest "$ADOPT_BACKUP" "$backup_identity" \
     "$ADOPT_SOURCE_DEVICE") || return 1
   [[ "$backup_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] || return 1
-  mv -- "$ADOPT_BACKUP" "$ADOPT_SOURCE" || return 1
+  mv -n -- "$ADOPT_BACKUP" "$ADOPT_SOURCE" || return 1
+  [[ ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] || return 1
   restored_identity=$(path_identity "$ADOPT_SOURCE") || return 1
   restored_digest=$(stable_tree_digest "$ADOPT_SOURCE" "$restored_identity" \
     "$ADOPT_SOURCE_DEVICE") || restored_digest=""
@@ -1847,11 +2072,26 @@ rollback_adopt_source() {
       || "$restored_digest" != "$ADOPT_SOURCE_TREE_DIGEST" ]]; then
     if [[ -d "$ADOPT_SOURCE" && ! -L "$ADOPT_SOURCE" \
         && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]]; then
-      mv -- "$ADOPT_SOURCE" "$ADOPT_BACKUP" || return 1
+      mv -n -- "$ADOPT_SOURCE" "$ADOPT_BACKUP" || return 1
     fi
     return 1
   fi
   cleanup_staged_link
+}
+
+abort_adopt_replacement_with_rollback() { # reason
+  local detail rollback_status
+  if rollback_adopt_source; then
+    rollback_status=0
+  else
+    rollback_status=$?
+  fi
+  detail=$(describe_adopt_rollback_locations) \
+    || detail="no adopt source or backup location could be verified"
+  if [[ "$rollback_status" -eq 0 ]]; then
+    die "$1, $detail"
+  fi
+  die "$1, rollback incomplete; $detail"
 }
 
 adopt_mount_identity_matches() {
@@ -1898,7 +2138,7 @@ adopt_quarantined_backup_matches() {
   [[ ! -L "$quarantined" && -d "$quarantined" ]] || return 1
   [[ "$(path_identity "$quarantined")" == "$ADOPT_BACKUP_IDENTITY" ]] \
     || return 1
-  [[ "$(stat -f '%d' -- "$quarantined" 2>/dev/null)" \
+  [[ "$("$BSD_STAT" -f '%d' -- "$quarantined" 2>/dev/null)" \
     == "$ADOPT_BACKUP_DEVICE" ]] || return 1
   digest=$(stable_tree_digest "$quarantined" "$ADOPT_BACKUP_IDENTITY" \
     "$ADOPT_BACKUP_DEVICE") || return 1
@@ -1909,9 +2149,9 @@ tree_is_confined() { # root expected_identity expected_device
   local root=$1 expected_identity=$2 expected_device=$3 path device
   [[ ! -L "$root" && -d "$root" ]] || return 1
   [[ "$(path_identity "$root")" == "$expected_identity" ]] || return 1
-  if ! LC_ALL=C find -P -s -x "$root" -print0 \
+  if ! LC_ALL=C "$BSD_FIND" -P -s -x "$root" -print0 \
       | while IFS= read -r -d '' path; do
-      device=$(stat -f '%d' -- "$path" 2>/dev/null) || return 1
+      device=$("$BSD_STAT" -f '%d' -- "$path" 2>/dev/null) || return 1
       [[ "$device" == "$expected_device" ]] || return 1
       [[ -L "$path" || -d "$path" || -f "$path" ]] || return 1
       done; then
@@ -1928,9 +2168,130 @@ adopt_quarantined_backup_is_empty_tree() {
     || return 1
   tree_is_confined "$quarantined" "$ADOPT_BACKUP_IDENTITY" \
     "$ADOPT_BACKUP_DEVICE" || return 1
-  remaining=$(find -P -s -x "$quarantined" ! -type d -print -quit) \
+  remaining=$("$BSD_FIND" -P -s -x "$quarantined" ! -type d \
+    -print -quit) \
     || return 1
   [[ -z "$remaining" ]]
+}
+
+file_sha256_digest() { # path
+  local output
+  output=$(/usr/bin/shasum -a 256 < "$1" 2>/dev/null) || return 1
+  sha256_output_digest "$output"
+}
+
+verify_adopt_directory_skeleton() {
+  local digest
+  adopt_quarantine_envelope_matches || return 1
+  [[ -f "$ADOPT_DIRECTORY_SKELETON" \
+    && ! -L "$ADOPT_DIRECTORY_SKELETON" ]] || return 1
+  [[ "$(path_identity "$ADOPT_DIRECTORY_SKELETON")" \
+    == "$ADOPT_DIRECTORY_SKELETON_IDENTITY" ]] || return 1
+  [[ "$(path_mode "$ADOPT_DIRECTORY_SKELETON")" == "600" ]] || return 1
+  digest=$(file_sha256_digest "$ADOPT_DIRECTORY_SKELETON") || return 1
+  [[ "$digest" == "$ADOPT_DIRECTORY_SKELETON_DIGEST" ]]
+}
+
+create_adopt_directory_skeleton() {
+  local root=$ADOPT_BACKUP_QUARANTINE/backup path relative identity mode device
+  ADOPT_DIRECTORY_SKELETON=$ADOPT_BACKUP_QUARANTINE/.directory-skeleton
+  if ! (umask 077; set -o noclobber; : > "$ADOPT_DIRECTORY_SKELETON") \
+      2>/dev/null; then
+    die "cannot create protected directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  fi
+  chmod 600 "$ADOPT_DIRECTORY_SKELETON" \
+    || die "cannot protect directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  if ! LC_ALL=C "$BSD_FIND" -P -s -x "$root" -depth -type d -print0 \
+      | while IFS= read -r -d '' path; do
+        if [[ "$path" == "$root" ]]; then
+          relative=.
+        elif [[ "$path" == "$root/"* ]]; then
+          relative=${path#"$root/"}
+        else
+          return 1
+        fi
+        device=$("$BSD_STAT" -f '%d' -- "$path" 2>/dev/null) || return 1
+        [[ "$device" == "$ADOPT_BACKUP_DEVICE" ]] || return 1
+        identity=$(path_identity "$path") || return 1
+        mode=$(path_mode "$path") || return 1
+        printf '%s\0%s\0%s\0' "$relative" "$identity" "$mode" \
+          >> "$ADOPT_DIRECTORY_SKELETON" || return 1
+      done; then
+    die "cannot capture directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  fi
+  ADOPT_DIRECTORY_SKELETON_IDENTITY=$(path_identity \
+    "$ADOPT_DIRECTORY_SKELETON") \
+    || die "cannot capture directory skeleton identity, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  ADOPT_DIRECTORY_SKELETON_DIGEST=$(file_sha256_digest \
+    "$ADOPT_DIRECTORY_SKELETON") \
+    || die "cannot digest directory skeleton, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  verify_adopt_directory_skeleton \
+    || die "directory skeleton verification failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+}
+
+directory_is_in_adopt_skeleton() { # relative identity mode
+  local expected_relative=$1 expected_identity=$2 expected_mode=$3
+  local relative identity mode
+  while IFS= read -r -d '' relative \
+      && IFS= read -r -d '' identity \
+      && IFS= read -r -d '' mode; do
+    if [[ "$relative" == "$expected_relative" \
+        && "$identity" == "$expected_identity" \
+        && "$mode" == "$expected_mode" ]]; then
+      return 0
+    fi
+  done < "$ADOPT_DIRECTORY_SKELETON"
+  return 1
+}
+
+adopt_quarantine_directories_are_captured() {
+  local root=$ADOPT_BACKUP_QUARANTINE/backup path relative identity mode device
+  verify_adopt_directory_skeleton || return 1
+  LC_ALL=C "$BSD_FIND" -P -s -x "$root" -depth -type d -print0 \
+    | while IFS= read -r -d '' path; do
+      if [[ "$path" == "$root" ]]; then
+        relative=.
+      elif [[ "$path" == "$root/"* ]]; then
+        relative=${path#"$root/"}
+      else
+        return 1
+      fi
+      [[ ! -L "$path" && -d "$path" ]] || return 1
+      device=$("$BSD_STAT" -f '%d' -- "$path" 2>/dev/null) || return 1
+      [[ "$device" == "$ADOPT_BACKUP_DEVICE" ]] || return 1
+      identity=$(path_identity "$path") || return 1
+      mode=$(path_mode "$path") || return 1
+      directory_is_in_adopt_skeleton "$relative" "$identity" "$mode" \
+        || return 1
+    done
+}
+
+delete_captured_adopt_directories() {
+  local root=$ADOPT_BACKUP_QUARANTINE/backup relative identity mode path device
+  while IFS= read -r -d '' relative \
+      && IFS= read -r -d '' identity \
+      && IFS= read -r -d '' mode; do
+    verify_adopt_directory_skeleton \
+      || die "directory skeleton changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+    adopt_quarantine_directories_are_captured \
+      || die "directory cleanup boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+    if [[ "$relative" == "." ]]; then
+      path=$root
+    else
+      path=$root/$relative
+    fi
+    [[ ! -L "$path" && -d "$path" ]] \
+      || die "captured directory changed type, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+    [[ "$(path_identity "$path")" == "$identity" \
+      && "$(path_mode "$path")" == "$mode" ]] \
+      || die "captured directory identity changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+    device=$("$BSD_STAT" -f '%d' -- "$path" 2>/dev/null) \
+      || die "captured directory device unavailable, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+    [[ "$device" == "$ADOPT_BACKUP_DEVICE" ]] \
+      || die "captured directory device changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+    rmdir "$path" \
+      || die "captured directory removal failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  done < "$ADOPT_DIRECTORY_SKELETON"
 }
 
 create_adopt_backup_quarantine() {
@@ -1958,22 +2319,30 @@ quarantine_adopt_backup() {
   fi
   adopt_quarantined_backup_matches \
     || die "backup quarantine verification failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  create_adopt_directory_skeleton
 }
 
 delete_quarantined_adopt_backup() {
   local quarantined=$ADOPT_BACKUP_QUARANTINE/backup
   adopt_quarantined_backup_matches \
     || die "backup deletion boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
-  find -P -x "$quarantined" -depth ! -type d \
+  "$BSD_FIND" -P -x "$quarantined" -depth ! -type d \
     -exec /bin/rm -f -- {} + \
     || die "replacement succeeded but backup cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   adopt_quarantined_backup_is_empty_tree \
     || die "backup cleanup boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
-  find -P -x "$quarantined" -depth -type d \
-    -exec /bin/rmdir -- {} + \
-    || die "replacement succeeded but backup cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  adopt_quarantine_directories_are_captured \
+    || die "directory cleanup boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  delete_captured_adopt_directories
   [[ ! -e "$quarantined" && ! -L "$quarantined" ]] \
     || die "replacement succeeded but quarantined backup remains at $quarantined"
+  verify_adopt_directory_skeleton \
+    || die "directory skeleton changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  /bin/rm -f -- "$ADOPT_DIRECTORY_SKELETON" \
+    || die "directory skeleton cleanup failed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
+  [[ ! -e "$ADOPT_DIRECTORY_SKELETON" \
+      && ! -L "$ADOPT_DIRECTORY_SKELETON" ]] \
+    || die "directory skeleton retained at $ADOPT_DIRECTORY_SKELETON"
   adopt_quarantine_envelope_matches \
     || die "backup quarantine boundary changed, quarantine retained at $ADOPT_BACKUP_QUARANTINE"
   rmdir -- "$ADOPT_BACKUP_QUARANTINE" \
@@ -1981,6 +2350,9 @@ delete_quarantined_adopt_backup() {
   ADOPT_BACKUP=""
   ADOPT_BACKUP_QUARANTINE=""
   ADOPT_BACKUP_QUARANTINE_IDENTITY=""
+  ADOPT_DIRECTORY_SKELETON=""
+  ADOPT_DIRECTORY_SKELETON_IDENTITY=""
+  ADOPT_DIRECTORY_SKELETON_DIGEST=""
 }
 
 execute_adopt_replace_source() {
@@ -1997,6 +2369,15 @@ execute_adopt_replace_source() {
     || die "adopt staging paths already exist"
   ln -s -- "$ADOPT_DESTINATION" "$ADOPT_STAGED_LINK" \
     || die "cannot stage replacement symlink, source remains unchanged"
+  ADOPT_STAGED_LINK_IDENTITY=$(path_identity "$ADOPT_STAGED_LINK") \
+    || die "cannot capture staged link identity, staged link retained at $ADOPT_STAGED_LINK"
+  ADOPT_STAGED_LINK_TARGET=$(/usr/bin/readlink -- "$ADOPT_STAGED_LINK" \
+    2>/dev/null) \
+    || die "cannot capture staged link target, staged link retained at $ADOPT_STAGED_LINK"
+  [[ "$ADOPT_STAGED_LINK_TARGET" == "$ADOPT_DESTINATION" ]] \
+    || die "staged link target changed, staged link retained at $ADOPT_STAGED_LINK"
+  adopt_staged_link_owned_at "$ADOPT_STAGED_LINK" \
+    || die "staged link identity changed, staged link retained at $ADOPT_STAGED_LINK"
   assert_adopt_source_manifest \
     "source manifest changed before backup move, staged link retained at $ADOPT_STAGED_LINK"
   assert_adopt_destination_manifest \
@@ -2013,7 +2394,8 @@ execute_adopt_replace_source() {
   [[ "$ADOPT_BACKUP_IDENTITY" == "$ADOPT_SOURCE_IDENTITY" ]] || {
     die "staged source backup identity changed, backup retained at $ADOPT_BACKUP"
   }
-  ADOPT_BACKUP_DEVICE=$(stat -f '%d' -- "$ADOPT_BACKUP" 2>/dev/null) \
+  ADOPT_BACKUP_DEVICE=$("$BSD_STAT" -f '%d' -- "$ADOPT_BACKUP" \
+    2>/dev/null) \
     || die "cannot verify staged source backup device, backup retained at $ADOPT_BACKUP"
   [[ "$ADOPT_BACKUP_DEVICE" == "$ADOPT_SOURCE_DEVICE" ]] \
     || die "staged source backup device changed, backup retained at $ADOPT_BACKUP"
@@ -2026,16 +2408,14 @@ execute_adopt_replace_source() {
   assert_adopt_destination_manifest \
     "destination manifest changed after backup move, backup retained at $ADOPT_BACKUP"
   verify_adopt_mount_identity
-  if ! mv -- "$ADOPT_STAGED_LINK" "$ADOPT_SOURCE"; then
-    rollback_adopt_source \
-      || die "replacement failed and rollback failed, data remains at $ADOPT_BACKUP, backup retained at $ADOPT_BACKUP"
-    die "replacement failed, original source restored"
+  if ! mv -n -- "$ADOPT_STAGED_LINK" "$ADOPT_SOURCE" \
+      || [[ -e "$ADOPT_STAGED_LINK" || -L "$ADOPT_STAGED_LINK" ]]; then
+    abort_adopt_replacement_with_rollback "replacement failed"
   fi
   link_target=$(readlink "$ADOPT_SOURCE" 2>/dev/null) || link_target=""
-  if [[ ! -L "$ADOPT_SOURCE" || "$link_target" != "$ADOPT_DESTINATION" ]]; then
-    rollback_adopt_source \
-      || die "replacement verification failed and rollback failed, data remains at $ADOPT_BACKUP, backup retained at $ADOPT_BACKUP"
-    die "replacement verification failed, original source restored"
+  if [[ ! -L "$ADOPT_SOURCE" || "$link_target" != "$ADOPT_DESTINATION" ]] \
+      || ! adopt_staged_link_owned_at "$ADOPT_SOURCE"; then
+    abort_adopt_replacement_with_rollback "replacement verification failed"
   fi
   ADOPT_BACKUP_IDENTITY=$(path_identity "$ADOPT_BACKUP") \
     || die "cannot verify backup before cleanup, backup retained at $ADOPT_BACKUP"

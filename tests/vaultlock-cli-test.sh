@@ -10,6 +10,13 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
   : "${VAULTLOCK_TEST_MUTATION_LOG:?missing mutation log}"
   : "${VAULTLOCK_TEST_HOOK_LOG:?missing hook log}"
   : "${VAULTLOCK_TEST_APFS_STATE:?missing APFS state directory}"
+  if [[ -n "${VAULTLOCK_TEST_GNU_PATH_DIR:-}" \
+      && "${0%/*}" == "$VAULTLOCK_TEST_GNU_PATH_DIR" \
+      && ( "$fixture_command" == "find" || "$fixture_command" == "stat" ) ]]; then
+    : > "$VAULTLOCK_TEST_APFS_STATE/gnu_path_tool_called"
+    printf '%s: unsupported BSD option\n' "$fixture_command" >&2
+    exit 64
+  fi
   : "${VAULTLOCK_TEST_FAKE_BIN:?missing fake binary directory}"
   : "${VAULTLOCK_MOUNT_POINT:?missing mount point}"
 
@@ -430,18 +437,48 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       ;;
     base64) /usr/bin/base64 "$@" ;;
     ditto)
+      fixture_ditto_source=""
+      fixture_ditto_destination=""
+      for fixture_argument in "$@"; do
+        fixture_ditto_source=$fixture_ditto_destination
+        fixture_ditto_destination=$fixture_argument
+      done
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_ditto" ]]; then
-        /bin/mkdir -p "$2"
-        printf 'partial\n' > "$2/partial-copy"
+        /bin/mkdir -p "$fixture_ditto_destination"
+        printf 'partial\n' > "$fixture_ditto_destination/partial-copy"
         exit 1
       fi
       /usr/bin/ditto "$@" || exit 1
+      if [[ -n "${DITTONORSRC:-}" ]]; then
+        /usr/bin/xattr -c "$fixture_ditto_destination/subdirectory/file"
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/drop_copy_mtime" ]]; then
+        /usr/bin/touch -t 202001020304 \
+          "$fixture_ditto_destination/subdirectory/file"
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/drop_copy_flags" ]]; then
+        /usr/bin/chflags nohidden "$fixture_ditto_destination/subdirectory/file"
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/drop_copy_xattrs" ]]; then
+        /usr/bin/xattr -c "$fixture_ditto_destination/subdirectory/file"
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/break_copy_hardlink" ]]; then
+        /bin/cp -p "$fixture_ditto_destination/subdirectory/file" \
+          "$fixture_ditto_destination/subdirectory/broken-link"
+        /bin/mv "$fixture_ditto_destination/subdirectory/broken-link" \
+          "$fixture_ditto_destination/subdirectory/hardlink"
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/rename_copy_trailing_newline" ]]; then
+        /bin/mv "$fixture_ditto_destination/"$'trailing\n' \
+          "$fixture_ditto_destination/trailing"
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/modify_source_after_copy" ]]; then
-        printf 'modified after copy\n' > "$1/subdirectory/file"
+        printf 'modified after copy\n' \
+          > "$fixture_ditto_source/subdirectory/file"
         /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/modify_source_after_copy"
       fi
       [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/add_copy_entry" ]] \
-        || printf 'extra\n' > "$2/extra-copy-entry"
+        || printf 'extra\n' > "$fixture_ditto_destination/extra-copy-entry"
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_mount_uuid_after_copy" ]]; then
         fixture_write uuid UUID-SWAPPED
       fi
@@ -455,11 +492,50 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     stat)
       fixture_stat_path=""
       for fixture_argument in "$@"; do fixture_stat_path=$fixture_argument; done
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/foreign_device_after_backup_quarantine" \
+      if [[ ( -f "$VAULTLOCK_TEST_APFS_STATE/source_compressed_flags" \
+            || -f "$VAULTLOCK_TEST_APFS_STATE/source_immutable_flags" \
+            || -f "$VAULTLOCK_TEST_APFS_STATE/source_append_flags" ) \
+          && "$fixture_stat_path" != "$VAULTLOCK_MOUNT_POINT"/* \
+          && "${1:-}" == "-f" \
+          && "${2:-}" == '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9Fc:%f:%r:%l' ]]; then
+        fixture_flag_metadata=$(/usr/bin/stat "$@") || exit 1
+        IFS=: read -r fixture_device fixture_inode fixture_mode fixture_uid \
+          fixture_gid fixture_size fixture_mtime fixture_ctime fixture_flags \
+          fixture_rdev fixture_nlink <<< "$fixture_flag_metadata"
+        fixture_flags=32
+        [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/source_immutable_flags" ]] \
+          || fixture_flags=2
+        [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/source_append_flags" ]] \
+          || fixture_flags=4
+        printf '%s:%s:%s:%s:%s:%s:%s:%s:%s:%s:%s\n' \
+          "$fixture_device" "$fixture_inode" "$fixture_mode" "$fixture_uid" \
+          "$fixture_gid" "$fixture_size" "$fixture_mtime" "$fixture_ctime" \
+          "$fixture_flags" "$fixture_rdev" "$fixture_nlink"
+      elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/drop_copy_owner_metadata" \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/copy_complete" \
+          && "$fixture_stat_path" == "$VAULTLOCK_MOUNT_POINT"/* \
+          && "${1:-}" == "-f" \
+          && "${2:-}" == '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9Fc:%f:%r:%l' ]]; then
+        fixture_owner_metadata=$(/usr/bin/stat "$@") || exit 1
+        IFS=: read -r fixture_device fixture_inode fixture_mode fixture_uid \
+          fixture_gid fixture_size fixture_mtime fixture_ctime fixture_flags \
+          fixture_rdev fixture_nlink <<< "$fixture_owner_metadata"
+        printf '%s:%s:%s:999:%s:%s:%s:%s:%s:%s:%s\n' \
+          "$fixture_device" "$fixture_inode" "$fixture_mode" "$fixture_gid" \
+          "$fixture_size" "$fixture_mtime" "$fixture_ctime" "$fixture_flags" \
+          "$fixture_rdev" "$fixture_nlink"
+      elif [[ -f "$VAULTLOCK_TEST_APFS_STATE/foreign_device_after_backup_quarantine" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/adopt_backup_quarantined" \
-          && "$fixture_stat_path" == *.vaultlock-quarantine.*/backup/subdirectory/file \
-          && "${1:-}" == "-f" && "${2:-}" == "%d" ]]; then
-        printf '999\n'
+          && "$fixture_stat_path" == *.vaultlock-quarantine.*/backup/subdirectory/file ]]; then
+        if [[ "${1:-}" == "-f" && "${2:-}" == "%d" ]]; then
+          printf '999\n'
+        elif [[ "${1:-}" == "-f" \
+            && "${2:-}" == '%d:%i:%Lp:%u:%g:%z:%.9Fm:%.9Fc:%f:%r:%l' ]]; then
+          fixture_foreign_metadata=$(/usr/bin/stat "$@") || exit 1
+          printf '999:%s\n' "${fixture_foreign_metadata#*:}"
+        else
+          /usr/bin/stat "$@"
+        fi
       elif [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/state.json" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/overwrite_state_after_install_identity" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/state_link_installed" ]]; then
@@ -553,10 +629,27 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         /usr/bin/stat "$@"
       fi
       ;;
+    ls)
+      fixture_ls_path=""
+      for fixture_argument in "$@"; do fixture_ls_path=$fixture_argument; done
+      /bin/ls "$@" || exit 1
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/drop_copy_acl" \
+          && " $* " == *" -ldnePB "* \
+          && "$fixture_ls_path" != "$VAULTLOCK_MOUNT_POINT"/* ]]; then
+        printf ' 0: user:501 allow read\n'
+      fi
+      ;;
     find)
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_cleanup" \
           && " $* " == *" -exec /bin/rm "* ]]; then
         exit 1
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/insert_directory_after_file_cleanup" \
+          && " $* " == *" -exec /bin/rmdir "* \
+          && "${1:-}" == *.vaultlock-quarantine.*/backup ]]; then
+        /bin/mkdir "$1/inserted-after-file-cleanup"
+        /bin/rm -f \
+          "$VAULTLOCK_TEST_APFS_STATE/insert_directory_after_file_cleanup"
       fi
       /usr/bin/find "$@"
       ;;
@@ -606,6 +699,12 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           && "$fixture_mv_source" == *.vaultlock-link \
           && "$fixture_mv_destination" == "${fixture_mv_source%.vaultlock-link}" ]]; then
         : > "$VAULTLOCK_TEST_APFS_STATE/adopt_link_move_failed"
+        if [[ -f "$VAULTLOCK_TEST_APFS_STATE/race_source_symlink_on_link_move_failure" ]]; then
+          /bin/ln -s "$VAULTLOCK_TEST_APFS_STATE/unowned-link-target" \
+            "$fixture_mv_destination"
+          /bin/rm -f \
+            "$VAULTLOCK_TEST_APFS_STATE/race_source_symlink_on_link_move_failure"
+        fi
         exit 1
       fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_rollback_move" \
@@ -702,7 +801,18 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/remove_state_after_state"
       fi
       ;;
-    rmdir) /bin/rmdir "$@" ;;
+    rmdir)
+      fixture_rmdir_path=""
+      for fixture_argument in "$@"; do fixture_rmdir_path=$fixture_argument; done
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/insert_directory_after_file_cleanup" \
+          && "$fixture_rmdir_path" == *.vaultlock-quarantine.*/backup* ]]; then
+        /bin/mkdir \
+          "${fixture_rmdir_path%%/backup*}/backup/inserted-after-file-cleanup"
+        /bin/rm -f \
+          "$VAULTLOCK_TEST_APFS_STATE/insert_directory_after_file_cleanup"
+      fi
+      /bin/rmdir "$@"
+      ;;
     mkdir) /bin/mkdir "$@" ;;
     chmod)
       fixture_chmod_mode=${1:-}
@@ -733,6 +843,7 @@ test_root=$(mktemp -d "/tmp/vaultlock cli.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT
 
 fake_bin="$test_root/bin"
+gnu_bin="$test_root/gnu-bin"
 action_log="$test_root/actions"
 mutation_log="$test_root/mutations"
 hook_log="$test_root/hooks"
@@ -741,7 +852,7 @@ test_home="$test_root/home"
 state_dir="$test_home/.vaultlock"
 mount_point="$test_root/Volumes/vault.test"
 confirm_device="$test_root/confirm"
-mkdir -p "$fake_bin" "$apfs_state" "$state_dir" "$mount_point"
+mkdir -p "$fake_bin" "$gnu_bin" "$apfs_state" "$state_dir" "$mount_point"
 : > "$action_log"
 : > "$mutation_log"
 : > "$hook_log"
@@ -749,11 +860,13 @@ mkdir -p "$fake_bin" "$apfs_state" "$state_dir" "$mount_point"
 
 TEST_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 for fake_command in diskutil security sudo tle tmutil curl mount head base64 \
-  ditto dirname basename stat find wc readlink mv ln rm rmdir mkdir chmod \
+  ditto dirname basename stat find ls wc readlink mv ln rm rmdir mkdir chmod \
   mktemp \
   mount-fixture bash-version-fixture; do
   ln -s "$TEST_SELF" "$fake_bin/$fake_command"
 done
+ln -s "$TEST_SELF" "$gnu_bin/find"
+ln -s "$TEST_SELF" "$gnu_bin/stat"
 
 for read_only_utility in cat jq plutil grep tr; do
   utility_path=$(command -v "$read_only_utility") \
@@ -835,6 +948,31 @@ run_vaultlock() {
   VAULTLOCK_CONFIRM_DEVICE="$confirm_device" \
   VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   VAULTLOCK_TEST_FAKE_BIN="$fake_bin" \
+  VAULTLOCK_TEST_DITTO="$fake_bin/ditto" \
+  VAULTLOCK_TEST_BSD_FIND="$fake_bin/find" \
+  VAULTLOCK_TEST_BSD_LS="$fake_bin/ls" \
+  VAULTLOCK_TEST_BSD_STAT="$fake_bin/stat" \
+  VAULTLOCK_TEST_ACTION_LOG="$action_log" \
+  VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
+  VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
+  VAULTLOCK_TEST_APFS_STATE="$apfs_state" \
+  /bin/bash "$VL" "$@"
+}
+
+run_vaultlock_with_gnu_path() {
+  HOME="$test_home" \
+  PATH="$gnu_bin:$fake_bin" \
+  VAULTLOCK_STATE_DIR="$state_dir" \
+  VAULTLOCK_MOUNT_POINT="$mount_point" \
+  VAULTLOCK_MOUNT_COMMAND="$fake_bin/mount-fixture" \
+  VAULTLOCK_CONFIRM_DEVICE="$confirm_device" \
+  VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  VAULTLOCK_TEST_FAKE_BIN="$fake_bin" \
+  VAULTLOCK_TEST_DITTO="$fake_bin/ditto" \
+  VAULTLOCK_TEST_GNU_PATH_DIR="$gnu_bin" \
+  VAULTLOCK_TEST_BSD_FIND="$fake_bin/find" \
+  VAULTLOCK_TEST_BSD_LS="$fake_bin/ls" \
+  VAULTLOCK_TEST_BSD_STAT="$fake_bin/stat" \
   VAULTLOCK_TEST_ACTION_LOG="$action_log" \
   VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
   VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
@@ -853,6 +991,10 @@ run_vaultlock_with_stdin() { # input command...
   VAULTLOCK_CONFIRM_DEVICE="$confirm_device" \
   VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   VAULTLOCK_TEST_FAKE_BIN="$fake_bin" \
+  VAULTLOCK_TEST_DITTO="$fake_bin/ditto" \
+  VAULTLOCK_TEST_BSD_FIND="$fake_bin/find" \
+  VAULTLOCK_TEST_BSD_LS="$fake_bin/ls" \
+  VAULTLOCK_TEST_BSD_STAT="$fake_bin/stat" \
   VAULTLOCK_TEST_ACTION_LOG="$action_log" \
   VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
   VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
@@ -871,6 +1013,10 @@ run_vaultlock_tty_yes() {
     "VAULTLOCK_CONFIRM_DEVICE=/dev/tty" \
     "VAULTLOCK_TEST_FAKE_SYSTEM=1" \
     "VAULTLOCK_TEST_FAKE_BIN=$fake_bin" \
+    "VAULTLOCK_TEST_DITTO=$fake_bin/ditto" \
+    "VAULTLOCK_TEST_BSD_FIND=$fake_bin/find" \
+    "VAULTLOCK_TEST_BSD_LS=$fake_bin/ls" \
+    "VAULTLOCK_TEST_BSD_STAT=$fake_bin/stat" \
     "VAULTLOCK_TEST_ACTION_LOG=$action_log" \
     "VAULTLOCK_TEST_MUTATION_LOG=$mutation_log" \
     "VAULTLOCK_TEST_HOOK_LOG=$hook_log" \
@@ -1813,6 +1959,16 @@ check_count "adopt missing ditto renders no plan" 0 \
 check_empty "adopt missing ditto performs no mutation" "$mutation_log"
 mv "$fake_bin/ditto.missing" "$fake_bin/ditto"
 
+rm -f "$apfs_state/gnu_path_tool_called"
+if gnu_path_adopt_output=$(run_vaultlock_with_gnu_path adopt --dry-run \
+    "$adopt_source" 2>&1); then
+  :
+else
+  record_failure "adopt uses explicit BSD find and stat: ${gnu_path_adopt_output//$'\n'/ | }"
+fi
+[[ ! -e "$apfs_state/gnu_path_tool_called" ]] \
+  || record_failure "adopt bypasses incompatible PATH find and stat"
+
 : > "$mutation_log"
 adopt_plan=$(run_vaultlock adopt --dry-run "$adopt_source")
 check_contains "adopt dry-run plans copy" \
@@ -1864,22 +2020,32 @@ reset_adopt_fixture() {
   : > "$hook_log"
   rm -f "$apfs_state/fail_ditto" "$apfs_state/add_copy_entry" \
     "$apfs_state/modify_source_after_copy" \
+    "$apfs_state/drop_copy_mtime" "$apfs_state/drop_copy_flags" \
+    "$apfs_state/drop_copy_xattrs" "$apfs_state/drop_copy_owner_metadata" \
+    "$apfs_state/drop_copy_acl" "$apfs_state/break_copy_hardlink" \
+    "$apfs_state/rename_copy_trailing_newline" \
+    "$apfs_state/source_compressed_flags" \
+    "$apfs_state/source_immutable_flags" \
+    "$apfs_state/source_append_flags" \
     "$apfs_state/replace_source_entry_before_backup_move" \
     "$apfs_state/foreign_device_after_backup_quarantine" \
     "$apfs_state/swap_backup_at_quarantine_boundary" \
     "$apfs_state/adopt_backup_quarantined" \
+    "$apfs_state/insert_directory_after_file_cleanup" \
     "$apfs_state/fail_staged_link_cleanup" \
     "$apfs_state/swap_mount_uuid_after_copy" \
     "$apfs_state/swap_mount_device_after_copy" \
     "$apfs_state/swap_source_identity_after_copy" \
     "$apfs_state/swap_destination_identity" "$apfs_state/fail_ln" \
     "$apfs_state/swap_backup_identity" "$apfs_state/adopt_link_move_failed" \
+    "$apfs_state/race_source_symlink_on_link_move_failure" \
     "$apfs_state/swap_restored_identity" "$apfs_state/rollback_moved" \
     "$apfs_state/fail_link_verification" \
     "$apfs_state/fail_backup_move" "$apfs_state/fail_link_move" \
     "$apfs_state/fail_rollback_move" "$apfs_state/fail_cleanup" \
     "$apfs_state/copy_complete" \
-    "$apfs_state/destination_stat_count"
+    "$apfs_state/destination_stat_count" \
+    "$apfs_state/gnu_path_tool_called"
   write_apfs_state false true UUID-INIT disk8s1
 }
 
@@ -2000,6 +2166,117 @@ count_failure_source=$(new_adopt_source count-failure)
 expect_adopt_failure_preserves_source "adopt count mismatch" \
   "$count_failure_source" 'copy verification failed'
 
+expect_adopt_manifest_loss() { # description source
+  local description=$1 source=$2 output
+  if output=$(run_vaultlock adopt --yes "$source" 2>&1); then
+    record_failure "$description"
+  else
+    check_contains "$description reports copy verification" \
+      'copy verification failed' "$output"
+  fi
+}
+
+reset_adopt_fixture
+dittonorsrc_source=$(new_adopt_source dittonorsrc-sabotage)
+/usr/bin/xattr -wx com.apple.ResourceFork 000102 \
+  "$dittonorsrc_source/subdirectory/file"
+if dittonorsrc_output=$(DITTONORSRC=1 run_vaultlock adopt --yes \
+    "$dittonorsrc_source" 2>&1); then
+  :
+else
+  record_failure "adopt unsets inherited DITTONORSRC: ${dittonorsrc_output//$'\n'/ | }"
+fi
+dittonorsrc_resource_fork=$(/usr/bin/xattr -px com.apple.ResourceFork \
+  "$mount_point/dittonorsrc-sabotage/subdirectory/file" 2>/dev/null \
+  | tr -d '[:space:]') || dittonorsrc_resource_fork=""
+check "adopt preserves resource fork with inherited DITTONORSRC" 000102 \
+  "$dittonorsrc_resource_fork"
+
+expect_adopt_precopy_manifest_refusal() { # description marker source
+  local description=$1 marker=$2 source=$3 output
+  [[ "$marker" == "-" ]] || : > "$apfs_state/$marker"
+  if output=$(run_vaultlock adopt --yes "$source" 2>&1); then
+    record_failure "$description"
+  else
+    check_contains "$description reports manifest refusal" \
+      'cannot create stable source manifest' "$output"
+  fi
+  [[ ! -e "$apfs_state/copy_complete" \
+      && ! -e "$mount_point/${source##*/}" ]] \
+    || record_failure "$description copies nothing"
+}
+
+reset_adopt_fixture
+compressed_flags_source=$(new_adopt_source compressed-flags)
+expect_adopt_precopy_manifest_refusal "adopt rejects compressed source flags" \
+  source_compressed_flags "$compressed_flags_source"
+
+reset_adopt_fixture
+immutable_flags_source=$(new_adopt_source immutable-flags)
+expect_adopt_precopy_manifest_refusal "adopt rejects immutable source flags" \
+  source_immutable_flags "$immutable_flags_source"
+
+reset_adopt_fixture
+append_flags_source=$(new_adopt_source append-flags)
+expect_adopt_precopy_manifest_refusal "adopt rejects append-only source flags" \
+  source_append_flags "$append_flags_source"
+
+reset_adopt_fixture
+external_hardlink_source=$(new_adopt_source external-hardlink)
+/bin/ln "$external_hardlink_source/subdirectory/file" \
+  "$test_root/external-hardlink-entry"
+expect_adopt_precopy_manifest_refusal \
+  "adopt rejects hardlinks outside the source tree" - \
+  "$external_hardlink_source"
+
+reset_adopt_fixture
+trailing_newline_source=$(new_adopt_source trailing-newline-loss)
+printf 'trailing newline path\n' > "$trailing_newline_source/"$'trailing\n'
+: > "$apfs_state/rename_copy_trailing_newline"
+expect_adopt_manifest_loss "adopt rejects copied trailing-newline path loss" \
+  "$trailing_newline_source"
+
+reset_adopt_fixture
+mtime_loss_source=$(new_adopt_source mtime-loss)
+: > "$apfs_state/drop_copy_mtime"
+expect_adopt_manifest_loss "adopt rejects copied mtime loss" \
+  "$mtime_loss_source"
+
+reset_adopt_fixture
+flags_loss_source=$(new_adopt_source flags-loss)
+/usr/bin/chflags hidden "$flags_loss_source/subdirectory/file"
+: > "$apfs_state/drop_copy_flags"
+expect_adopt_manifest_loss "adopt rejects copied file flags loss" \
+  "$flags_loss_source"
+
+reset_adopt_fixture
+xattr_loss_source=$(new_adopt_source xattr-loss)
+/usr/bin/xattr -wx com.apple.ResourceFork 000102 \
+  "$xattr_loss_source/subdirectory/file"
+: > "$apfs_state/drop_copy_xattrs"
+expect_adopt_manifest_loss "adopt rejects copied xattr loss" \
+  "$xattr_loss_source"
+
+reset_adopt_fixture
+owner_loss_source=$(new_adopt_source owner-loss)
+: > "$apfs_state/drop_copy_owner_metadata"
+expect_adopt_manifest_loss "adopt rejects copied owner loss" \
+  "$owner_loss_source"
+
+reset_adopt_fixture
+acl_loss_source=$(new_adopt_source acl-loss)
+: > "$apfs_state/drop_copy_acl"
+expect_adopt_manifest_loss "adopt rejects copied ACL loss" \
+  "$acl_loss_source"
+
+reset_adopt_fixture
+hardlink_loss_source=$(new_adopt_source hardlink-loss)
+/bin/ln "$hardlink_loss_source/subdirectory/file" \
+  "$hardlink_loss_source/subdirectory/hardlink"
+: > "$apfs_state/break_copy_hardlink"
+expect_adopt_manifest_loss "adopt rejects copied hardlink topology loss" \
+  "$hardlink_loss_source"
+
 reset_adopt_fixture
 source_content_change_source=$(new_adopt_source source-content-change)
 : > "$apfs_state/modify_source_after_copy"
@@ -2066,6 +2343,48 @@ expect_adopt_failure_preserves_source "adopt link move rollback" \
   "$link_move_failure_source" 'original source restored'
 
 reset_adopt_fixture
+rollback_symlink_race_source=$(new_adopt_source rollback-symlink-race)
+: > "$apfs_state/fail_link_move"
+: > "$apfs_state/race_source_symlink_on_link_move_failure"
+if rollback_symlink_race_output=$(run_vaultlock adopt --yes \
+    "$rollback_symlink_race_source" 2>&1); then
+  record_failure "adopt rollback refuses unowned source symlink"
+else
+  check_contains "adopt rollback race reports retained replacement" \
+    "replacement retained at $rollback_symlink_race_source" \
+    "$rollback_symlink_race_output"
+  check_contains "adopt rollback race reports retained backup" \
+    "backup retained at $rollback_symlink_race_source.vaultlock-backup" \
+    "$rollback_symlink_race_output"
+fi
+[[ -L "$rollback_symlink_race_source" \
+    && "$(readlink "$rollback_symlink_race_source")" \
+      == "$apfs_state/unowned-link-target" \
+    && -d "$rollback_symlink_race_source.vaultlock-backup" ]] \
+  || record_failure "adopt rollback race retains replacement and backup"
+
+reset_adopt_fixture
+rollback_cleanup_source=$(new_adopt_source rollback-cleanup-reporting)
+: > "$apfs_state/fail_link_move"
+: > "$apfs_state/fail_staged_link_cleanup"
+if rollback_cleanup_output=$(run_vaultlock adopt --yes \
+    "$rollback_cleanup_source" 2>&1); then
+  record_failure "adopt rollback cleanup failure exits nonzero"
+else
+  check_contains "adopt rollback cleanup reports restored source" \
+    'original source restored' "$rollback_cleanup_output"
+  check_contains "adopt rollback cleanup reports retained staged link" \
+    "$rollback_cleanup_source.vaultlock-link" "$rollback_cleanup_output"
+  check_count "adopt rollback cleanup omits absent backup claim" 0 \
+    "data remains at $rollback_cleanup_source.vaultlock-backup" \
+    "$rollback_cleanup_output"
+fi
+[[ -d "$rollback_cleanup_source" && ! -L "$rollback_cleanup_source" \
+    && -L "$rollback_cleanup_source.vaultlock-link" \
+    && ! -e "$rollback_cleanup_source.vaultlock-backup" ]] \
+  || record_failure "adopt rollback cleanup retains actual restored locations"
+
+reset_adopt_fixture
 staged_cleanup_failure_source=$(new_adopt_source staged-cleanup-failure)
 : > "$apfs_state/fail_backup_move"
 : > "$apfs_state/fail_staged_link_cleanup"
@@ -2095,6 +2414,22 @@ fi
 cleanup_backup_count=$(find "$test_root" -maxdepth 1 -type d \
   -name 'cleanup-failure.vaultlock-quarantine.*' | wc -l | tr -d ' ')
 check "adopt cleanup failure retains one quarantine" 1 "$cleanup_backup_count"
+
+reset_adopt_fixture
+directory_insertion_source=$(new_adopt_source directory-insertion)
+: > "$apfs_state/insert_directory_after_file_cleanup"
+if directory_insertion_output=$(run_vaultlock adopt --yes \
+    "$directory_insertion_source" 2>&1); then
+  record_failure "adopt rejects directory insertion after file cleanup"
+else
+  check_contains "adopt directory insertion reports quarantine" \
+    'quarantine retained at' "$directory_insertion_output"
+fi
+directory_insertion_quarantine=$(find "$test_root" -maxdepth 1 -type d \
+  -name 'directory-insertion.vaultlock-quarantine.*' -print -quit)
+[[ -n "$directory_insertion_quarantine" \
+    && -d "$directory_insertion_quarantine/backup/inserted-after-file-cleanup" ]] \
+  || record_failure "adopt directory insertion retains unexpected directory"
 
 reset_adopt_fixture
 foreign_device_source=$(new_adopt_source foreign-device)
