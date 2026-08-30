@@ -6,7 +6,8 @@
 # exists, the decryption key material does not exist anywhere.
 #
 # Env overrides (for tests): VAULTLOCK_STATE_DIR, VAULTLOCK_VOLUME,
-# VAULTLOCK_CONTAINER, VAULTLOCK_MOUNT_POINT.
+# VAULTLOCK_CONTAINER, VAULTLOCK_MOUNT_POINT, VAULTLOCK_MOUNT_COMMAND,
+# VAULTLOCK_CONFIRM_DEVICE.
 # shellcheck disable=SC2034  # Constants are used by later tasks
 set -euo pipefail
 
@@ -21,6 +22,8 @@ STATE_DIR=${VAULTLOCK_STATE_DIR:-$HOME/.vaultlock}
 VOLUME=${VAULTLOCK_VOLUME:-vault}
 CONTAINER=${VAULTLOCK_CONTAINER:-disk3}
 MOUNT_POINT=${VAULTLOCK_MOUNT_POINT:-/Volumes/$VOLUME}
+MOUNT_COMMAND=${VAULTLOCK_MOUNT_COMMAND:-mount}
+CONFIRM_DEVICE=${VAULTLOCK_CONFIRM_DEVICE:-/dev/tty}
 KEYCHAIN_SERVICE="vaultlock-$VOLUME"
 state_file="$STATE_DIR/state.json"
 
@@ -374,7 +377,7 @@ require_mounted() {
 
     uuid=$(vol_uuid)
     device=$(vol_device)
-    if ! mount | grep -q "on $MOUNT_POINT ("; then
+    if ! "$MOUNT_COMMAND" | grep -q "on $MOUNT_POINT ("; then
         diskutil mount "$device" >/dev/null 2>&1 \
             || die "vault is not mountable (locked?), see: vaultlock status"
     fi
@@ -599,7 +602,7 @@ cmd_status() {
     note "drand round: target $round, current $(current_round)"
     note "when the deadline passes: vaultlock unlock (needs internet)"
   else
-    if mount | grep -q "on $MOUNT_POINT ("; then
+    if "$MOUNT_COMMAND" | grep -q "on $MOUNT_POINT ("; then
       note "UNLOCKED (mounted at $MOUNT_POINT)"
     else
       note "UNLOCKED (not mounted)"
