@@ -452,6 +452,18 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       fixture_stat_path=""
       for fixture_argument in "$@"; do fixture_stat_path=$fixture_argument; done
       if [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/state.json" \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/overwrite_state_after_install_identity" \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/state_link_installed" ]]; then
+        /usr/bin/stat "$@" || exit 1
+        /usr/bin/stat -f '%d:%i' "$VAULTLOCK_STATE_DIR/state.json" \
+          > "$VAULTLOCK_TEST_APFS_STATE/state_install_inode_before_rewrite"
+        printf '%s\n' \
+          '{"locked":false,"volume_uuid":"UUID-INIT","created":"rewritten-before-installed-digest","deadline":null,"deadline_epoch":null,"round":null}' \
+          > "$VAULTLOCK_STATE_DIR/state.json"
+        /usr/bin/stat -f '%d:%i' "$VAULTLOCK_STATE_DIR/state.json" \
+          > "$VAULTLOCK_TEST_APFS_STATE/state_install_inode_after_rewrite"
+        /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/overwrite_state_after_install_identity"
+      elif [[ "$fixture_stat_path" == "$VAULTLOCK_STATE_DIR/state.json" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/swap_state_before_quarantine_move" \
           && -f "$VAULTLOCK_TEST_APFS_STATE/final_info_complete" ]]; then
         /usr/bin/stat "$@" || exit 1
@@ -598,6 +610,11 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
     ln)
       [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_ln" ]] || exit 1
       /bin/ln "$@"
+      fixture_ln_destination=""
+      for fixture_argument in "$@"; do fixture_ln_destination=$fixture_argument; done
+      if [[ "$fixture_ln_destination" == "$VAULTLOCK_STATE_DIR/state.json" ]]; then
+        : > "$VAULTLOCK_TEST_APFS_STATE/state_link_installed"
+      fi
       ;;
     rm)
       fixture_rm_path=""
@@ -2025,6 +2042,10 @@ reset_init_fixture() {
     "$apfs_state/swapped_state_identity" \
     "$apfs_state/remove_state_after_state" \
     "$apfs_state/fail_init_state_cleanup" \
+    "$apfs_state/overwrite_state_after_install_identity" \
+    "$apfs_state/state_link_installed" \
+    "$apfs_state/state_install_inode_before_rewrite" \
+    "$apfs_state/state_install_inode_after_rewrite" \
     "$apfs_state/overwrite_state_after_final_info" \
     "$apfs_state/final_info_complete" \
     "$apfs_state/state_inode_before_rewrite" \
@@ -2394,6 +2415,24 @@ check "init state inode swap preserves equivalent UUID content" UUID-INIT \
   "$(jq -r '.volume_uuid' "$state_dir/state.json")"
 check_count "init state inode swap does not report success" 0 \
   'Result: created encrypted volume' "$state_inode_swap_output"
+
+reset_init_fixture
+: > "$apfs_state/overwrite_state_after_install_identity"
+if state_install_content_race_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init rejects in-place rewrite before installed digest"
+else
+  check_contains "init installed-digest rewrite reports content change" \
+    'installed state content changed during installation' \
+    "$state_install_content_race_output"
+fi
+check "init installed-digest rewrite preserves inode during race" \
+  "$(< "$apfs_state/state_install_inode_before_rewrite")" \
+  "$(< "$apfs_state/state_install_inode_after_rewrite")"
+check "init installed-digest rewrite retains altered state" \
+  rewritten-before-installed-digest \
+  "$(jq -r '.created' "$state_dir/state.json")"
+check_count "init installed-digest rewrite does not report success" 0 \
+  'Result: created encrypted volume' "$state_install_content_race_output"
 
 reset_init_fixture
 : > "$apfs_state/overwrite_state_after_final_info"

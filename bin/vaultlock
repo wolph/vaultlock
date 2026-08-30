@@ -1291,7 +1291,7 @@ validate_installed_init_state_path() { # path
 
 execute_init_write_state() {
   local identity uuid device temporary_state temporary_identity installed_identity
-  local final_identity
+  local final_identity installed_digest
   verify_installed_init_recovery "state creation"
   identity=$(read_apfs_identity "$MOUNT_POINT") \
     || die "cannot discover final APFS identity, protected recovery material remains at $STATE_DIR/passphrase.txt"
@@ -1316,6 +1316,12 @@ execute_init_write_state() {
     || die "state staging identity is unavailable after write, recovery material remains at $INIT_RECOVERY_PATH"
   [[ "$installed_identity" == "$temporary_identity" ]] \
     || die "state staging path is unsafe, protected recovery material remains at $INIT_RECOVERY_PATH"
+  INIT_STATE_DIGEST=$(state_path_digest "$temporary_state") \
+    || die "state staging content is unreadable, recovery material remains at $INIT_RECOVERY_PATH"
+  final_identity=$(path_identity "$temporary_state") \
+    || die "state staging identity is unavailable after fingerprinting, recovery material remains at $INIT_RECOVERY_PATH"
+  [[ "$final_identity" == "$temporary_identity" ]] \
+    || die "state staging identity changed during fingerprinting, recovery material remains at $INIT_RECOVERY_PATH"
   require_init_state_dir_identity
   if ! ln -- "$temporary_state" "$state_file"; then
     die "state staging path is unsafe, protected recovery material remains at $INIT_RECOVERY_PATH"
@@ -1325,12 +1331,14 @@ execute_init_write_state() {
   [[ "$installed_identity" == "$temporary_identity" ]] \
     || die "installed state identity mismatch, recovery material remains at $INIT_RECOVERY_PATH"
   INIT_STATE_IDENTITY=$installed_identity
-  INIT_STATE_DIGEST=$(state_path_digest "$state_file") \
+  installed_digest=$(state_path_digest "$state_file") \
     || die "installed state content is unreadable, recovery material remains at $INIT_RECOVERY_PATH"
   final_identity=$(path_identity "$state_file") \
     || die "installed state identity is unavailable after fingerprinting, recovery material remains at $INIT_RECOVERY_PATH"
   [[ "$final_identity" == "$INIT_STATE_IDENTITY" ]] \
     || die "installed state identity changed during fingerprinting, recovery material remains at $INIT_RECOVERY_PATH"
+  [[ "$installed_digest" == "$INIT_STATE_DIGEST" ]] \
+    || die "installed state content changed during installation, recovery material remains at $INIT_RECOVERY_PATH"
   rm -f -- "$temporary_state" \
     || die "cannot remove state staging name, recovery material remains at $INIT_RECOVERY_PATH"
 }
