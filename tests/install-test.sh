@@ -2,16 +2,41 @@
 # Isolated guarded-install tests. All targets live under a temporary directory.
 set -euo pipefail
 
+if [[ "${VAULTLOCK_INSTALL_TRANSITION_FIXTURE:-0}" == "1" ]]; then
+  transition_phase=${1:-}
+  transition_index=${2:-}
+  transition_source=${3:-}
+  transition_stage=${5:-}
+  case "${VAULTLOCK_INSTALL_TRANSITION_MODE:-}:$transition_phase" in
+    fail-stage:after-stage-create)
+      printf '%s\n' "$transition_stage" > "$VAULTLOCK_INSTALL_TRANSITION_MARKER"
+      exit 7
+      ;;
+    drift-source:before-replacement)
+      if [[ "$transition_index" == "0" \
+          && ! -e "$VAULTLOCK_INSTALL_TRANSITION_MARKER" ]]; then
+        /bin/mv "$transition_source" "$transition_source.before-drift"
+        printf '#!/bin/bash\nprintf '\''drifted source\\n'\''\n' \
+          > "$transition_source"
+        /bin/chmod +x "$transition_source"
+        : > "$VAULTLOCK_INSTALL_TRANSITION_MARKER"
+      fi
+      ;;
+  esac
+  exit 0
+fi
+
 if [[ "${VAULTLOCK_INSTALL_TEST_NESTED:-0}" == "1" ]]; then
   exit 0
 fi
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 makefile=$repo_root/Makefile
+installer=$repo_root/scripts/install.sh
 fail=0
 
-if [[ ! -f "$makefile" ]]; then
-  printf 'FAIL guarded install requires %s\n' "$makefile"
+if [[ ! -f "$makefile" || ! -x "$installer" ]]; then
+  printf 'FAIL guarded install requires %s and %s\n' "$makefile" "$installer"
   exit 1
 fi
 
@@ -63,25 +88,6 @@ check_link() { # description path expected
   check "$description" "$expected" "$actual"
 }
 
-check_installer_hardening_structure() {
-  local register_line chmod_line source_identity_count
-  # shellcheck disable=SC2016  # These are literal Make recipe fragments.
-  register_line=$(/usr/bin/grep -nF \
-    'stage_directories[$$index]=$$stage' "$makefile" \
-    | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)
-  # shellcheck disable=SC2016  # These are literal Make recipe fragments.
-  chmod_line=$(/usr/bin/grep -nF '/bin/chmod 700 "$$stage"' "$makefile" \
-    | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1)
-  check 'staging directory is registered before chmod can fail' true \
-    "$([[ -n "$register_line" && -n "$chmod_line" \
-      && "$register_line" -lt "$chmod_line" ]] && printf true || printf false)"
-
-  source_identity_count=$(/usr/bin/grep -cF 'source_identities' "$makefile" \
-    || true)
-  check 'installer freezes and finally revalidates source identity' true \
-    "$([[ "$source_identity_count" -ge 3 ]] && printf true || printf false)"
-}
-
 reset_bin_dir() {
   /bin/rm -rf "$bin_dir"
   /bin/mkdir -p "$bin_dir"
@@ -117,24 +123,83 @@ write_fixture_sources() { # version
     "$fixture_repo/tests/vaultlock-cli-test.sh"
 }
 
+create_one_commit_fixture() { # repository
+  local repository=$1
+  /bin/mkdir -p "$repository/bin" "$repository/scripts" "$repository/tests"
+  /bin/cp "$makefile" "$repository/Makefile"
+  /bin/cp "$installer" "$repository/scripts/install.sh"
+  /bin/cp "$0" "$repository/tests/install-test.sh"
+  printf '#!/bin/bash\nprintf '\''vaultlock baseline\\n'\''\n' \
+    > "$repository/bin/vaultlock"
+  printf '#!/bin/bash\nprintf '\''vaultlock-test baseline\\n'\''\n' \
+    > "$repository/tests/vaultlock-test.sh"
+  printf '#!/bin/bash\nexit 0\n' \
+    > "$repository/tests/vaultlock-cli-test.sh"
+  /bin/chmod +x "$repository/bin/vaultlock" \
+    "$repository/tests/vaultlock-test.sh" \
+    "$repository/tests/vaultlock-cli-test.sh" \
+    "$repository/tests/install-test.sh" \
+    "$repository/scripts/install.sh"
+  /usr/bin/git -C "$repository" init -q -b master 2>/dev/null \
+    || /usr/bin/git -C "$repository" init -q
+  /usr/bin/git -C "$repository" config user.name 'Vaultlock install test'
+  /usr/bin/git -C "$repository" config user.email \
+    'vaultlock-install@example.invalid'
+  /usr/bin/git -C "$repository" add Makefile bin scripts tests
+  /usr/bin/git -C "$repository" commit -q -m baseline
+}
+
+regular_identity() { # path
+  if [[ -f "$1" && ! -L "$1" ]]; then
+    /usr/bin/stat -f '%d:%i' "$1"
+  else
+    printf '<not a regular file>\n'
+  fi
+}
+
+run_install_in() { # repository destination
+  VAULTLOCK_INSTALL_TEST_NESTED=1 \
+    /usr/bin/make -s -C "$1" install BIN_DIR="$2"
+}
+
 run_install() {
   VAULTLOCK_INSTALL_TEST_NESTED=1 \
     /usr/bin/make -s -C "$fixture_repo" install BIN_DIR="$bin_dir"
 }
 
-check_installer_hardening_structure
+run_install_from_environment() {
+  BIN_DIR="$bin_dir" VAULTLOCK_INSTALL_TEST_NESTED=1 \
+    /usr/bin/make -s -C "$fixture_repo" install
+}
 
-/bin/mkdir -p "$fixture_repo/bin" "$fixture_repo/tests"
+run_install_with_home() { # home
+  HOME=$1 VAULTLOCK_INSTALL_TEST_NESTED=1 \
+    /usr/bin/make -s -C "$fixture_repo" install
+}
+
+run_install_with_transition() { # mode marker
+  VAULTLOCK_INSTALL_TEST_NESTED=1 \
+  VAULTLOCK_INSTALL_TEST_MODE=1 \
+  VAULTLOCK_INSTALL_TEST_TRANSITION="$0" \
+  VAULTLOCK_INSTALL_TRANSITION_FIXTURE=1 \
+  VAULTLOCK_INSTALL_TRANSITION_MODE=$1 \
+  VAULTLOCK_INSTALL_TRANSITION_MARKER=$2 \
+    /usr/bin/make -s -C "$fixture_repo" install BIN_DIR="$bin_dir"
+}
+
+/bin/mkdir -p "$fixture_repo/bin" "$fixture_repo/scripts" "$fixture_repo/tests"
 /bin/cp "$makefile" "$fixture_repo/Makefile"
+/bin/cp "$installer" "$fixture_repo/scripts/install.sh"
 /bin/cp "$0" "$fixture_repo/tests/install-test.sh"
 /bin/chmod +x "$fixture_repo/tests/install-test.sh"
+/bin/chmod +x "$fixture_repo/scripts/install.sh"
 write_fixture_sources baseline
 
 /usr/bin/git -C "$fixture_repo" init -q -b master 2>/dev/null \
   || /usr/bin/git -C "$fixture_repo" init -q
 /usr/bin/git -C "$fixture_repo" config user.name 'Vaultlock install test'
 /usr/bin/git -C "$fixture_repo" config user.email 'vaultlock-install@example.invalid'
-/usr/bin/git -C "$fixture_repo" add Makefile bin tests
+/usr/bin/git -C "$fixture_repo" add Makefile bin scripts tests
 /usr/bin/git -C "$fixture_repo" commit -q -m baseline
 
 write_fixture_sources current
@@ -163,6 +228,28 @@ check_link 'missing nested BIN_DIR is created after validation' \
   "$vaultlock_target" "$vaultlock_source"
 check_link 'nested BIN_DIR receives both targets' "$test_target" "$test_source"
 
+physical_suffix_root=$test_root/physical-suffix
+/bin/mkdir -p "$physical_suffix_root/real-destination"
+/bin/ln -s "$physical_suffix_root/real-destination" \
+  "$physical_suffix_root/destination-alias"
+bin_dir=$physical_suffix_root/missing/../destination-alias/subdir
+vaultlock_target=$physical_suffix_root/real-destination/subdir/vaultlock
+test_target=$physical_suffix_root/real-destination/subdir/vaultlock-test.sh
+if run_install >/dev/null 2>&1; then
+  printf 'ok   suffix symlink reached after dot-dot is resolved before mkdir\n'
+else
+  printf 'FAIL suffix symlink reached after dot-dot was rejected after mutation\n'
+  fail=1
+fi
+check 'suffix normalization creates no cancelled component' false \
+  "$([[ -e "$physical_suffix_root/missing" \
+      || -L "$physical_suffix_root/missing" ]] \
+    && printf true || printf false)"
+check_link 'suffix normalization installs command in physical directory' \
+  "$vaultlock_target" "$vaultlock_source"
+check_link 'suffix normalization installs helper in physical directory' \
+  "$test_target" "$test_source"
+
 # shellcheck disable=SC2016  # Literal shell syntax tests Make expansion safety.
 bin_dir=$test_root/'bin with spaces"`touch injected-marker`'
 vaultlock_target=$bin_dir/vaultlock
@@ -175,9 +262,223 @@ check 'BIN_DIR cannot inject a command through Make expansion' false \
   "$([[ -e "$fixture_repo/injected-marker" || -e "$test_root/injected-marker" ]] \
     && printf true || printf false)"
 
+# shellcheck disable=SC2016  # Literal Make syntax must remain pathname text.
+bin_dir=$test_root/'bin$(shell touch make-injected-marker)'
+vaultlock_target=$bin_dir/vaultlock
+test_target=$bin_dir/vaultlock-test.sh
+/bin/rm -rf "$bin_dir"
+/bin/rm -f "$fixture_repo/make-injected-marker"
+run_install >/dev/null
+check_link 'BIN_DIR with literal Make function syntax is preserved' \
+  "$vaultlock_target" "$vaultlock_source"
+check 'BIN_DIR cannot execute a Make shell function' false \
+  "$([[ -e "$fixture_repo/make-injected-marker" ]] \
+    && printf true || printf false)"
+
+# shellcheck disable=SC2016  # Literal environment value must stay literal.
+bin_dir=$test_root/'env-bin$(shell touch env-make-injected-marker)'
+vaultlock_target=$bin_dir/vaultlock
+test_target=$bin_dir/vaultlock-test.sh
+/bin/rm -rf "$bin_dir"
+/bin/rm -f "$fixture_repo/env-make-injected-marker"
+run_install_from_environment >/dev/null
+check_link 'environment BIN_DIR preserves literal Make syntax' \
+  "$vaultlock_target" "$vaultlock_source"
+check 'environment BIN_DIR cannot execute a Make shell function' false \
+  "$([[ -e "$fixture_repo/env-make-injected-marker" ]] \
+    && printf true || printf false)"
+
+# shellcheck disable=SC2016  # Literal HOME Make syntax must stay literal.
+default_home=$test_root/'home$(shell touch home-make-injected-marker)'
+bin_dir=$default_home/bin
+vaultlock_target=$bin_dir/vaultlock
+test_target=$bin_dir/vaultlock-test.sh
+/bin/rm -rf "$default_home"
+/bin/rm -f "$fixture_repo/home-make-injected-marker"
+run_install_with_home "$default_home" >/dev/null
+check_link 'default HOME preserves literal Make syntax' \
+  "$vaultlock_target" "$vaultlock_source"
+check_link 'default HOME installs both targets' "$test_target" "$test_source"
+check 'default HOME cannot execute a Make shell function' false \
+  "$([[ -e "$fixture_repo/home-make-injected-marker" ]] \
+    && printf true || printf false)"
+
+empty_home_bin=$test_root/empty-home-bin
+if VAULTLOCK_INSTALL_REPO_ROOT="$fixture_repo" \
+    VAULTLOCK_INSTALL_BIN_DIR="$empty_home_bin" \
+    VAULTLOCK_INSTALL_BIN_DIR_MODE=default-home \
+    VAULTLOCK_INSTALL_HOME='' \
+    "$fixture_repo/scripts/install.sh" >/dev/null 2>&1; then
+  printf 'FAIL omitted BIN_DIR with empty HOME was accepted\n'
+  fail=1
+else
+  printf 'ok   omitted BIN_DIR with empty HOME is refused\n'
+fi
+check 'empty HOME refusal creates no command target' false \
+  "$([[ -e "$empty_home_bin/vaultlock" \
+      || -L "$empty_home_bin/vaultlock" ]] && printf true || printf false)"
+check 'empty HOME refusal creates no helper target' false \
+  "$([[ -e "$empty_home_bin/vaultlock-test.sh" \
+      || -L "$empty_home_bin/vaultlock-test.sh" ]] \
+    && printf true || printf false)"
+
+unset_home_bin=$test_root/unset-home-bin
+if /usr/bin/env -u HOME -u VAULTLOCK_INSTALL_HOME \
+    VAULTLOCK_INSTALL_REPO_ROOT="$fixture_repo" \
+    VAULTLOCK_INSTALL_BIN_DIR="$unset_home_bin" \
+    VAULTLOCK_INSTALL_BIN_DIR_MODE=default-home \
+    "$fixture_repo/scripts/install.sh" >/dev/null 2>&1; then
+  printf 'FAIL omitted BIN_DIR with unset HOME was accepted\n'
+  fail=1
+else
+  printf 'ok   omitted BIN_DIR with unset HOME is refused\n'
+fi
+check 'unset HOME refusal creates no command target' false \
+  "$([[ -e "$unset_home_bin/vaultlock" \
+      || -L "$unset_home_bin/vaultlock" ]] && printf true || printf false)"
+check 'unset HOME refusal creates no helper target' false \
+  "$([[ -e "$unset_home_bin/vaultlock-test.sh" \
+      || -L "$unset_home_bin/vaultlock-test.sh" ]] \
+    && printf true || printf false)"
+
+one_commit_bin_repo=$test_root/one-commit-bin
+create_one_commit_fixture "$one_commit_bin_repo"
+one_commit_source=$one_commit_bin_repo/bin/vaultlock
+one_commit_identity=$(regular_identity "$one_commit_source")
+one_commit_content=$(< "$one_commit_source")
+if run_install_in "$one_commit_bin_repo" "$one_commit_bin_repo/bin" \
+    >/dev/null 2>&1; then
+  printf 'FAIL BIN_DIR equal to repository bin was accepted\n'
+  fail=1
+else
+  printf 'ok   BIN_DIR equal to repository bin is refused\n'
+fi
+check_file 'repository bin source is preserved' \
+  "$one_commit_source" "$one_commit_content"
+check 'repository bin source identity is preserved' "$one_commit_identity" \
+  "$(regular_identity "$one_commit_source")"
+check 'repository bin refusal installs no helper link' false \
+  "$([[ -e "$one_commit_bin_repo/bin/vaultlock-test.sh" \
+      || -L "$one_commit_bin_repo/bin/vaultlock-test.sh" ]] \
+    && printf true || printf false)"
+
+one_commit_tests_repo=$test_root/one-commit-tests
+create_one_commit_fixture "$one_commit_tests_repo"
+one_commit_source=$one_commit_tests_repo/tests/vaultlock-test.sh
+one_commit_identity=$(regular_identity "$one_commit_source")
+one_commit_content=$(< "$one_commit_source")
+if run_install_in "$one_commit_tests_repo" "$one_commit_tests_repo/tests" \
+    >/dev/null 2>&1; then
+  printf 'FAIL BIN_DIR equal to repository tests was accepted\n'
+  fail=1
+else
+  printf 'ok   BIN_DIR equal to repository tests is refused\n'
+fi
+check_file 'repository test source is preserved' \
+  "$one_commit_source" "$one_commit_content"
+check 'repository test source identity is preserved' "$one_commit_identity" \
+  "$(regular_identity "$one_commit_source")"
+check 'repository tests refusal installs no command link' false \
+  "$([[ -e "$one_commit_tests_repo/tests/vaultlock" \
+      || -L "$one_commit_tests_repo/tests/vaultlock" ]] \
+    && printf true || printf false)"
+
+one_commit_alias_repo=$test_root/one-commit-alias
+create_one_commit_fixture "$one_commit_alias_repo"
+/bin/ln -s "$one_commit_alias_repo" "$test_root/repository-alias"
+one_commit_source=$one_commit_alias_repo/bin/vaultlock
+one_commit_identity=$(regular_identity "$one_commit_source")
+one_commit_content=$(< "$one_commit_source")
+if run_install_in "$one_commit_alias_repo" \
+    "$test_root/repository-alias/bin" >/dev/null 2>&1; then
+  printf 'FAIL physical BIN_DIR alias to repository bin was accepted\n'
+  fail=1
+else
+  printf 'ok   physical BIN_DIR alias to repository bin is refused\n'
+fi
+check_file 'physical BIN_DIR alias preserves repository source' \
+  "$one_commit_source" "$one_commit_content"
+check 'physical BIN_DIR alias preserves source identity' "$one_commit_identity" \
+  "$(regular_identity "$one_commit_source")"
+
+one_commit_parent_repo=$test_root/one-commit-parent
+create_one_commit_fixture "$one_commit_parent_repo"
+one_commit_source=$one_commit_parent_repo/bin/vaultlock
+one_commit_content=$(< "$one_commit_source")
+if run_install_in "$one_commit_parent_repo" \
+    "$one_commit_parent_repo/missing/../bin" >/dev/null 2>&1; then
+  printf 'FAIL lexical parent BIN_DIR alias to repository bin was accepted\n'
+  fail=1
+else
+  printf 'ok   lexical parent BIN_DIR alias to repository bin is refused\n'
+fi
+check_file 'lexical parent BIN_DIR alias preserves repository source' \
+  "$one_commit_source" "$one_commit_content"
+check 'lexical parent BIN_DIR alias creates no directory' false \
+  "$([[ -e "$one_commit_parent_repo/missing" \
+      || -L "$one_commit_parent_repo/missing" ]] \
+    && printf true || printf false)"
+
+one_commit_dot_repo=$test_root/one-commit-dot
+create_one_commit_fixture "$one_commit_dot_repo"
+one_commit_source=$one_commit_dot_repo/bin/vaultlock
+one_commit_content=$(< "$one_commit_source")
+if run_install_in "$one_commit_dot_repo" "$one_commit_dot_repo/./bin" \
+    >/dev/null 2>&1; then
+  printf 'FAIL lexical dot BIN_DIR alias to repository bin was accepted\n'
+  fail=1
+else
+  printf 'ok   lexical dot BIN_DIR alias to repository bin is refused\n'
+fi
+check_file 'lexical dot BIN_DIR alias preserves repository source' \
+  "$one_commit_source" "$one_commit_content"
+
 bin_dir=$test_root/install-bin
 vaultlock_target=$bin_dir/vaultlock
 test_target=$bin_dir/vaultlock-test.sh
+
+reset_bin_dir
+stage_failure_marker=$test_root/stage-failure-marker
+if run_install_with_transition fail-stage "$stage_failure_marker" \
+    >/dev/null 2>&1; then
+  printf 'FAIL staging failure transition was ignored\n'
+  fail=1
+else
+  printf 'ok   staging failure stops installation\n'
+fi
+if [[ -f "$stage_failure_marker" ]]; then
+  failed_stage=$(< "$stage_failure_marker")
+  check 'failed stage is removed by owned cleanup' false \
+    "$([[ -e "$failed_stage" || -L "$failed_stage" ]] \
+      && printf true || printf false)"
+else
+  printf 'FAIL staging failure transition did not run\n'
+  fail=1
+fi
+check 'staging failure changes no target' false \
+  "$([[ -e "$vaultlock_target" || -L "$vaultlock_target" \
+      || -e "$test_target" || -L "$test_target" ]] \
+    && printf true || printf false)"
+
+reset_bin_dir
+run_install >/dev/null
+source_drift_marker=$test_root/source-drift-marker
+first_inode=$(/usr/bin/stat -f '%i' "$vaultlock_target")
+if run_install_with_transition drift-source "$source_drift_marker" \
+    >/dev/null 2>&1; then
+  printf 'FAIL source drift transition was ignored\n'
+  fail=1
+else
+  printf 'ok   source drift before replacement stops installation\n'
+fi
+check 'source drift transition executed' true \
+  "$([[ -e "$source_drift_marker" ]] && printf true || printf false)"
+check 'source drift preserves installed target identity' "$first_inode" \
+  "$(/usr/bin/stat -f '%i' "$vaultlock_target")"
+if [[ -e "$vaultlock_source.before-drift" ]]; then
+  /bin/rm "$vaultlock_source"
+  /bin/mv "$vaultlock_source.before-drift" "$vaultlock_source"
+fi
 
 first_inode=$(/usr/bin/stat -f '%i' "$vaultlock_target")
 run_install >/dev/null
