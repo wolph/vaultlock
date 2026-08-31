@@ -1259,131 +1259,70 @@ plan_add_coordination_finish() {
   plan_add operation_lock_release "Release cooperative operation lock"
 }
 
-append_frozen_plan_field() { # name value
-  FROZEN_PLAN_FIELD_NAMES+=("$1")
-  FROZEN_PLAN_FIELD_VALUES+=("$2")
+append_serialized_plan_field() { # name value
+  SERIALIZED_PLAN_FIELD_NAMES+=("$1")
+  SERIALIZED_PLAN_FIELD_VALUES+=("$2")
 }
 
-append_candidate_plan_field() { # name value
-  CANDIDATE_PLAN_FIELD_NAMES+=("$1")
-  CANDIDATE_PLAN_FIELD_VALUES+=("$2")
-}
-
-capture_common_frozen_plan_fields() { # command
+serialize_common_plan_fields() { # command
   local index argument_index locked
-  append_frozen_plan_field schema 1
-  append_frozen_plan_field command "$1"
-  append_frozen_plan_field option_dry_run "$OPTION_DRY_RUN"
-  append_frozen_plan_field option_yes "$OPTION_YES"
-  append_frozen_plan_field option_hooks "$OPTION_HOOKS"
-  append_frozen_plan_field operands "$OPTION_OPERANDS"
-  append_frozen_plan_field volume "$VOLUME"
-  append_frozen_plan_field mount_point "$MOUNT_POINT"
-  append_frozen_plan_field state_dir "$STATE_DIR"
-  append_frozen_plan_field context_uuid "$PLAN_CONTEXT_UUID"
-  append_frozen_plan_field context_device "$PLAN_CONTEXT_DEVICE"
-  append_frozen_plan_field context_deadline "$PLAN_CONTEXT_DEADLINE"
-  append_frozen_plan_field context_deadline_epoch "$PLAN_CONTEXT_DEADLINE_EPOCH"
-  append_frozen_plan_field context_round "$PLAN_CONTEXT_ROUND"
-  append_frozen_plan_field snapshot_state_valid "${SNAPSHOT_STATE_VALID:-}"
-  append_frozen_plan_field snapshot_init_absent "$SNAPSHOT_INIT_ABSENT"
-  append_frozen_plan_field snapshot_recorded_locked \
+  append_serialized_plan_field schema 1
+  append_serialized_plan_field command "$1"
+  append_serialized_plan_field option_dry_run "$OPTION_DRY_RUN"
+  append_serialized_plan_field option_yes "$OPTION_YES"
+  append_serialized_plan_field option_hooks "$OPTION_HOOKS"
+  append_serialized_plan_field operands "$OPTION_OPERANDS"
+  append_serialized_plan_field volume "$VOLUME"
+  append_serialized_plan_field mount_point "$MOUNT_POINT"
+  append_serialized_plan_field state_dir "$STATE_DIR"
+  append_serialized_plan_field context_uuid "$PLAN_CONTEXT_UUID"
+  append_serialized_plan_field context_device "$PLAN_CONTEXT_DEVICE"
+  append_serialized_plan_field context_deadline "$PLAN_CONTEXT_DEADLINE"
+  append_serialized_plan_field context_deadline_epoch \
+    "$PLAN_CONTEXT_DEADLINE_EPOCH"
+  append_serialized_plan_field context_round "$PLAN_CONTEXT_ROUND"
+  append_serialized_plan_field snapshot_state_valid \
+    "${SNAPSHOT_STATE_VALID:-}"
+  append_serialized_plan_field snapshot_init_absent "$SNAPSHOT_INIT_ABSENT"
+  append_serialized_plan_field snapshot_recorded_locked \
     "${SNAPSHOT_RECORDED_LOCKED:-}"
-  append_frozen_plan_field snapshot_expected_uuid \
+  append_serialized_plan_field snapshot_expected_uuid \
     "${SNAPSHOT_EXPECTED_UUID:-}"
-  append_frozen_plan_field snapshot_apfs_valid "${SNAPSHOT_APFS_VALID:-}"
-  append_frozen_plan_field snapshot_apfs_locked "${SNAPSHOT_APFS_LOCKED:-}"
-  append_frozen_plan_field snapshot_apfs_mounted "${SNAPSHOT_APFS_MOUNTED:-}"
-  append_frozen_plan_field snapshot_apfs_inspected \
-    "${SNAPSHOT_APFS_INSPECTED:-}"
-  append_frozen_plan_field snapshot_valid "${SNAPSHOT_VALID:-}"
-  append_frozen_plan_field snapshot_error "${SNAPSHOT_ERROR:-}"
-  append_frozen_plan_field snapshot_deadline "${SNAPSHOT_DEADLINE:-}"
-  append_frozen_plan_field snapshot_deadline_epoch \
-    "${SNAPSHOT_DEADLINE_EPOCH:-}"
-  append_frozen_plan_field snapshot_round "${SNAPSHOT_ROUND:-}"
-  append_frozen_plan_field snapshot_actual_uuid "${SNAPSHOT_ACTUAL_UUID:-}"
-  append_frozen_plan_field snapshot_device "${SNAPSHOT_DEVICE:-}"
-  append_frozen_plan_field snapshot_mount "${SNAPSHOT_ACTUAL_MOUNT_POINT:-}"
-  append_frozen_plan_field snapshot_plaintext "${SNAPSHOT_PLAINTEXT_PRESENT:-}"
-  append_frozen_plan_field snapshot_ciphertext "${SNAPSHOT_CIPHERTEXT_PRESENT:-}"
-  append_frozen_plan_field snapshot_hash "${SNAPSHOT_HASH_PRESENT:-}"
-  append_frozen_plan_field assessment "${RUNTIME_ASSESSMENT:-}"
-  for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
-    append_frozen_plan_field "operation_id_$index" \
-      "${PLAN_OPERATION_IDS[$index]}"
-    append_frozen_plan_field "hook_path_$index" "${PLAN_HOOK_PATHS[$index]}"
-    append_frozen_plan_field "hook_phase_$index" "${PLAN_HOOK_PHASES[$index]}"
-    append_frozen_plan_field "hook_scope_$index" "${PLAN_HOOK_SCOPES[$index]}"
-    append_frozen_plan_field "hook_directory_$index" \
-      "${PLAN_HOOK_DIRECTORIES[$index]}"
-    if [[ "${PLAN_OPERATION_IDS[$index]}" == hook ]]; then
-      locked=$(hook_locked_value "${PLAN_HOOK_PHASES[$index]}")
-      build_hook_argv "${PLAN_HOOK_PHASES[$index]}" \
-        "${PLAN_HOOK_SCOPES[$index]}" "$PLAN_CONTEXT_UUID" \
-        "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
-        "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
-      append_frozen_plan_field "hook_argv_count_$index" "${#HOOK_ARGV[@]}"
-      for ((argument_index=0; argument_index<${#HOOK_ARGV[@]}; \
-          argument_index++)); do
-        append_frozen_plan_field \
-          "hook_argv_${index}_$argument_index" \
-          "${HOOK_ARGV[$argument_index]}"
-      done
-    else
-      append_frozen_plan_field "hook_argv_count_$index" 0
-    fi
-  done
-}
-
-capture_common_candidate_plan_fields() { # command
-  local index argument_index locked
-  append_candidate_plan_field schema 1
-  append_candidate_plan_field command "$1"
-  append_candidate_plan_field option_dry_run "$OPTION_DRY_RUN"
-  append_candidate_plan_field option_yes "$OPTION_YES"
-  append_candidate_plan_field option_hooks "$OPTION_HOOKS"
-  append_candidate_plan_field operands "$OPTION_OPERANDS"
-  append_candidate_plan_field volume "$VOLUME"
-  append_candidate_plan_field mount_point "$MOUNT_POINT"
-  append_candidate_plan_field state_dir "$STATE_DIR"
-  append_candidate_plan_field context_uuid "$PLAN_CONTEXT_UUID"
-  append_candidate_plan_field context_device "$PLAN_CONTEXT_DEVICE"
-  append_candidate_plan_field context_deadline "$PLAN_CONTEXT_DEADLINE"
-  append_candidate_plan_field context_deadline_epoch "$PLAN_CONTEXT_DEADLINE_EPOCH"
-  append_candidate_plan_field context_round "$PLAN_CONTEXT_ROUND"
-  append_candidate_plan_field snapshot_state_valid "${SNAPSHOT_STATE_VALID:-}"
-  append_candidate_plan_field snapshot_init_absent "$SNAPSHOT_INIT_ABSENT"
-  append_candidate_plan_field snapshot_recorded_locked \
-    "${SNAPSHOT_RECORDED_LOCKED:-}"
-  append_candidate_plan_field snapshot_expected_uuid \
-    "${SNAPSHOT_EXPECTED_UUID:-}"
-  append_candidate_plan_field snapshot_apfs_valid "${SNAPSHOT_APFS_VALID:-}"
-  append_candidate_plan_field snapshot_apfs_locked "${SNAPSHOT_APFS_LOCKED:-}"
-  append_candidate_plan_field snapshot_apfs_mounted \
+  append_serialized_plan_field snapshot_apfs_valid \
+    "${SNAPSHOT_APFS_VALID:-}"
+  append_serialized_plan_field snapshot_apfs_locked \
+    "${SNAPSHOT_APFS_LOCKED:-}"
+  append_serialized_plan_field snapshot_apfs_mounted \
     "${SNAPSHOT_APFS_MOUNTED:-}"
-  append_candidate_plan_field snapshot_apfs_inspected \
+  append_serialized_plan_field snapshot_apfs_inspected \
     "${SNAPSHOT_APFS_INSPECTED:-}"
-  append_candidate_plan_field snapshot_valid "${SNAPSHOT_VALID:-}"
-  append_candidate_plan_field snapshot_error "${SNAPSHOT_ERROR:-}"
-  append_candidate_plan_field snapshot_deadline "${SNAPSHOT_DEADLINE:-}"
-  append_candidate_plan_field snapshot_deadline_epoch \
+  append_serialized_plan_field snapshot_valid "${SNAPSHOT_VALID:-}"
+  append_serialized_plan_field snapshot_error "${SNAPSHOT_ERROR:-}"
+  append_serialized_plan_field snapshot_deadline "${SNAPSHOT_DEADLINE:-}"
+  append_serialized_plan_field snapshot_deadline_epoch \
     "${SNAPSHOT_DEADLINE_EPOCH:-}"
-  append_candidate_plan_field snapshot_round "${SNAPSHOT_ROUND:-}"
-  append_candidate_plan_field snapshot_actual_uuid "${SNAPSHOT_ACTUAL_UUID:-}"
-  append_candidate_plan_field snapshot_device "${SNAPSHOT_DEVICE:-}"
-  append_candidate_plan_field snapshot_mount "${SNAPSHOT_ACTUAL_MOUNT_POINT:-}"
-  append_candidate_plan_field snapshot_plaintext "${SNAPSHOT_PLAINTEXT_PRESENT:-}"
-  append_candidate_plan_field snapshot_ciphertext "${SNAPSHOT_CIPHERTEXT_PRESENT:-}"
-  append_candidate_plan_field snapshot_hash "${SNAPSHOT_HASH_PRESENT:-}"
-  append_candidate_plan_field assessment "${RUNTIME_ASSESSMENT:-}"
+  append_serialized_plan_field snapshot_round "${SNAPSHOT_ROUND:-}"
+  append_serialized_plan_field snapshot_actual_uuid \
+    "${SNAPSHOT_ACTUAL_UUID:-}"
+  append_serialized_plan_field snapshot_device "${SNAPSHOT_DEVICE:-}"
+  append_serialized_plan_field snapshot_mount \
+    "${SNAPSHOT_ACTUAL_MOUNT_POINT:-}"
+  append_serialized_plan_field snapshot_plaintext \
+    "${SNAPSHOT_PLAINTEXT_PRESENT:-}"
+  append_serialized_plan_field snapshot_ciphertext \
+    "${SNAPSHOT_CIPHERTEXT_PRESENT:-}"
+  append_serialized_plan_field snapshot_hash "${SNAPSHOT_HASH_PRESENT:-}"
+  append_serialized_plan_field assessment "${RUNTIME_ASSESSMENT:-}"
   for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
-    append_candidate_plan_field "operation_id_$index" \
+    append_serialized_plan_field "operation_id_$index" \
       "${PLAN_OPERATION_IDS[$index]}"
-    append_candidate_plan_field "hook_path_$index" "${PLAN_HOOK_PATHS[$index]}"
-    append_candidate_plan_field "hook_phase_$index" "${PLAN_HOOK_PHASES[$index]}"
-    append_candidate_plan_field "hook_scope_$index" "${PLAN_HOOK_SCOPES[$index]}"
-    append_candidate_plan_field "hook_directory_$index" \
+    append_serialized_plan_field "hook_path_$index" \
+      "${PLAN_HOOK_PATHS[$index]}"
+    append_serialized_plan_field "hook_phase_$index" \
+      "${PLAN_HOOK_PHASES[$index]}"
+    append_serialized_plan_field "hook_scope_$index" \
+      "${PLAN_HOOK_SCOPES[$index]}"
+    append_serialized_plan_field "hook_directory_$index" \
       "${PLAN_HOOK_DIRECTORIES[$index]}"
     if [[ "${PLAN_OPERATION_IDS[$index]}" == hook ]]; then
       locked=$(hook_locked_value "${PLAN_HOOK_PHASES[$index]}")
@@ -1391,130 +1330,100 @@ capture_common_candidate_plan_fields() { # command
         "${PLAN_HOOK_SCOPES[$index]}" "$PLAN_CONTEXT_UUID" \
         "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
         "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
-      append_candidate_plan_field "hook_argv_count_$index" \
+      append_serialized_plan_field "hook_argv_count_$index" \
         "${#HOOK_ARGV[@]}"
       for ((argument_index=0; argument_index<${#HOOK_ARGV[@]}; \
           argument_index++)); do
-        append_candidate_plan_field \
+        append_serialized_plan_field \
           "hook_argv_${index}_$argument_index" \
           "${HOOK_ARGV[$argument_index]}"
       done
     else
-      append_candidate_plan_field "hook_argv_count_$index" 0
+      append_serialized_plan_field "hook_argv_count_$index" 0
     fi
   done
 }
 
-freeze_planned_command_snapshot() { # command
-  local command=$1 state_dir_identity state_file_identity
-  FROZEN_PLAN_FIELD_NAMES=()
-  FROZEN_PLAN_FIELD_VALUES=()
-  capture_common_frozen_plan_fields "$command"
+serialize_planned_command_snapshot() { # target command
+  local target=$1 command=$2 state_dir_identity state_file_identity
+  SERIALIZED_PLAN_FIELD_NAMES=()
+  SERIALIZED_PLAN_FIELD_VALUES=()
+  serialize_common_plan_fields "$command"
   case "$command" in
     init)
       if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
         state_dir_identity=$(path_identity "$STATE_DIR") || \
-          die "cannot freeze state directory identity"
+          die "cannot serialize $target state directory identity"
       else
         state_dir_identity=absent
       fi
       if [[ -e "$state_file" || -L "$state_file" ]]; then
         state_file_identity=$(path_identity "$state_file") || \
-          die "cannot freeze state file identity"
+          die "cannot serialize $target state file identity"
       else
         state_file_identity=absent
       fi
-      append_frozen_plan_field typed_operand_count 0
-      append_frozen_plan_field state_dir_identity "$state_dir_identity"
-      append_frozen_plan_field state_file_identity "$state_file_identity"
+      append_serialized_plan_field typed_operand_count 0
+      append_serialized_plan_field state_dir_identity "$state_dir_identity"
+      append_serialized_plan_field state_file_identity "$state_file_identity"
       ;;
     adopt)
       state_dir_identity=$(path_identity "$STATE_DIR") || \
-        die "cannot freeze adopt state directory identity"
+        die "cannot serialize $target adopt state directory identity"
       state_file_identity=$(path_identity "$state_file") || \
-        die "cannot freeze adopt state file identity"
-      append_frozen_plan_field typed_operand_count 1
-      append_frozen_plan_field state_dir_identity "$state_dir_identity"
-      append_frozen_plan_field state_file_identity "$state_file_identity"
-      append_frozen_plan_field adopt_reserved_state_dir \
+        die "cannot serialize $target adopt state file identity"
+      append_serialized_plan_field typed_operand_count 1
+      append_serialized_plan_field state_dir_identity "$state_dir_identity"
+      append_serialized_plan_field state_file_identity "$state_file_identity"
+      append_serialized_plan_field adopt_reserved_state_dir \
         "$ADOPT_RESERVED_STATE_DIR"
-      append_frozen_plan_field adopt_reserved_state_dir_identity \
+      append_serialized_plan_field adopt_reserved_state_dir_identity \
         "$ADOPT_RESERVED_STATE_DIR_IDENTITY"
-      append_frozen_plan_field adopt_reserved_state_file \
+      append_serialized_plan_field adopt_reserved_state_file \
         "$ADOPT_RESERVED_STATE_FILE"
-      append_frozen_plan_field adopt_reserved_state_file_identity \
+      append_serialized_plan_field adopt_reserved_state_file_identity \
         "$ADOPT_RESERVED_STATE_FILE_IDENTITY"
-      append_frozen_plan_field adopt_reserved_operation_lock \
+      append_serialized_plan_field adopt_reserved_operation_lock \
         "$ADOPT_RESERVED_OPERATION_LOCK"
-      append_frozen_plan_field typed_operand_0_name source
-      append_frozen_plan_field typed_operand_0_value "$ADOPT_SOURCE"
-      append_frozen_plan_field adopt_source_identity "$ADOPT_SOURCE_IDENTITY"
-      append_frozen_plan_field adopt_source_device "$ADOPT_SOURCE_DEVICE"
-      append_frozen_plan_field adopt_parent "$ADOPT_PARENT"
-      append_frozen_plan_field adopt_parent_identity "$ADOPT_PARENT_IDENTITY"
-      append_frozen_plan_field adopt_destination "$ADOPT_DESTINATION"
-      append_frozen_plan_field adopt_destination_identity \
+      append_serialized_plan_field typed_operand_0_name source
+      append_serialized_plan_field typed_operand_0_value "$ADOPT_SOURCE"
+      append_serialized_plan_field adopt_source_identity \
+        "$ADOPT_SOURCE_IDENTITY"
+      append_serialized_plan_field adopt_source_device "$ADOPT_SOURCE_DEVICE"
+      append_serialized_plan_field adopt_parent "$ADOPT_PARENT"
+      append_serialized_plan_field adopt_parent_identity \
+        "$ADOPT_PARENT_IDENTITY"
+      append_serialized_plan_field adopt_destination "$ADOPT_DESTINATION"
+      append_serialized_plan_field adopt_destination_identity \
         "$ADOPT_DESTINATION_IDENTITY"
-      append_frozen_plan_field adopt_destination_device \
+      append_serialized_plan_field adopt_destination_device \
         "$ADOPT_DESTINATION_DEVICE"
       ;;
   esac
 }
 
-capture_candidate_planned_command_snapshot() { # command
-  local command=$1 state_dir_identity state_file_identity
-  CANDIDATE_PLAN_FIELD_NAMES=()
-  CANDIDATE_PLAN_FIELD_VALUES=()
-  capture_common_candidate_plan_fields "$command"
-  case "$command" in
-    init)
-      if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
-        state_dir_identity=$(path_identity "$STATE_DIR") || \
-          die "cannot capture candidate state directory identity"
-      else
-        state_dir_identity=absent
-      fi
-      if [[ -e "$state_file" || -L "$state_file" ]]; then
-        state_file_identity=$(path_identity "$state_file") || \
-          die "cannot capture candidate state file identity"
-      else
-        state_file_identity=absent
-      fi
-      append_candidate_plan_field typed_operand_count 0
-      append_candidate_plan_field state_dir_identity "$state_dir_identity"
-      append_candidate_plan_field state_file_identity "$state_file_identity"
+copy_serialized_plan_snapshot() { # target
+  case "$1" in
+    frozen)
+      FROZEN_PLAN_FIELD_NAMES=("${SERIALIZED_PLAN_FIELD_NAMES[@]}")
+      FROZEN_PLAN_FIELD_VALUES=("${SERIALIZED_PLAN_FIELD_VALUES[@]}")
       ;;
-    adopt)
-      state_dir_identity=$(path_identity "$STATE_DIR") || \
-        die "cannot capture candidate adopt state directory identity"
-      state_file_identity=$(path_identity "$state_file") || \
-        die "cannot capture candidate adopt state file identity"
-      append_candidate_plan_field typed_operand_count 1
-      append_candidate_plan_field state_dir_identity "$state_dir_identity"
-      append_candidate_plan_field state_file_identity "$state_file_identity"
-      append_candidate_plan_field adopt_reserved_state_dir \
-        "$ADOPT_RESERVED_STATE_DIR"
-      append_candidate_plan_field adopt_reserved_state_dir_identity \
-        "$ADOPT_RESERVED_STATE_DIR_IDENTITY"
-      append_candidate_plan_field adopt_reserved_state_file \
-        "$ADOPT_RESERVED_STATE_FILE"
-      append_candidate_plan_field adopt_reserved_state_file_identity \
-        "$ADOPT_RESERVED_STATE_FILE_IDENTITY"
-      append_candidate_plan_field adopt_reserved_operation_lock \
-        "$ADOPT_RESERVED_OPERATION_LOCK"
-      append_candidate_plan_field typed_operand_0_name source
-      append_candidate_plan_field typed_operand_0_value "$ADOPT_SOURCE"
-      append_candidate_plan_field adopt_source_identity "$ADOPT_SOURCE_IDENTITY"
-      append_candidate_plan_field adopt_source_device "$ADOPT_SOURCE_DEVICE"
-      append_candidate_plan_field adopt_parent "$ADOPT_PARENT"
-      append_candidate_plan_field adopt_parent_identity "$ADOPT_PARENT_IDENTITY"
-      append_candidate_plan_field adopt_destination "$ADOPT_DESTINATION"
-      append_candidate_plan_field adopt_destination_identity \
-        "$ADOPT_DESTINATION_IDENTITY"
-      append_candidate_plan_field adopt_destination_device \
-        "$ADOPT_DESTINATION_DEVICE"
+    candidate)
+      CANDIDATE_PLAN_FIELD_NAMES=("${SERIALIZED_PLAN_FIELD_NAMES[@]}")
+      CANDIDATE_PLAN_FIELD_VALUES=("${SERIALIZED_PLAN_FIELD_VALUES[@]}")
       ;;
+    *) die "unknown plan snapshot target: $1" ;;
   esac
+}
+
+freeze_planned_command_snapshot() { # command
+  serialize_planned_command_snapshot frozen "$1"
+  copy_serialized_plan_snapshot frozen
+}
+
+capture_candidate_planned_command_snapshot() { # command
+  serialize_planned_command_snapshot candidate "$1"
+  copy_serialized_plan_snapshot candidate
 }
 
 compare_frozen_candidate_plan_snapshots() {
@@ -2662,6 +2571,7 @@ assert_path_identity() { # path expected description
 
 inspect_adopt_state() {
   local raw=$OPTION_OPERANDS parent leaf canonical_mount
+  local canonical_destination
   preflight_adopt_dependencies
   [[ -n "$raw" && "$raw" != "/" ]] || die "adopt source must not be empty or root"
   path_has_control_character "$raw" && die "adopt source contains control characters"
@@ -2679,7 +2589,7 @@ inspect_adopt_state() {
   ADOPT_PARENT=$parent
   ADOPT_PARENT_IDENTITY=$(path_identity "$ADOPT_PARENT") \
     || die "cannot capture adopt source parent identity"
-  ADOPT_SOURCE="$parent/$leaf"
+  ADOPT_SOURCE="${parent%/}/$leaf"
   [[ ! -L "$ADOPT_SOURCE" && -d "$ADOPT_SOURCE" ]] \
     || die "$ADOPT_SOURCE is not a real directory"
   capture_adopt_reserved_control_paths
@@ -2691,13 +2601,20 @@ inspect_adopt_state() {
   [[ "$ADOPT_SOURCE" != "$canonical_mount" \
       && "$ADOPT_SOURCE" != "$canonical_mount"/* ]] \
     || die "$ADOPT_SOURCE is already on the vault"
+  [[ "$canonical_mount" != "$ADOPT_SOURCE" \
+      && "$canonical_mount" != "$ADOPT_SOURCE"/* ]] \
+    || die "$ADOPT_SOURCE contains the expected mount point"
   inspect_runtime_state
   classify_runtime_state
   [[ "$RUNTIME_ASSESSMENT" == "usable" \
       && "$SNAPSHOT_APFS_MOUNTED" == "true" \
       && "$SNAPSHOT_ACTUAL_MOUNT_POINT" == "$MOUNT_POINT" ]] \
     || die "adopt requires a usable mounted vault"
-  ADOPT_DESTINATION="$MOUNT_POINT/$leaf"
+  ADOPT_DESTINATION="${MOUNT_POINT%/}/$leaf"
+  canonical_destination="${canonical_mount%/}/$leaf"
+  [[ "$canonical_destination" != "$ADOPT_SOURCE" \
+      && "$canonical_destination" != "$ADOPT_SOURCE"/* ]] \
+    || die "$ADOPT_DESTINATION would be inside the adopt source"
   [[ ! -e "$ADOPT_DESTINATION" && ! -L "$ADOPT_DESTINATION" ]] \
     || die "$ADOPT_DESTINATION already exists"
   ADOPT_STAGED_LINK="$ADOPT_SOURCE.vaultlock-link"
@@ -4483,16 +4400,18 @@ run_planned_command() { # command
   revalidate_plan_under_operation_lock "$command"
   execute_plan
   case "$command" in
+    init) verify_init_target ;;
+    adopt) verify_adopt_target ;;
+  esac
+  finish_operation_lock
+  case "$command" in
     init)
-      verify_init_target
       note "Result: created encrypted volume $VOLUME ($PLAN_CONTEXT_UUID), state in $STATE_DIR"
       ;;
     adopt)
-      verify_adopt_target
       note "Result: adopted $ADOPT_SOURCE -> $ADOPT_DESTINATION"
       ;;
   esac
-  finish_operation_lock
 }
 
 dispatch_init() {

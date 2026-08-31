@@ -445,6 +445,26 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
         fixture_ditto_source=$fixture_ditto_destination
         fixture_ditto_destination=$fixture_argument
       done
+      fixture_ditto_source_physical=$(cd -P -- "$fixture_ditto_source" \
+        2>/dev/null && pwd -P) || fixture_ditto_source_physical=
+      fixture_ditto_destination_parent=$(/usr/bin/dirname -- \
+        "$fixture_ditto_destination")
+      fixture_ditto_destination_leaf=$(/usr/bin/basename -- \
+        "$fixture_ditto_destination")
+      fixture_ditto_destination_parent=$(cd -P -- \
+        "$fixture_ditto_destination_parent" 2>/dev/null && pwd -P) \
+        || fixture_ditto_destination_parent=
+      fixture_ditto_destination_physical=
+      if [[ -n "$fixture_ditto_destination_parent" ]]; then
+        fixture_ditto_destination_physical=\
+$fixture_ditto_destination_parent/$fixture_ditto_destination_leaf
+      fi
+      case "$fixture_ditto_destination_physical/" in
+        "$fixture_ditto_source_physical/"*)
+          : > "$VAULTLOCK_TEST_APFS_STATE/ditto_destination_inside_source"
+          exit 73
+          ;;
+      esac
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_ditto" ]]; then
         fixture_ditto_signal=$(< "$VAULTLOCK_TEST_APFS_STATE/signal_ditto")
         /bin/rm -f "$VAULTLOCK_TEST_APFS_STATE/signal_ditto"
@@ -681,6 +701,21 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       fi
       ;;
     find)
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/count_tree_traversals" \
+          && " $* " == *" -print0 "* ]]; then
+        if [[ " $* " == *" -type f "* ]]; then
+          fixture_traversal_name=hardlink_index_traversal_count
+        else
+          fixture_traversal_name=tree_manifest_traversal_count
+        fi
+        fixture_tree_traversals=0
+        [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/$fixture_traversal_name" ]] \
+          || fixture_tree_traversals=$(< \
+            "$VAULTLOCK_TEST_APFS_STATE/$fixture_traversal_name")
+        fixture_tree_traversals=$((fixture_tree_traversals + 1))
+        fixture_write "$fixture_traversal_name" "$fixture_tree_traversals"
+        [[ "$fixture_tree_traversals" -le 64 ]] || exit 71
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/count_directory_traversals" \
         && " $* " == *" -depth "* \
         && " $* " == *" -type d "* ]]; then
@@ -2495,6 +2530,10 @@ reset_adopt_fixture() {
     "$apfs_state/tampered_current_snapshot_path" \
     "$apfs_state/count_directory_traversals" \
     "$apfs_state/directory_traversal_count" \
+    "$apfs_state/count_tree_traversals" \
+    "$apfs_state/hardlink_index_traversal_count" \
+    "$apfs_state/tree_manifest_traversal_count" \
+    "$apfs_state/ditto_destination_inside_source" \
     "$apfs_state/rename_copy_trailing_newline" \
     "$apfs_state/source_compressed_flags" \
     "$apfs_state/source_immutable_flags" \
@@ -2625,6 +2664,22 @@ else
   check_contains "adopt mount descendant reports already on vault" \
     'already on the vault' "$mount_descendant_output"
 fi
+reset_adopt_fixture
+mount_parent_source=${mount_point%/*}
+mount_parent_identity=$(/usr/bin/stat -f '%d:%i' "$mount_parent_source")
+if mount_parent_output=$(run_vaultlock adopt --yes \
+    "$mount_parent_source//" 2>&1); then
+  record_failure "adopt rejects normalized mount parent"
+else
+  check_contains "adopt mount parent reports containment" \
+    'contains the expected mount point' "$mount_parent_output"
+fi
+check "adopt mount parent preserves source identity" "$mount_parent_identity" \
+  "$(/usr/bin/stat -f '%d:%i' "$mount_parent_source")"
+check_count "adopt mount parent stops before ditto" 0 'ditto ' \
+  "$(< "$mutation_log")"
+[[ ! -e "$apfs_state/ditto_destination_inside_source" ]] \
+  || record_failure "adopt mount parent reaches recursive ditto boundary"
 control_source=$'control\nsource'
 if control_output=$(run_vaultlock adopt --dry-run "$control_source" 2>&1); then
   record_failure "adopt rejects control characters"
@@ -3871,8 +3926,24 @@ else
   check_contains "adopt operation lock release failure reports retained lock" \
     "$operation_lock_dir" "$release_failure_output"
 fi
+check_count "adopt release failure reports no final success" 0 \
+  'Result: adopted' "$release_failure_output"
 [[ -d "$operation_lock_dir" ]] \
   || record_failure "adopt operation lock release failure retains lock"
+
+reset_operation_lock_fixture
+reset_init_fixture
+: > "$apfs_state/fail_operation_lock_release"
+if init_release_failure_output=$(run_vaultlock init --yes 2>&1); then
+  record_failure "init operation lock release failure exits nonzero"
+else
+  check_contains "init operation lock release failure reports retained lock" \
+    "$operation_lock_dir" "$init_release_failure_output"
+fi
+check_count "init release failure reports no final success" 0 \
+  'Result: created encrypted volume' "$init_release_failure_output"
+[[ -d "$operation_lock_dir" ]] \
+  || record_failure "init operation lock release failure retains lock"
 
 for signal_case in TERM:143 HUP:129 INT:130; do
   reset_operation_lock_fixture
@@ -3986,24 +4057,105 @@ fi
 reset_adopt_fixture
 large_directory_source=$(new_adopt_source adopt-large-directory-skeleton)
 large_directory_path=$large_directory_source
-for large_directory_index in {1..16}; do
+for large_directory_index in {1..24}; do
   large_directory_path=$large_directory_path/d$large_directory_index
   mkdir "$large_directory_path"
 done
 printf 'deep payload\n' > "$large_directory_path/deep-file"
+large_file_index=1
+while [[ "$large_file_index" -le 200 ]]; do
+  printf -v large_file_name '%03d' "$large_file_index"
+  printf 'payload %s\n' "$large_file_name" \
+    > "$large_directory_source/file-$large_file_name"
+  large_file_index=$((large_file_index + 1))
+done
+/bin/ln "$large_directory_source/file-001" \
+  "$large_directory_source/group-a-1"
+/bin/ln "$large_directory_source/file-001" \
+  "$large_directory_source/group-a-2"
+/bin/ln "$large_directory_source/file-101" \
+  "$large_directory_source/group-b-1"
+/bin/ln "$large_directory_source/file-101" \
+  "$large_directory_source/group-b-2"
+/bin/ln "$large_directory_source/file-101" \
+  "$large_directory_source/group-b-3"
+large_scale_file_count=$(/usr/bin/find "$large_directory_source" \
+  -type f | /usr/bin/wc -l | /usr/bin/tr -d '[:space:]')
+check "large hardlink index fixture has hundreds of file entries" 207 \
+  "$large_scale_file_count"
+large_external_link=$test_root/adopt-large-external-link
+/bin/ln "$large_directory_source/file-200" "$large_external_link"
+: > "$apfs_state/count_tree_traversals"
+if large_external_output=$(run_vaultlock adopt --yes \
+    "$large_directory_source" 2>&1); then
+  record_failure "large adopt rejects hardlink outside source tree"
+else
+  check_contains "large adopt external hardlink reports manifest refusal" \
+    'cannot create stable source manifest' "$large_external_output"
+fi
+check_count "large external hardlink stops before ditto" 0 'ditto ' \
+  "$(< "$mutation_log")"
+large_external_index_traversals=$(< \
+  "$apfs_state/hardlink_index_traversal_count")
+if [[ "$large_external_index_traversals" -le 2 ]]; then
+  printf 'ok   large external hardlink uses bounded index traversals: %s\n' \
+    "$large_external_index_traversals"
+else
+  record_failure \
+    "large external hardlink uses bounded index traversals: $large_external_index_traversals"
+fi
+/bin/rm -f -- "$large_external_link"
+large_file_index=33
+while [[ "$large_file_index" -le 200 ]]; do
+  if [[ "$large_file_index" -ne 101 ]]; then
+    printf -v large_file_name '%03d' "$large_file_index"
+    /bin/rm -f -- "$large_directory_source/file-$large_file_name"
+  fi
+  large_file_index=$((large_file_index + 1))
+done
+large_success_file_count=$(/usr/bin/find "$large_directory_source" \
+  -type f | /usr/bin/wc -l | /usr/bin/tr -d '[:space:]')
+check "large cleanup fixture retains internal hardlink groups" 40 \
+  "$large_success_file_count"
+reset_adopt_fixture
 : > "$apfs_state/count_directory_traversals"
+: > "$apfs_state/count_tree_traversals"
 if large_directory_output=$(run_vaultlock adopt --yes \
     "$large_directory_source" 2>&1); then
   :
 else
   record_failure \
-    "adopt cleans deterministic 16-directory skeleton: $large_directory_output"
+    "adopt cleans deterministic large-tree skeleton: $large_directory_output"
 fi
+check "adopt preserves large-tree hardlink group A" \
+  "$(/usr/bin/stat -f '%d:%i' "$mount_point/adopt-large-directory-skeleton/file-001")" \
+  "$(/usr/bin/stat -f '%d:%i' "$mount_point/adopt-large-directory-skeleton/group-a-2")"
+check "adopt preserves large-tree hardlink group B" \
+  "$(/usr/bin/stat -f '%d:%i' "$mount_point/adopt-large-directory-skeleton/file-101")" \
+  "$(/usr/bin/stat -f '%d:%i' "$mount_point/adopt-large-directory-skeleton/group-b-3")"
 large_directory_traversals=$(< "$apfs_state/directory_traversal_count")
 if [[ "$large_directory_traversals" -le 3 ]]; then
   printf 'ok   adopt directory cleanup uses bounded traversals\n'
 else
   record_failure "adopt directory cleanup uses bounded traversals: $large_directory_traversals"
+fi
+large_hardlink_index_traversals=$(< \
+  "$apfs_state/hardlink_index_traversal_count")
+large_tree_manifest_traversals=$(< \
+  "$apfs_state/tree_manifest_traversal_count")
+if [[ "$large_hardlink_index_traversals" -le 64 ]]; then
+  printf 'ok   adopt large tree uses bounded hardlink index traversals: %s\n' \
+    "$large_hardlink_index_traversals"
+else
+  record_failure \
+    "adopt large tree uses bounded hardlink index traversals: $large_hardlink_index_traversals"
+fi
+if [[ "$large_tree_manifest_traversals" -le 64 ]]; then
+  printf 'ok   adopt large tree uses bounded manifest traversals: %s\n' \
+    "$large_tree_manifest_traversals"
+else
+  record_failure \
+    "adopt large tree uses bounded manifest traversals: $large_tree_manifest_traversals"
 fi
 
 reset_adopt_fixture
