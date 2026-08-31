@@ -20,6 +20,18 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
   : "${VAULTLOCK_TEST_FAKE_BIN:?missing fake binary directory}"
   : "${VAULTLOCK_MOUNT_POINT:?missing mount point}"
 
+  for fixture_secret_scope in unlock init; do
+    fixture_expected_secret_path=$VAULTLOCK_TEST_APFS_STATE/expected_child_${fixture_secret_scope}_secret
+    [[ -f "$fixture_expected_secret_path" ]] || continue
+    fixture_expected_secret=$(< "$fixture_expected_secret_path")
+    while IFS= read -r fixture_secret_name; do
+      fixture_secret_value=${!fixture_secret_name-}
+      if [[ "$fixture_secret_value" == *"$fixture_expected_secret"* ]]; then
+        : > "$VAULTLOCK_TEST_APFS_STATE/${fixture_secret_scope}_secret_in_child_environment"
+      fi
+    done < <(compgen -e)
+  done
+
   printf '%q' "$fixture_command" >> "$VAULTLOCK_TEST_ACTION_LOG"
   for fixture_argument in "$@"; do
     printf ' %q' "$fixture_argument" >> "$VAULTLOCK_TEST_ACTION_LOG"
@@ -34,7 +46,10 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       fi
       ;;
   security|tmutil|ditto|mv|ln|rm|rmdir|mkdir|chmod|mktemp)
-    if [[ " $* " != *"$HOME/.vaultlock-operation"* ]]; then
+    if [[ "$fixture_command" == security \
+        && "${1:-}" == find-generic-password ]]; then
+      :
+    elif [[ " $* " != *"$HOME/.vaultlock-operation"* ]]; then
       printf '%s\n' "$fixture_command $*" >> "$VAULTLOCK_TEST_MUTATION_LOG"
     fi
       ;;
@@ -383,9 +398,27 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
               printf 'Volume locked\n'
               ;;
             unlockVolume)
+              IFS= read -r fixture_unlock_passphrase \
+                || [[ -n "$fixture_unlock_passphrase" ]]
+              if [[ -f "$VAULTLOCK_TEST_APFS_STATE/expected_unlock_passphrase" \
+                  && "$fixture_unlock_passphrase" \
+                    != "$(fixture_read expected_unlock_passphrase)" ]]; then
+                exit 77
+              fi
+              : > "$VAULTLOCK_TEST_APFS_STATE/unlock_stdin_verified"
               fixture_write locked false
-              fixture_write mounted true
-              fixture_write mount_point "$VAULTLOCK_MOUNT_POINT"
+              if [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/unlock_leaves_unmounted" ]]; then
+                fixture_write mounted true
+                fixture_write mount_point "$VAULTLOCK_MOUNT_POINT"
+              fi
+              if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_identity_after_unlock" \
+                  || -f "$VAULTLOCK_TEST_APFS_STATE/swap_uuid_after_unlock" ]]; then
+                fixture_write uuid UUID-UNLOCK-SWAPPED
+              fi
+              if [[ -f "$VAULTLOCK_TEST_APFS_STATE/swap_identity_after_unlock" \
+                  || -f "$VAULTLOCK_TEST_APFS_STATE/swap_device_after_unlock" ]]; then
+                fixture_write device disk99s9
+              fi
               ;;
             *) exit 64 ;;
           esac
@@ -414,20 +447,43 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
       printf '%s\n' "$BASH_VERSION"
       ;;
     security)
-      [[ "${1:-}" == "-i" && $# -eq 1 ]] || exit 64
-      IFS= read -r fixture_security_command || exit 1
-      [[ "$fixture_security_command" == add-generic-password\ * ]] || exit 64
-      if /usr/bin/find "$VAULTLOCK_STATE_DIR" -maxdepth 1 \
-          -name '.security-output.*' -print -quit | grep -q .; then
-        : > "$VAULTLOCK_TEST_APFS_STATE/security_output_artifact_seen"
-      fi
-      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/echo_security_error" ]]; then
-        printf '%s\n' "$fixture_security_command"
-        printf '%s\n' "$fixture_security_command" >&2
-        exit 1
-      fi
-      [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_keychain" ]] || exit 1
-      : > "$VAULTLOCK_TEST_APFS_STATE/keychain_marker"
+      case "${1:-}" in
+        -i)
+          [[ $# -eq 1 ]] || exit 64
+          for fixture_secret_scope in unlock init; do
+            if [[ -f "$VAULTLOCK_TEST_APFS_STATE/expected_child_${fixture_secret_scope}_secret" ]]; then
+              : > "$VAULTLOCK_TEST_APFS_STATE/${fixture_secret_scope}_secret_environment_probe_ran"
+            fi
+          done
+          IFS= read -r fixture_security_command || exit 1
+          [[ "$fixture_security_command" == add-generic-password\ * ]] \
+            || exit 64
+          if /usr/bin/find "$VAULTLOCK_STATE_DIR" -maxdepth 1 \
+              -name '.security-output.*' -print -quit | grep -q .; then
+            : > "$VAULTLOCK_TEST_APFS_STATE/security_output_artifact_seen"
+          fi
+          if [[ -f "$VAULTLOCK_TEST_APFS_STATE/echo_security_error" ]]; then
+            printf '%s\n' "$fixture_security_command"
+            printf '%s\n' "$fixture_security_command" >&2
+            exit 1
+          fi
+          [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_keychain" ]] || exit 1
+          fixture_keychain_value=${fixture_security_command##* -w }
+          fixture_keychain_value=${fixture_keychain_value% -U}
+          printf '%s' "$fixture_keychain_value" \
+            > "$VAULTLOCK_TEST_APFS_STATE/keychain_value"
+          : > "$VAULTLOCK_TEST_APFS_STATE/keychain_marker"
+          ;;
+        find-generic-password)
+          [[ $# -eq 6 && "${2:-}" == -a && "${4:-}" == -s \
+            && "${6:-}" == -w ]] || exit 64
+          [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_keychain_read" ]] \
+            || exit 70
+          [[ -f "$VAULTLOCK_TEST_APFS_STATE/keychain_value" ]] || exit 44
+          printf '%s\n' "$(fixture_read keychain_value)"
+          ;;
+        *) exit 64 ;;
+      esac
       ;;
     head)
       [[ "$*" == "-c 32 /dev/urandom" ]] || exit 64
@@ -531,6 +587,17 @@ $fixture_ditto_destination_parent/$fixture_ditto_destination_leaf
     stat)
       fixture_stat_path=""
       for fixture_argument in "$@"; do fixture_stat_path=$fixture_argument; done
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_unlock_temp_identity_once" ]]; then
+        fixture_unlock_temp_prefix=$(< \
+          "$VAULTLOCK_TEST_APFS_STATE/fail_unlock_temp_identity_once")
+        case "$fixture_stat_path" in
+          "$VAULTLOCK_STATE_DIR/$fixture_unlock_temp_prefix"*)
+            /bin/rm -f \
+              "$VAULTLOCK_TEST_APFS_STATE/fail_unlock_temp_identity_once"
+            exit 1
+            ;;
+        esac
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_operation_lock_identity_once" \
           && "$fixture_stat_path" == "$HOME/.vaultlock-operation.lock" \
           && " $* " == *" %d:%i "* ]]; then
@@ -776,6 +843,11 @@ $fixture_ditto_destination_parent/$fixture_ditto_destination_leaf
           && "$fixture_mv_source" == "${fixture_mv_destination%.vaultlock-backup}" ]]; then
         exit 1
       fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_unlock_state_install" \
+          && "$fixture_mv_source" == "$VAULTLOCK_STATE_DIR"/.state-unlock.* \
+          && "$fixture_mv_destination" == "$VAULTLOCK_STATE_DIR/state.json" ]]; then
+        exit 1
+      fi
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_link_move" \
           && "$fixture_mv_source" == *.vaultlock-link \
           && "$fixture_mv_destination" == "${fixture_mv_source%.vaultlock-link}" ]]; then
@@ -857,6 +929,18 @@ $fixture_ditto_destination_parent/$fixture_ditto_destination_leaf
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_staged_link_cleanup" \
           && "$fixture_rm_path" == *.vaultlock-link ]]; then
         exit 1
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_unlock_staging_cleanup" \
+          && "$fixture_rm_path" == "$VAULTLOCK_STATE_DIR"/.unlock-recovery.* ]]; then
+        exit 1
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_unlock_private_temp_cleanup" ]]; then
+        fixture_private_temp_prefix=$(< \
+          "$VAULTLOCK_TEST_APFS_STATE/fail_unlock_private_temp_cleanup")
+        if [[ "$fixture_rm_path" \
+            == "$VAULTLOCK_STATE_DIR/$fixture_private_temp_prefix"* ]]; then
+          exit 1
+        fi
       fi
       /bin/rm "$@" || exit 1
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/signal_operation_owner_unlink" \
@@ -1121,13 +1205,81 @@ $fixture_ditto_destination_parent/$fixture_ditto_destination_leaf
         printf 'version=1\npid=broken\n' > "$fixture_subject"
         /bin/chmod 600 "$fixture_subject"
         ;;
-      state_equivalent_inode_swap)
+        state_equivalent_inode_swap)
         /bin/cp "$VAULTLOCK_STATE_DIR/state.json" \
           "$VAULTLOCK_TEST_APFS_STATE/state-equivalent-copy"
         /bin/rm "$VAULTLOCK_STATE_DIR/state.json"
-        /bin/mv "$VAULTLOCK_TEST_APFS_STATE/state-equivalent-copy" \
-          "$VAULTLOCK_STATE_DIR/state.json"
-        ;;
+          /bin/mv "$VAULTLOCK_TEST_APFS_STATE/state-equivalent-copy" \
+            "$VAULTLOCK_STATE_DIR/state.json"
+          ;;
+        unlock_apfs_state_swap)
+          fixture_write locked false
+          fixture_write mounted true
+          fixture_write mount_point "$VAULTLOCK_MOUNT_POINT"
+          ;;
+        unlock_device_revalidation_swap)
+          fixture_write device disk9s2
+          ;;
+        unlock_deadline_round_change)
+          fixture_changed_state=$(jq \
+            '.deadline = "2000-01-01T00:01:00+0000"
+            | .deadline_epoch = 61 | .round = 2' \
+            "$VAULTLOCK_STATE_DIR/state.json") || exit 1
+          printf '%s\n' "$fixture_changed_state" \
+            > "$VAULTLOCK_STATE_DIR/state.json"
+          ;;
+        unlock_recovery_replace)
+          /bin/rm -f "$VAULTLOCK_STATE_DIR/passphrase.txt"
+          printf 'VGFtcGVyZWRTZWNyZXQ=' \
+            > "$VAULTLOCK_STATE_DIR/passphrase.txt"
+          /usr/bin/shasum -a 256 "$VAULTLOCK_STATE_DIR/passphrase.txt" \
+            | /usr/bin/cut -d' ' -f1 \
+            > "$VAULTLOCK_STATE_DIR/passphrase.sha256"
+          ;;
+        unlock_state_future_replace)
+          printf '%s\n' \
+            '{"locked":true,"volume_uuid":"UUID-123","created":"race","deadline":"2099-01-02T03:04:00+0100","deadline_epoch":4070999040,"round":792731235}' \
+            > "$VAULTLOCK_STATE_DIR/state.json"
+          ;;
+        unlock_keychain_change)
+          printf 'Q2hhbmdlZEtleWNoYWlu\n' \
+            > "$VAULTLOCK_TEST_APFS_STATE/keychain_value"
+          ;;
+        unlock_staging_artifact_create)
+          printf 'post-revalidation plaintext artifact\n' \
+            > "$VAULTLOCK_STATE_DIR/.unlock-recovery.post-revalidation"
+          ;;
+        unlock_apfs_uuid_swap)
+          fixture_write uuid UUID-IMMEDIATE-SWAP
+          ;;
+        unlock_apfs_device_swap)
+          fixture_write device disk9s2
+          ;;
+        unlock_apfs_lock_swap)
+          fixture_write locked false
+          ;;
+        unlock_plaintext_stage_fail)
+          exit 75
+          ;;
+        unlock_tle_error_stage_fail)
+          exit 76
+          ;;
+        unlock_state_stage_fail)
+          exit 77
+          ;;
+        unlock_hook_create)
+          /bin/mkdir -p "$VAULTLOCK_STATE_DIR/hooks/post-unlock.d"
+          /bin/cp "$0" \
+            "$VAULTLOCK_STATE_DIR/hooks/post-unlock.d/drift-hook"
+          /bin/chmod +x \
+            "$VAULTLOCK_STATE_DIR/hooks/post-unlock.d/drift-hook"
+          ;;
+        hold_unlock_execution)
+          : > "$VAULTLOCK_TEST_APFS_STATE/unlock_execution_entered"
+          while [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/release_unlock_execution" ]]; do
+            /bin/sleep 0.01
+          done
+          ;;
       adopt_mount_uuid_swap)
         fixture_write uuid UUID-POST-BACKUP-SWAP
         ;;
@@ -1159,10 +1311,54 @@ $fixture_ditto_destination_parent/$fixture_ditto_destination_leaf
       esac
       /bin/rm -f "$fixture_transition_marker"
       ;;
-    mount|tle|tmutil|curl)
+    tle)
+      if [[ " $* " == *" -d "* ]]; then
+        if [[ -f "$VAULTLOCK_TEST_APFS_STATE/tle_early" ]]; then
+          printf 'too early for requested round\n' >&2
+          exit 1
+        fi
+        [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_tle" ]] \
+          || { printf 'fixture tle failure\n' >&2; exit 2; }
+        fixture_read tle_plaintext || exit 3
+      fi
+      ;;
+    mount|tmutil|curl)
       ;;
     *)
       # Hook fixtures use the same dispatcher and only record their argv.
+      if [[ " $* " == *" --phase post-unlock "* \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/verify_post_hook_target" ]]; then
+        [[ "$(fixture_read locked)" == false \
+          && "$(fixture_read mounted)" == true \
+          && "$(fixture_read mount_point)" == "$VAULTLOCK_MOUNT_POINT" \
+          && "$(jq -r .locked "$VAULTLOCK_STATE_DIR/state.json")" == false \
+          && -f "$VAULTLOCK_STATE_DIR/passphrase.txt" \
+          && -f "$VAULTLOCK_STATE_DIR/passphrase.sha256" \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/keychain_value" \
+          && "$(< "$VAULTLOCK_STATE_DIR/passphrase.txt")" \
+            == "$(fixture_read keychain_value)" ]] || exit 74
+        : > "$VAULTLOCK_TEST_APFS_STATE/post_hook_saw_usable_target"
+      fi
+      if [[ "$fixture_command" == 20-post-metadata-tamper \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/tamper_plaintext_mode_in_post_hook" ]]; then
+        case "$(fixture_read tamper_plaintext_mode_in_post_hook)" in
+          mode) /bin/chmod 644 "$VAULTLOCK_STATE_DIR/passphrase.txt" || exit 1 ;;
+          acl)
+            /bin/chmod +a 'everyone allow read' \
+              "$VAULTLOCK_STATE_DIR/passphrase.txt" || exit 1
+            ;;
+          *) exit 64 ;;
+        esac
+      fi
+      if [[ "$fixture_command" == 20-deferred-identity-swap \
+          && -f "$VAULTLOCK_TEST_APFS_STATE/tamper_mount_identity_in_post_hook" ]]; then
+        fixture_write uuid UUID-POST-HOOK-SWAP
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/fail_hook_name" \
+          && "$fixture_command" \
+            == "$(fixture_read fail_hook_name)" ]]; then
+        exit 73
+      fi
       ;;
   esac
   exit 0
@@ -1184,6 +1380,8 @@ state_dir="$test_home/.vaultlock"
 mount_point="$test_root/Volumes/vault.test"
 confirm_device="$test_root/confirm"
 mkdir -p "$fake_bin" "$gnu_bin" "$apfs_state" "$state_dir" "$mount_point"
+/bin/chmod 700 "$state_dir"
+umask 077
 : > "$action_log"
 : > "$mutation_log"
 : > "$hook_log"
@@ -1271,6 +1469,14 @@ record_failure() { # description
 }
 
 run_vaultlock() {
+  local -a vaultlock_command=(/bin/bash)
+  if [[ "${VAULTLOCK_TEST_ALLEXPORT:-0}" == 1 ]]; then
+    vaultlock_command+=( -a )
+  fi
+  if [[ "${VAULTLOCK_TEST_NOGLOB:-0}" == 1 ]]; then
+    vaultlock_command+=( -f )
+  fi
+  vaultlock_command+=( "$VL" "$@" )
   HOME="$test_home" \
   PATH="$fake_bin" \
   VAULTLOCK_STATE_DIR="$state_dir" \
@@ -1297,8 +1503,18 @@ run_vaultlock() {
   VAULTLOCK_TEST_MUTATION_LOG="$mutation_log" \
   VAULTLOCK_TEST_HOOK_LOG="$hook_log" \
   VAULTLOCK_TEST_APFS_STATE="$apfs_state" \
-  /bin/bash "$VL" "$@"
+  "${vaultlock_command[@]}"
 }
+
+run_vaultlock_with_imported_secret_names() (
+  export INIT_PASSPHRASE=caller-controlled
+  export UNLOCK_PASSPHRASE=caller-controlled
+  export content=caller-controlled value=caller-controlled
+  export passphrase=caller-controlled expected_plaintext=caller-controlled
+  export plaintext=caller-controlled decrypted_recovery=caller-controlled
+  export actual_content=caller-controlled
+  VAULTLOCK_TEST_ALLEXPORT=1 run_vaultlock "$@"
+)
 
 start_vaultlock_background() { # output command...
   local output=$1
@@ -2031,7 +2247,8 @@ check_plan_coordination() { # description plan
 }
 
 fake_passphrase='FAKE-PASSPHRASE-DO-NOT-PRINT'
-fake_hash='FAKE-HASH-DO-NOT-PRINT'
+fake_hash=$(printf '%s' "$fake_passphrase" \
+  | /usr/bin/shasum -a 256 | /usr/bin/cut -d' ' -f1)
 fake_ciphertext='FAKE-CIPHERTEXT-DO-NOT-PRINT'
 
 manifest_probe="$test_root/manifest-probe"
@@ -2183,11 +2400,39 @@ EOF
 check "unlock dry-run ordered actions" "$expected_unlock_order" "$unlock_order"
 check "unlock dry-run final result" 'Result: no changes made' \
   "$(tail -n 1 <<< "$unlock_plan")"
+audit_state_dir=$(printf '%q' "$state_dir")
+audit_state_file=$(printf '%q' "$state_dir/state.json")
+audit_ciphertext=$(printf '%q' "$state_dir/passphrase.tle")
+audit_hash=$(printf '%q' "$state_dir/passphrase.sha256")
+audit_pre_hook=$(printf '%q' "$state_dir/hooks/pre-unlock.d/10-pre hook")
+audit_post_hook=$(printf '%q' "$state_dir/hooks/post-unlock.d/20-post hook")
+audit_staging_pattern=$(printf '%q' '.unlock-recovery.*')
+audit_tle_pattern=$(printf '%q' '.tle-unlock.*')
+audit_state_staging_pattern=$(printf '%q' '.state-unlock.*')
+expected_unlock_reads=$(cat <<EOF
+diskutil info -plist UUID-123
+stat -f %d:%i:%Lp:%u:%l -- $audit_state_dir
+ls -ldeB -- $audit_state_dir
+find -P $audit_state_dir -mindepth 1 -maxdepth 1 \( -name $audit_staging_pattern -o -name $audit_tle_pattern -o -name $audit_state_staging_pattern \) -print -quit
+stat -f %d:%i:%Lp:%u:%l -- $audit_state_file
+ls -ldeB -- $audit_state_file
+stat -f %d:%i:%Lp:%u:%l -- $audit_ciphertext
+ls -ldeB -- $audit_ciphertext
+stat -f %d:%i:%Lp:%u:%l -- $audit_hash
+ls -ldeB -- $audit_hash
+curl -fsS --max-time 10 https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/info
+stat -f %d:%i:%Lp:%u:%l -- $audit_pre_hook
+ls -ldeB -- $audit_pre_hook
+stat -f %d:%i:%Lp:%u:%l -- $audit_post_hook
+ls -ldeB -- $audit_post_hook
+EOF
+)
 check "unlock dry-run audit contains only allowlisted reads" \
-  $'diskutil info -plist UUID-123\ncurl -fsS --max-time 10 https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971/info' \
+  "$expected_unlock_reads" \
   "$(< "$action_log")"
 check_empty "unlock dry-run mutation log" "$mutation_log"
-check_empty "unlock dry-run hook log" "$hook_log"
+check_count "unlock dry-run executes no hooks" 0 \
+  '--phase ' "$(< "$hook_log")"
 check_tree_unchanged "unlock dry-run leaves state tree unchanged" \
   "$unlock_state_before" "$state_dir"
 check_tree_unchanged "unlock dry-run leaves APFS fixture unchanged" \
@@ -2260,7 +2505,9 @@ check "recorded-unlocked repair plans disabled hooks after target" \
 write_json_state false null null null UUID-123
 write_apfs_state false true UUID-123 disk9s1
 printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
-rm -f "$state_dir/passphrase.sha256" "$state_dir/passphrase.tle"
+printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
+printf '%s' "$fake_passphrase" > "$apfs_state/keychain_value"
+rm -f "$state_dir/passphrase.tle"
 usable_unlock_plan=$(run_vaultlock unlock --dry-run --no-hooks)
 check_count "usable unlock no-hooks reports disabled hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$usable_unlock_plan"
@@ -2275,7 +2522,9 @@ check_count "usable unlock plans no deferred hook discovery" 0 \
 write_json_state false null null null UUID-123
 write_apfs_state false false UUID-123 disk9s1
 printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
-rm -f "$state_dir/passphrase.sha256" "$state_dir/passphrase.tle"
+printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
+printf '%s' "$fake_passphrase" > "$apfs_state/keychain_value"
+rm -f "$state_dir/passphrase.tle"
 unmounted_unlock_plan=$(run_vaultlock unlock --dry-run --no-hooks)
 check_count "unmounted unlock no-hooks reports disabled hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$unmounted_unlock_plan"
@@ -3214,6 +3463,10 @@ reset_init_fixture() {
     "$apfs_state/cleanup_original_identity" \
     "$apfs_state/cleanup_replacement_identity" \
     "$apfs_state/security_output_artifact_seen" \
+    "$apfs_state/keychain_value" \
+    "$apfs_state/expected_child_init_secret" \
+    "$apfs_state/init_secret_in_child_environment" \
+    "$apfs_state/init_secret_environment_probe_ran" \
     "$apfs_state/inherit_recovery_acl" \
     "$apfs_state/fail_recovery_acl_removal" \
     "$apfs_state/swap_identity_after_add" \
@@ -5043,6 +5296,1292 @@ fi
 /bin/rm -f "$state_dir"
 /bin/mv "$state_dir_real" "$state_dir"
 /bin/rm -rf -- "${state_dir_symlink_source:?}"
+
+reset_operation_lock_fixture
+
+# Task 7 normal unlock convergence and cooperative serialization.
+unlock_test_passphrase='VGFzazdS ZWNvdmVyeQ=='
+unlock_test_passphrase=${unlock_test_passphrase/ /}
+unlock_test_hash=$(printf '%s' "$unlock_test_passphrase" \
+  | /usr/bin/shasum -a 256 | /usr/bin/cut -d' ' -f1)
+
+reset_unlock_fixture() {
+  reset_operation_lock_fixture
+  /bin/rm -rf -- "$state_dir/hooks/pre-unlock.d" \
+    "$state_dir/hooks/post-unlock.d" "$mount_point/.vaultlock"
+  /bin/rm -f "$state_dir/passphrase.txt" "$state_dir/passphrase.tle" \
+    "$state_dir/passphrase.sha256" "$state_dir"/.tle-unlock.* \
+    "$state_dir"/.state-unlock.* \
+    "$apfs_state/keychain_marker" "$apfs_state/keychain_value" \
+    "$apfs_state/fail_keychain" "$apfs_state/fail_keychain_read" \
+    "$apfs_state/fail_unlock_state_install" \
+    "$apfs_state/fail_unlock_staging_cleanup" \
+    "$apfs_state/fail_unlock_private_temp_cleanup" \
+    "$apfs_state/fail_unlock_temp_identity_once" \
+    "$apfs_state/expected_unlock_passphrase" \
+    "$apfs_state/unlock_stdin_verified" \
+    "$apfs_state/unlock_leaves_unmounted" \
+    "$apfs_state/swap_identity_after_unlock" \
+    "$apfs_state/swap_uuid_after_unlock" \
+    "$apfs_state/swap_device_after_unlock" \
+    "$apfs_state/tle_plaintext" "$apfs_state/tle_early" \
+    "$apfs_state/fail_tle" "$apfs_state/fail_hook_name" \
+    "$apfs_state/verify_post_hook_target" \
+    "$apfs_state/post_hook_saw_usable_target" \
+    "$apfs_state/tamper_plaintext_mode_in_post_hook" \
+    "$apfs_state/tamper_mount_identity_in_post_hook" \
+    "$apfs_state/expected_child_unlock_secret" \
+    "$apfs_state/unlock_secret_in_child_environment" \
+    "$apfs_state/unlock_secret_environment_probe_ran" \
+    "$apfs_state/unlock_execution_entered" \
+    "$apfs_state/release_unlock_execution" \
+    "$apfs_state"/transition_*
+  : > "$action_log"
+  : > "$mutation_log"
+  : > "$hook_log"
+}
+
+check_action_order() { # description earlier later
+  local description=$1 earlier=$2 later=$3 earlier_line later_line
+  earlier_line=$(/usr/bin/grep -Fn -- "$earlier" "$action_log" \
+    | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1 || true)
+  later_line=$(/usr/bin/grep -Fn -- "$later" "$action_log" \
+    | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1 || true)
+  if [[ -n "$earlier_line" && -n "$later_line" \
+      && "$earlier_line" -lt "$later_line" ]]; then
+    printf 'ok   %s\n' "$description"
+  else
+    record_failure "$description: [$earlier] must precede [$later]"
+  fi
+}
+
+write_unlock_plaintext() {
+  printf '%s' "$unlock_test_passphrase" > "$state_dir/passphrase.txt"
+  printf '%s\n' "$unlock_test_hash" > "$state_dir/passphrase.sha256"
+}
+
+write_unlock_ciphertext() {
+  printf 'fixture ciphertext\n' > "$state_dir/passphrase.tle"
+  printf '%s\n' "$unlock_test_hash" > "$state_dir/passphrase.sha256"
+  printf '%s' "$unlock_test_passphrase" > "$apfs_state/tle_plaintext"
+}
+
+write_matching_keychain() {
+  printf '%s' "$unlock_test_passphrase" > "$apfs_state/keychain_value"
+  : > "$apfs_state/keychain_marker"
+}
+
+assert_unlock_usable() { # description
+  local description=$1
+  check "$description records JSON unlocked" false \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check "$description leaves APFS unlocked" false \
+    "$(< "$apfs_state/locked")"
+  check "$description leaves APFS mounted" true \
+    "$(< "$apfs_state/mounted")"
+  check "$description leaves expected mount path" "$mount_point" \
+    "$(< "$apfs_state/mount_point")"
+  check "$description leaves expected UUID" UUID-123 \
+    "$(< "$apfs_state/uuid")"
+  check "$description leaves expected device" disk9s1 \
+    "$(< "$apfs_state/device")"
+  check "$description restores exact plaintext" "$unlock_test_passphrase" \
+    "$(< "$state_dir/passphrase.txt")"
+  check "$description preserves matching hash" "$unlock_test_hash" \
+    "$(< "$state_dir/passphrase.sha256")"
+  check "$description stores matching keychain value" \
+    "$unlock_test_passphrase" "$(< "$apfs_state/keychain_value")"
+  [[ ! -e "$operation_lock_dir" ]] \
+    || record_failure "$description releases operation lock"
+}
+
+check_no_unlock_staging_artifacts() { # description
+  local description=$1 artifact
+  artifact=$(/usr/bin/find -P "$state_dir" -mindepth 1 -maxdepth 1 \
+    \( -name '.unlock-recovery.*' -o -name '.tle-unlock.*' \
+      -o -name '.state-unlock.*' \) -print -quit)
+  [[ -z "$artifact" ]] \
+    || record_failure "$description leaves staging artifact $artifact"
+}
+
+for unsafe_unlock_boundary in state-mode plaintext-mode plaintext-acl; do
+  reset_unlock_fixture
+  write_json_state false null null null UUID-123
+  write_apfs_state false true UUID-123 disk9s1
+  write_unlock_plaintext
+  write_matching_keychain
+  case "$unsafe_unlock_boundary" in
+    state-mode) /bin/chmod 755 "$state_dir" ;;
+    plaintext-mode) /bin/chmod 644 "$state_dir/passphrase.txt" ;;
+    plaintext-acl)
+      /bin/chmod +a 'everyone allow read' "$state_dir/passphrase.txt"
+      ;;
+  esac
+  if unsafe_unlock_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "unlock rejects unsafe $unsafe_unlock_boundary boundary"
+  else
+    check_contains "unlock reports unsafe $unsafe_unlock_boundary boundary" \
+      'unsafe protected state metadata' "$unsafe_unlock_output"
+  fi
+  check_empty "unlock unsafe $unsafe_unlock_boundary performs no mutation" \
+    "$mutation_log"
+  check_count "unlock unsafe $unsafe_unlock_boundary runs no hooks" 0 \
+    '--phase ' "$(< "$hook_log")"
+  /bin/chmod -RN "$state_dir"
+  /bin/chmod 700 "$state_dir"
+  /bin/chmod 600 "$state_dir/passphrase.txt" \
+    "$state_dir/passphrase.sha256" "$state_dir/state.json"
+done
+
+for hostile_glob_state in normal noglob globignore; do
+  reset_unlock_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_ciphertext
+  printf '%s' "$unlock_test_passphrase" \
+    > "$state_dir/.unlock-recovery.crash-artifact"
+  case "$hostile_glob_state" in
+    normal)
+      crash_artifact_output=$(run_vaultlock unlock 2>&1) \
+        && crash_artifact_status=0 || crash_artifact_status=$?
+      ;;
+    noglob)
+      crash_artifact_output=$(VAULTLOCK_TEST_NOGLOB=1 \
+        run_vaultlock unlock 2>&1) \
+        && crash_artifact_status=0 || crash_artifact_status=$?
+      ;;
+    globignore)
+      crash_artifact_output=$(GLOBIGNORE='*' run_vaultlock unlock 2>&1) \
+        && crash_artifact_status=0 || crash_artifact_status=$?
+      ;;
+  esac
+  [[ "$crash_artifact_status" -ne 0 ]] \
+    || record_failure "unlock rejects $hostile_glob_state untracked staging artifact"
+  check_contains "unlock reports $hostile_glob_state untracked staging artifact" \
+    '.unlock-recovery.crash-artifact' "$crash_artifact_output"
+  check_empty "$hostile_glob_state untracked staging artifact stops before mutation" \
+    "$mutation_log"
+  /bin/rm -f "$state_dir/.unlock-recovery.crash-artifact"
+done
+
+for private_temp_kind in tle-unlock state-unlock; do
+  reset_unlock_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_ciphertext
+  private_temp_artifact="$state_dir/.${private_temp_kind}.crash-artifact"
+  printf 'untracked private temporary\n' > "$private_temp_artifact"
+  if private_temp_artifact_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "unlock rejects untracked $private_temp_kind artifact"
+  else
+    check_contains "unlock reports untracked $private_temp_kind artifact" \
+      ".${private_temp_kind}.crash-artifact" \
+      "$private_temp_artifact_output"
+  fi
+  check_empty "untracked $private_temp_kind stops before mutation" \
+    "$mutation_log"
+  /bin/rm -f "$private_temp_artifact"
+done
+
+for unsafe_keychain_token in user service; do
+  for unsafe_keychain_plan in recorded-unlocked recorded-locked; do
+    reset_unlock_fixture
+    if [[ "$unsafe_keychain_plan" == recorded-locked ]]; then
+      write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+      write_unlock_ciphertext
+    else
+      write_json_state false null null null UUID-123
+      write_unlock_plaintext
+    fi
+    write_apfs_state true false UUID-123 disk9s1
+    if [[ "$unsafe_keychain_token" == user ]]; then
+      if unsafe_keychain_output=$(USER='unsafe user' \
+          run_vaultlock unlock 2>&1); then
+        record_failure "$unsafe_keychain_plan unlock rejects unsafe USER"
+      fi
+    else
+      if unsafe_keychain_output=$(VAULTLOCK_VOLUME='unsafe volume' \
+          run_vaultlock unlock 2>&1); then
+        record_failure "$unsafe_keychain_plan unlock rejects unsafe service"
+      fi
+    fi
+    check_contains "$unsafe_keychain_plan reports unsafe $unsafe_keychain_token" \
+      'unsafe' "$unsafe_keychain_output"
+    check_empty "$unsafe_keychain_plan unsafe $unsafe_keychain_token performs no mutation" \
+      "$mutation_log"
+    check_count "$unsafe_keychain_plan unsafe $unsafe_keychain_token stops before TLE" \
+      0 'tle -d ' "$(< "$action_log")"
+    if [[ "$unsafe_keychain_plan" == recorded-locked \
+        && -e "$state_dir/passphrase.txt" ]]; then
+      record_failure "$unsafe_keychain_plan unsafe $unsafe_keychain_token restores no plaintext"
+    fi
+  done
+done
+
+reset_unlock_fixture
+write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_ciphertext
+/bin/mv "$fake_bin/security" "$fake_bin/security.saved"
+if missing_security_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "unlock keychain-update plan requires security before mutation"
+else
+  check_contains "unlock missing security reports preflight failure" \
+    'security is required' "$missing_security_output"
+fi
+/bin/mv "$fake_bin/security.saved" "$fake_bin/security"
+check_empty "unlock missing security performs no mutation" "$mutation_log"
+check_count "unlock missing security stops before TLE" 0 \
+  'tle -d ' "$(< "$action_log")"
+[[ ! -e "$state_dir/passphrase.txt" ]] \
+  || record_failure "unlock missing security restores no plaintext"
+
+for post_revalidation_drift in state recovery keychain staging; do
+  reset_unlock_fixture
+  write_json_state false null null null UUID-123
+  write_unlock_plaintext
+  write_matching_keychain
+  if [[ "$post_revalidation_drift" == keychain ]]; then
+    write_apfs_state false false UUID-123 disk9s1
+    printf 'unlock_keychain_change\n' \
+      > "$apfs_state/transition_unlock_before_execution"
+  else
+    write_apfs_state true false UUID-123 disk9s1
+    printf '%s' "$unlock_test_passphrase" \
+      > "$apfs_state/expected_unlock_passphrase"
+    case "$post_revalidation_drift" in
+      state) post_revalidation_action=unlock_state_future_replace ;;
+      recovery) post_revalidation_action=unlock_recovery_replace ;;
+      staging) post_revalidation_action=unlock_staging_artifact_create ;;
+    esac
+    printf '%s\n' "$post_revalidation_action" \
+      > "$apfs_state/transition_unlock_before_execution"
+  fi
+  if post_revalidation_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "unlock rejects post-revalidation $post_revalidation_drift drift"
+  else
+    if [[ "$post_revalidation_drift" == staging ]]; then
+      check_contains "unlock post-revalidation staging reports retained artifact" \
+        '.unlock-recovery.post-revalidation' "$post_revalidation_output"
+    else
+      check_contains "unlock post-revalidation $post_revalidation_drift reports drift" \
+        'unlock inputs changed after plan revalidation' \
+        "$post_revalidation_output"
+    fi
+  fi
+  check_count "unlock post-revalidation $post_revalidation_drift stops before APFS mutation" 0 \
+    'unlockVolume' "$(< "$mutation_log")"
+  check_count "unlock post-revalidation $post_revalidation_drift runs no hooks" 0 \
+    '--phase ' "$(< "$hook_log")"
+done
+/bin/rm -f "$state_dir/.unlock-recovery.post-revalidation"
+
+for immediate_apfs_drift in uuid device lock; do
+  reset_unlock_fixture
+  write_json_state false null null null UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_plaintext
+  printf '%s' "$unlock_test_passphrase" \
+    > "$apfs_state/expected_unlock_passphrase"
+  printf 'unlock_apfs_%s_swap\n' "$immediate_apfs_drift" \
+    > "$apfs_state/transition_unlock_before_apfs_unlock"
+  if immediate_apfs_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "unlock rejects immediate APFS $immediate_apfs_drift drift"
+  else
+    check_contains "unlock immediate APFS $immediate_apfs_drift reports drift" \
+      'expected APFS identity or lock state changed before unlock operation' \
+      "$immediate_apfs_output"
+  fi
+  check_count "unlock immediate APFS $immediate_apfs_drift stops before unlockVolume" 0 \
+    'unlockVolume' "$(< "$mutation_log")"
+  check_count "unlock immediate APFS $immediate_apfs_drift runs no hooks" 0 \
+    '--phase ' "$(< "$hook_log")"
+done
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_plaintext
+write_matching_keychain
+if unlock_dry_coordination_output=$(run_vaultlock unlock --dry-run 2>&1); then
+  unlock_dry_coordination_status=0
+else
+  unlock_dry_coordination_status=$?
+fi
+check "unlock dry-run coordination preview exits successfully" 0 \
+  "$unlock_dry_coordination_status"
+check_plan_coordination "unlock dry-run coordination preview" \
+  "$unlock_dry_coordination_output"
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "unlock dry-run creates no operation lock"
+[[ ! -e "$apfs_state/token_generated" ]] \
+  || record_failure "unlock dry-run generates no ownership token"
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_plaintext
+printf '%s' "$unlock_test_passphrase" \
+  > "$apfs_state/expected_unlock_passphrase"
+printf 'stale-keychain-value' > "$apfs_state/keychain_value"
+: > "$apfs_state/unlock_leaves_unmounted"
+: > "$apfs_state/verify_post_hook_target"
+/bin/mkdir -p "$state_dir/hooks/post-unlock.d"
+/bin/cp "$TEST_SELF" "$state_dir/hooks/post-unlock.d/20-post"
+/bin/chmod +x "$state_dir/hooks/post-unlock.d/20-post"
+if unlocked_drift_output=$(run_vaultlock unlock 2>&1); then
+  unlocked_drift_status=0
+else
+  unlocked_drift_status=$?
+fi
+check "recorded-unlocked APFS-locked repair exits successfully" 0 \
+  "$unlocked_drift_status"
+assert_unlock_usable "recorded-unlocked APFS-locked repair"
+[[ -f "$apfs_state/unlock_stdin_verified" ]] \
+  || record_failure "recorded-unlocked repair passes plaintext through stdin"
+check_count "recorded-unlocked repair performs no TLE recovery" 0 \
+  'tle -d ' "$(< "$action_log")"
+check_count "recorded-unlocked repair runs no pre-unlock hooks" 0 \
+  '--phase pre-unlock' "$(< "$hook_log")"
+check_contains "recorded-unlocked repair runs post-unlock hooks" \
+  '--phase post-unlock --scope global' "$(< "$hook_log")"
+[[ -f "$apfs_state/post_hook_saw_usable_target" ]] \
+  || record_failure "recorded-unlocked post hook sees complete usable target"
+check_count "recorded-unlocked repair explicitly mounts after APFS unlock" 1 \
+  'diskutil mount disk9s1' "$(< "$mutation_log")"
+check_contains "recorded-unlocked repair reports final success" \
+  "Result: unlocked and mounted at $mount_point" "$unlocked_drift_output"
+check_secret_absent "recorded-unlocked repair keeps secret out of output" \
+  "$unlocked_drift_output" "$unlock_test_passphrase"
+check_secret_absent "recorded-unlocked repair keeps secret out of actions" \
+  "$(< "$action_log")" "$unlock_test_passphrase"
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_plaintext
+write_matching_keychain
+if usable_noop_output=$(run_vaultlock unlock 2>&1); then
+  usable_noop_status=0
+else
+  usable_noop_status=$?
+fi
+check "usable unlock no-op exits successfully" 0 "$usable_noop_status"
+assert_unlock_usable "usable unlock no-op"
+check_empty "usable unlock no-op performs no domain mutation" "$mutation_log"
+check_count "usable unlock no-op runs no hooks" 0 \
+  '--phase ' "$(< "$hook_log")"
+check_plan_coordination "usable unlock no-op" "$usable_noop_output"
+check_contains "usable unlock no-op verifies keychain read-only" \
+  'security find-generic-password' "$(< "$action_log")"
+check_count "usable unlock no-op never writes keychain" 0 \
+  'security -i' "$(< "$action_log")"
+
+for keychain_failure_case in absent unreadable; do
+  reset_unlock_fixture
+  write_json_state false null null null UUID-123
+  write_apfs_state false true UUID-123 disk9s1
+  write_unlock_plaintext
+  if [[ "$keychain_failure_case" == unreadable ]]; then
+    write_matching_keychain
+    : > "$apfs_state/fail_keychain_read"
+  fi
+  if keychain_failure_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "usable unlock rejects $keychain_failure_case keychain plaintext"
+  else
+    check_contains "usable unlock reports $keychain_failure_case keychain plaintext" \
+      'cannot verify matching keychain recovery material' \
+      "$keychain_failure_output"
+  fi
+  check_empty "usable unlock $keychain_failure_case keychain performs no mutation" \
+    "$mutation_log"
+done
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_plaintext
+printf 'wrong-keychain-value' > "$apfs_state/keychain_value"
+if keychain_mismatch_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "usable unlock rejects mismatched keychain plaintext"
+else
+  check_contains "usable unlock reports mismatched keychain plaintext" \
+    'keychain recovery material does not match local plaintext' \
+    "$keychain_mismatch_output"
+fi
+check_empty "keychain mismatch causes no domain mutation" "$mutation_log"
+check_count "keychain mismatch reports no false success" 0 \
+  'Result: unlocked and mounted' "$keychain_mismatch_output"
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false false UUID-123 disk9s1
+write_unlock_plaintext
+write_matching_keychain
+if unmounted_repair_output=$(run_vaultlock unlock 2>&1); then
+  unmounted_repair_status=0
+else
+  unmounted_repair_status=$?
+fi
+check "recorded-unlocked unmounted repair exits successfully" 0 \
+  "$unmounted_repair_status"
+check_contains "recorded-unlocked unmounted repair reports success" \
+  'Result: unlocked and mounted' "$unmounted_repair_output"
+assert_unlock_usable "recorded-unlocked unmounted repair"
+check_count "unmounted repair mounts exactly once" 1 \
+  'diskutil mount disk9s1' "$(< "$mutation_log")"
+check_count "unmounted repair does not APFS-unlock" 0 \
+  'unlockVolume' "$(< "$mutation_log")"
+check_count "unmounted repair runs no hooks" 0 \
+  '--phase ' "$(< "$hook_log")"
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state true false UUID-123 disk9s1
+printf '%s\n' "$unlock_test_hash" > "$state_dir/passphrase.sha256"
+if missing_plaintext_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "recorded-unlocked repair rejects missing plaintext"
+else
+  check_contains "missing plaintext reports exact invariant" \
+    'plaintext recovery file is missing' "$missing_plaintext_output"
+fi
+check_empty "missing plaintext performs no domain mutation" "$mutation_log"
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state true false UUID-123 disk9s1
+printf '%s' "$unlock_test_passphrase" > "$state_dir/passphrase.txt"
+printf '%064d\n' 0 > "$state_dir/passphrase.sha256"
+printf '%s' "$unlock_test_passphrase" \
+  > "$apfs_state/expected_unlock_passphrase"
+if plaintext_mismatch_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "recorded-unlocked repair rejects plaintext hash mismatch"
+else
+  check_contains "plaintext hash mismatch reports exact invariant" \
+    'plaintext recovery material fails sha256 verification' \
+    "$plaintext_mismatch_output"
+fi
+check_count "plaintext hash mismatch stops before APFS unlock" 0 \
+  'unlockVolume' "$(< "$mutation_log")"
+check_count "plaintext hash mismatch reports no false success" 0 \
+  'Result: unlocked and mounted' "$plaintext_mismatch_output"
+
+reset_unlock_fixture
+write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_ciphertext
+printf '%s' "$unlock_test_passphrase" \
+  > "$apfs_state/expected_unlock_passphrase"
+: > "$apfs_state/unlock_leaves_unmounted"
+: > "$apfs_state/verify_post_hook_target"
+mkdir -p "$state_dir/hooks/pre-unlock.d" \
+  "$state_dir/hooks/post-unlock.d" \
+  "$mount_point/.vaultlock/hooks/post-unlock.d"
+for unlock_hook in \
+    "$state_dir/hooks/pre-unlock.d/10-pre" \
+    "$mount_point/.vaultlock/hooks/post-unlock.d/20-vault-post" \
+    "$state_dir/hooks/post-unlock.d/30-global-post"; do
+  /bin/cp "$TEST_SELF" "$unlock_hook"
+  /bin/chmod +x "$unlock_hook"
+done
+if locked_success_output=$(run_vaultlock unlock 2>&1); then
+  locked_success_status=0
+else
+  locked_success_status=$?
+fi
+check "recorded-locked recovery exits successfully" 0 \
+  "$locked_success_status"
+assert_unlock_usable "recorded-locked recovery"
+check_contains "recorded-locked recovery runs pre hook" \
+  '--phase pre-unlock --scope global' "$(< "$hook_log")"
+check_contains "recorded-locked recovery runs vault post hook" \
+  '--phase post-unlock --scope vault' "$(< "$hook_log")"
+check_contains "recorded-locked recovery runs global post hook" \
+  '--phase post-unlock --scope global' "$(< "$hook_log")"
+[[ -f "$apfs_state/unlock_stdin_verified" ]] \
+  || record_failure "recorded-locked recovery passes plaintext through stdin"
+[[ -f "$apfs_state/post_hook_saw_usable_target" ]] \
+  || record_failure "recorded-locked post hooks see complete usable target"
+check_count "recorded-locked recovery decrypts exactly once" 1 \
+  'tle -d ' "$(< "$action_log")"
+check_action_order "recorded-locked pre hook precedes TLE recovery" \
+  '10-pre ' 'tle -d '
+check_action_order "recorded-locked TLE precedes APFS unlock" \
+  'tle -d ' 'diskutil apfs unlockVolume disk9s1 -stdinpassphrase'
+check_action_order "recorded-locked APFS unlock precedes explicit mount" \
+  'diskutil apfs unlockVolume disk9s1 -stdinpassphrase' \
+  'diskutil mount disk9s1'
+check_action_order "recorded-locked keychain restore precedes vault post hook" \
+  'security -i' '20-vault-post '
+check_action_order "recorded-locked vault post precedes global post hook" \
+  '20-vault-post ' '30-global-post '
+check_secret_absent "recorded-locked recovery keeps secret out of output" \
+  "$locked_success_output" "$unlock_test_passphrase"
+check_secret_absent "recorded-locked recovery keeps secret out of actions" \
+  "$(< "$action_log")" "$unlock_test_passphrase"
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_plaintext
+write_matching_keychain
+printf '%s' "$unlock_test_passphrase" \
+  > "$apfs_state/expected_child_unlock_secret"
+(
+  export VAULTLOCK_TEST_RENAMED_SECRET_CARRIER="prefix${unlock_test_passphrase}suffix"
+  run_vaultlock unlock --dry-run >/dev/null 2>&1
+)
+[[ -e "$apfs_state/unlock_secret_in_child_environment" ]] \
+  || record_failure "secret detector finds renamed exported values containing secret"
+
+reset_unlock_fixture
+write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_ciphertext
+printf '%s' "$unlock_test_passphrase" \
+  > "$apfs_state/expected_unlock_passphrase"
+printf '%s' "$unlock_test_passphrase" \
+  > "$apfs_state/expected_child_unlock_secret"
+if imported_unlock_output=$(run_vaultlock_with_imported_secret_names \
+    unlock 2>&1); then
+  imported_unlock_status=0
+else
+  imported_unlock_status=$?
+fi
+check "unlock clears imported secret export attributes under allexport" 0 \
+  "$imported_unlock_status"
+check_contains "unlock imported-secret run reports success" \
+  'Result: unlocked and mounted' "$imported_unlock_output"
+[[ ! -e "$apfs_state/unlock_secret_in_child_environment" ]] \
+  || record_failure "unlock recovery secret reaches child environment"
+[[ -e "$apfs_state/unlock_secret_environment_probe_ran" ]] \
+  || record_failure "unlock secret environment probe did not run after recovery"
+
+reset_unlock_fixture
+write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_ciphertext
+printf 'unlock_plaintext_stage_fail\n' \
+  > "$apfs_state/transition_unlock_plaintext_staged"
+if staging_failure_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "plaintext staging transition failure exits nonzero"
+else
+  check_contains "plaintext staging transition failure reports interruption" \
+    'plaintext recovery installation failed' "$staging_failure_output"
+fi
+check_no_unlock_staging_artifacts "plaintext staging transition failure"
+check "plaintext staging transition failure leaves JSON locked" true \
+  "$(jq -r .locked "$state_dir/state.json")"
+check_count "plaintext staging transition failure reports no success" 0 \
+  'Result: unlocked and mounted' "$staging_failure_output"
+
+for staging_signal_case in HUP:129 INT:130 TERM:143; do
+  reset_unlock_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_ciphertext
+  staging_signal=${staging_signal_case%%:*}
+  staging_signal_status=${staging_signal_case##*:}
+  printf 'signal_%s\n' "$staging_signal" \
+    > "$apfs_state/transition_unlock_plaintext_staged"
+  if staging_signal_output=$(run_vaultlock unlock 2>&1); then
+    staging_signal_actual=0
+  else
+    staging_signal_actual=$?
+  fi
+  check "plaintext staging $staging_signal preserves signal status" \
+    "$staging_signal_status" "$staging_signal_actual"
+  check_no_unlock_staging_artifacts "plaintext staging $staging_signal"
+  check "plaintext staging $staging_signal leaves retryable plaintext" \
+    "$unlock_test_passphrase" "$(< "$state_dir/passphrase.txt")"
+  check "plaintext staging $staging_signal leaves JSON locked" true \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check_count "plaintext staging $staging_signal reports no success" 0 \
+    'Result: unlocked and mounted' "$staging_signal_output"
+done
+
+reset_unlock_fixture
+write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_ciphertext
+printf 'unlock_plaintext_stage_fail\n' \
+  > "$apfs_state/transition_unlock_plaintext_staged"
+: > "$apfs_state/fail_unlock_staging_cleanup"
+if retained_staging_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "failed plaintext staging cleanup exits nonzero"
+else
+  check_contains "failed plaintext staging cleanup reports retained path" \
+    'plaintext recovery staging file retained at' "$retained_staging_output"
+fi
+retained_staging_artifact=
+for staging_artifact in "$state_dir"/.unlock-recovery.*; do
+  if [[ -e "$staging_artifact" || -L "$staging_artifact" ]]; then
+    retained_staging_artifact=$staging_artifact
+  fi
+done
+[[ -n "$retained_staging_artifact" ]] \
+  || record_failure "failed plaintext staging cleanup retains reported artifact"
+/bin/rm -f "$apfs_state/fail_unlock_staging_cleanup"
+if [[ -n "$retained_staging_artifact" ]]; then
+  /bin/rm -f "$retained_staging_artifact"
+fi
+
+for private_temp_case in tle-error:unlock_tle_error_staged:unlock_tle_error_stage_fail \
+    state:unlock_state_staged:unlock_state_stage_fail; do
+  private_temp_name=${private_temp_case%%:*}
+  private_temp_remainder=${private_temp_case#*:}
+  private_temp_transition=${private_temp_remainder%%:*}
+  private_temp_failure=${private_temp_case##*:}
+  reset_unlock_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_ciphertext
+  printf '%s\n' "$private_temp_failure" \
+    > "$apfs_state/transition_$private_temp_transition"
+  if private_temp_failure_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "$private_temp_name staging transition failure exits nonzero"
+  fi
+  check_no_unlock_staging_artifacts \
+    "$private_temp_name staging transition failure"
+  check_count "$private_temp_name staging failure reports no success" 0 \
+    'Result: unlocked and mounted' "$private_temp_failure_output"
+done
+
+for private_temp_signal_case in \
+    tle-error:unlock_tle_error_staged:HUP:129 \
+    tle-error:unlock_tle_error_staged:INT:130 \
+    tle-error:unlock_tle_error_staged:TERM:143 \
+    state:unlock_state_staged:HUP:129 \
+    state:unlock_state_staged:INT:130 \
+    state:unlock_state_staged:TERM:143; do
+  private_temp_name=${private_temp_signal_case%%:*}
+  private_temp_remainder=${private_temp_signal_case#*:}
+  private_temp_transition=${private_temp_remainder%%:*}
+  private_temp_remainder=${private_temp_remainder#*:}
+  private_temp_signal=${private_temp_remainder%%:*}
+  private_temp_signal_status=${private_temp_signal_case##*:}
+  reset_unlock_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_ciphertext
+  printf 'signal_%s\n' "$private_temp_signal" \
+    > "$apfs_state/transition_$private_temp_transition"
+  if private_temp_signal_output=$(run_vaultlock unlock 2>&1); then
+    private_temp_signal_actual=0
+  else
+    private_temp_signal_actual=$?
+  fi
+  check "$private_temp_name staging $private_temp_signal preserves signal status" \
+    "$private_temp_signal_status" "$private_temp_signal_actual"
+  check_no_unlock_staging_artifacts \
+    "$private_temp_name staging $private_temp_signal"
+  check_count "$private_temp_name staging $private_temp_signal reports no success" \
+    0 'Result: unlocked and mounted' "$private_temp_signal_output"
+done
+
+for retained_private_temp_case in \
+    tle-error:unlock_tle_error_staged:unlock_tle_error_stage_fail:.tle-unlock. \
+    state:unlock_state_staged:unlock_state_stage_fail:.state-unlock.; do
+  retained_private_temp_name=${retained_private_temp_case%%:*}
+  retained_private_temp_remainder=${retained_private_temp_case#*:}
+  retained_private_temp_transition=${retained_private_temp_remainder%%:*}
+  retained_private_temp_remainder=${retained_private_temp_remainder#*:}
+  retained_private_temp_failure=${retained_private_temp_remainder%%:*}
+  retained_private_temp_prefix=${retained_private_temp_case##*:}
+  reset_unlock_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_ciphertext
+  printf '%s\n' "$retained_private_temp_failure" \
+    > "$apfs_state/transition_$retained_private_temp_transition"
+  printf '%s\n' "$retained_private_temp_prefix" \
+    > "$apfs_state/fail_unlock_private_temp_cleanup"
+  if retained_private_temp_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "$retained_private_temp_name cleanup failure exits nonzero"
+  else
+    check_contains "$retained_private_temp_name cleanup reports retained path" \
+      "$retained_private_temp_prefix" "$retained_private_temp_output"
+  fi
+  retained_private_temp_artifact=$(/usr/bin/find -P "$state_dir" \
+    -mindepth 1 -maxdepth 1 -name "${retained_private_temp_prefix}*" \
+    -print -quit)
+  [[ -n "$retained_private_temp_artifact" ]] \
+    || record_failure "$retained_private_temp_name cleanup retains reported artifact"
+  /bin/rm -f "$apfs_state/fail_unlock_private_temp_cleanup"
+  if [[ -n "$retained_private_temp_artifact" ]]; then
+    /bin/rm -f "$retained_private_temp_artifact"
+  fi
+done
+
+for identity_failure_case in \
+    tle-error:.tle-unlock.:.tle-unlock. \
+    plaintext:.unlock-recovery.:.unlock-recovery. \
+    state:.state-unlock.:.state-unlock.; do
+  identity_failure_name=${identity_failure_case%%:*}
+  identity_failure_remainder=${identity_failure_case#*:}
+  identity_failure_prefix=${identity_failure_remainder%%:*}
+  identity_failure_expected=${identity_failure_case##*:}
+  reset_unlock_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_ciphertext
+  printf '%s\n' "$identity_failure_prefix" \
+    > "$apfs_state/fail_unlock_temp_identity_once"
+  if identity_failure_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "$identity_failure_name identity failure exits nonzero"
+  else
+    check_contains "$identity_failure_name identity failure reports retained path" \
+      "$identity_failure_expected" "$identity_failure_output"
+  fi
+  identity_failure_artifact=$(/usr/bin/find -P "$state_dir" \
+    -mindepth 1 -maxdepth 1 -name "${identity_failure_prefix}*" \
+    -print -quit)
+  [[ -n "$identity_failure_artifact" ]] \
+    || record_failure "$identity_failure_name identity failure retains unverified path"
+  check_count "$identity_failure_name identity failure reports no success" 0 \
+    'Result: unlocked and mounted' "$identity_failure_output"
+  if [[ -n "$identity_failure_artifact" ]]; then
+    /bin/rm -f "$identity_failure_artifact"
+  fi
+done
+
+for partial_unlock_failure in keychain state-install; do
+  reset_unlock_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_ciphertext
+  printf '%s' "$unlock_test_passphrase" \
+    > "$apfs_state/expected_unlock_passphrase"
+  if [[ "$partial_unlock_failure" == keychain ]]; then
+    : > "$apfs_state/fail_keychain"
+  else
+    : > "$apfs_state/fail_unlock_state_install"
+  fi
+  if partial_unlock_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "recorded-locked $partial_unlock_failure failure exits nonzero"
+  else
+    check_contains "recorded-locked $partial_unlock_failure reports failure" \
+      'vaultlock:' "$partial_unlock_output"
+  fi
+  check "recorded-locked $partial_unlock_failure leaves JSON locked" true \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check "recorded-locked $partial_unlock_failure leaves APFS unlocked" false \
+    "$(< "$apfs_state/locked")"
+  check "recorded-locked $partial_unlock_failure retains verified plaintext" \
+    "$unlock_test_passphrase" "$(< "$state_dir/passphrase.txt")"
+  /bin/rm -f "$apfs_state/fail_keychain" \
+    "$apfs_state/fail_unlock_state_install"
+  : > "$action_log"
+  : > "$mutation_log"
+  : > "$hook_log"
+  if partial_retry_output=$(run_vaultlock unlock 2>&1); then
+    partial_retry_status=0
+  else
+    partial_retry_status=$?
+  fi
+  check "recorded-locked $partial_unlock_failure retry converges" 0 \
+    "$partial_retry_status"
+  check_contains "recorded-locked $partial_unlock_failure retry reports success" \
+    'Result: unlocked and mounted' "$partial_retry_output"
+  assert_unlock_usable "recorded-locked $partial_unlock_failure retry"
+done
+
+for partial_unlock_signal_case in HUP:129 INT:130 TERM:143; do
+  reset_unlock_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_ciphertext
+  printf '%s' "$unlock_test_passphrase" \
+    > "$apfs_state/expected_unlock_passphrase"
+  partial_unlock_signal=${partial_unlock_signal_case%%:*}
+  partial_unlock_signal_status=${partial_unlock_signal_case##*:}
+  printf 'signal_%s\n' "$partial_unlock_signal" \
+    > "$apfs_state/transition_unlock_after_plaintext_restored"
+  if partial_signal_output=$(run_vaultlock unlock 2>&1); then
+    partial_signal_actual=0
+  else
+    partial_signal_actual=$?
+  fi
+  check "unlock post-plaintext $partial_unlock_signal preserves status" \
+    "$partial_unlock_signal_status" "$partial_signal_actual"
+  check "unlock post-plaintext $partial_unlock_signal leaves JSON locked" true \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check "unlock post-plaintext $partial_unlock_signal retains plaintext" \
+    "$unlock_test_passphrase" "$(< "$state_dir/passphrase.txt")"
+  check_count "unlock post-plaintext $partial_unlock_signal has no success" 0 \
+    'Result: unlocked and mounted' "$partial_signal_output"
+  if partial_signal_retry_output=$(run_vaultlock unlock 2>&1); then
+    partial_signal_retry_status=0
+  else
+    partial_signal_retry_status=$?
+  fi
+  check "unlock post-plaintext $partial_unlock_signal retry converges" 0 \
+    "$partial_signal_retry_status"
+  : "$partial_signal_retry_output"
+  assert_unlock_usable "unlock post-plaintext $partial_unlock_signal retry"
+done
+
+reset_unlock_fixture
+write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_ciphertext
+/bin/mkdir -p "$state_dir/hooks/pre-unlock.d"
+/bin/cp "$TEST_SELF" "$state_dir/hooks/pre-unlock.d/10-pre-fail"
+/bin/chmod +x "$state_dir/hooks/pre-unlock.d/10-pre-fail"
+printf '10-pre-fail\n' > "$apfs_state/fail_hook_name"
+if pre_hook_failure_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "pre-unlock hook failure exits nonzero"
+else
+  check_contains "pre-unlock hook failure reports locked vault" \
+    'pre-unlock hooks failed, vault remains locked' "$pre_hook_failure_output"
+fi
+check_count "pre-unlock hook failure stops before TLE" 0 \
+  'tle -d ' "$(< "$action_log")"
+check_count "pre-unlock hook failure stops before APFS unlock" 0 \
+  'unlockVolume' "$(< "$mutation_log")"
+check "pre-unlock hook failure preserves JSON locked" true \
+  "$(jq -r .locked "$state_dir/state.json")"
+
+reset_unlock_fixture
+write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_ciphertext
+printf '%s' "$unlock_test_passphrase" \
+  > "$apfs_state/expected_unlock_passphrase"
+: > "$apfs_state/verify_post_hook_target"
+/bin/mkdir -p "$mount_point/.vaultlock/hooks/post-unlock.d" \
+  "$state_dir/hooks/post-unlock.d"
+/bin/cp "$TEST_SELF" \
+  "$mount_point/.vaultlock/hooks/post-unlock.d/20-post-fail"
+/bin/cp "$TEST_SELF" "$state_dir/hooks/post-unlock.d/30-post-continue"
+/bin/chmod +x \
+  "$mount_point/.vaultlock/hooks/post-unlock.d/20-post-fail" \
+  "$state_dir/hooks/post-unlock.d/30-post-continue"
+printf '20-post-fail\n' > "$apfs_state/fail_hook_name"
+if post_hook_failure_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "post-unlock hook failure exits nonzero"
+else
+  check_contains "post-unlock hook failure reports usable target" \
+    'vault is unlocked and mounted' "$post_hook_failure_output"
+fi
+assert_unlock_usable "post-unlock hook failure"
+check_contains "post-unlock failure continues global hooks" \
+  '30-post-continue' "$(< "$hook_log")"
+[[ -f "$apfs_state/post_hook_saw_usable_target" ]] \
+  || record_failure "post-unlock failure hook sees usable target"
+check_count "post-unlock failure reports no false success" 0 \
+  'Result: unlocked and mounted' "$post_hook_failure_output"
+
+for post_metadata_tamper in mode acl; do
+  reset_unlock_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_ciphertext
+  /bin/mkdir -p "$state_dir/hooks/post-unlock.d"
+  /bin/cp "$TEST_SELF" \
+    "$state_dir/hooks/post-unlock.d/20-post-metadata-tamper"
+  /bin/cp "$TEST_SELF" \
+    "$state_dir/hooks/post-unlock.d/30-post-must-not-run"
+  /bin/chmod +x "$state_dir/hooks/post-unlock.d/20-post-metadata-tamper" \
+    "$state_dir/hooks/post-unlock.d/30-post-must-not-run"
+  printf '%s\n' "$post_metadata_tamper" \
+    > "$apfs_state/tamper_plaintext_mode_in_post_hook"
+  if metadata_tamper_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "post-unlock $post_metadata_tamper tamper prevents success"
+  else
+    check_contains "post-unlock $post_metadata_tamper tamper reports unsafe target" \
+      'unsafe protected state metadata' "$metadata_tamper_output"
+  fi
+  check_count "post-unlock $post_metadata_tamper tamper stops later hooks" 0 \
+    '30-post-must-not-run --phase' "$(< "$hook_log")"
+  check_count "post-unlock $post_metadata_tamper tamper reports no false success" 0 \
+    'Result: unlocked and mounted' "$metadata_tamper_output"
+  /bin/chmod -RN "$state_dir/passphrase.txt"
+  /bin/chmod 600 "$state_dir/passphrase.txt"
+done
+
+reset_unlock_fixture
+write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_ciphertext
+/bin/mkdir -p "$mount_point/.vaultlock/hooks/post-unlock.d"
+/bin/cp "$TEST_SELF" \
+  "$mount_point/.vaultlock/hooks/post-unlock.d/20-deferred-identity-swap"
+/bin/cp "$TEST_SELF" \
+  "$mount_point/.vaultlock/hooks/post-unlock.d/30-deferred-must-not-run"
+/bin/chmod +x \
+  "$mount_point/.vaultlock/hooks/post-unlock.d/20-deferred-identity-swap" \
+  "$mount_point/.vaultlock/hooks/post-unlock.d/30-deferred-must-not-run"
+: > "$apfs_state/tamper_mount_identity_in_post_hook"
+if deferred_identity_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "deferred post hook mount-identity drift prevents success"
+else
+  check_contains "deferred post hook mount-identity drift reports target failure" \
+    'unlock target is not recorded unlocked, mounted, and identity-verified' \
+    "$deferred_identity_output"
+fi
+check_count "deferred post hook identity drift stops the next hook" 0 \
+  '30-deferred-must-not-run --phase' "$(< "$hook_log")"
+check_count "deferred post hook identity drift reports no false success" 0 \
+  'Result: unlocked and mounted' "$deferred_identity_output"
+
+reset_unlock_fixture
+write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_ciphertext
+: > "$apfs_state/tle_early"
+if early_unlock_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "recorded-locked early TLE recovery fails"
+else
+  check_contains "early TLE recovery reports the active lock" \
+    'still locked until 2099-01-02T03:04:00+0100' "$early_unlock_output"
+fi
+check "early TLE recovery preserves JSON locked" true \
+  "$(jq -r .locked "$state_dir/state.json")"
+check "early TLE recovery preserves APFS locked" true \
+  "$(< "$apfs_state/locked")"
+check_count "early TLE recovery stops before APFS unlock" 0 \
+  'unlockVolume' "$(< "$mutation_log")"
+check_count "early TLE recovery reports no false success" 0 \
+  'Result: unlocked and mounted' "$early_unlock_output"
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "early TLE recovery releases operation lock"
+
+reset_unlock_fixture
+write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_ciphertext
+printf 'RGlmZmVyZW50UmVjb3Zlcnk=' > "$apfs_state/tle_plaintext"
+if tle_hash_mismatch_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "TLE recovery rejects decrypted hash mismatch"
+else
+  check_contains "TLE hash mismatch reports exact invariant" \
+    'decrypted recovery material fails sha256 verification' \
+    "$tle_hash_mismatch_output"
+fi
+check_count "TLE hash mismatch stops before APFS unlock" 0 \
+  'unlockVolume' "$(< "$mutation_log")"
+check "TLE hash mismatch preserves JSON locked" true \
+  "$(jq -r .locked "$state_dir/state.json")"
+
+reset_unlock_fixture
+write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_ciphertext
+if unexpected_early_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "recorded-locked unexpected APFS unlock before deadline fails"
+else
+  check_contains "unexpected early APFS unlock reports security violation" \
+    'APFS volume is unexpectedly unlocked before the recorded deadline' \
+    "$unexpected_early_output"
+fi
+check "unexpected early APFS unlock preserves JSON locked" true \
+  "$(jq -r .locked "$state_dir/state.json")"
+check_empty "unexpected early APFS unlock performs no domain mutation" \
+  "$mutation_log"
+
+reset_unlock_fixture
+write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+write_apfs_state false false UUID-123 disk9s1
+write_unlock_ciphertext
+if unexpected_late_output=$(run_vaultlock unlock 2>&1); then
+  unexpected_late_status=0
+else
+  unexpected_late_status=$?
+fi
+check "unexpected unlocked APFS resumes after deadline" 0 \
+  "$unexpected_late_status"
+check_contains "unexpected unlocked APFS recovery reports success" \
+  'Result: unlocked and mounted' "$unexpected_late_output"
+assert_unlock_usable "unexpected unlocked APFS recovery"
+check_count "unexpected unlocked APFS recovery skips APFS unlock" 0 \
+  'unlockVolume' "$(< "$mutation_log")"
+check_count "unexpected unlocked APFS recovery mounts exactly once" 1 \
+  'diskutil mount disk9s1' "$(< "$mutation_log")"
+check_count "unexpected unlocked APFS recovery performs TLE recovery" 1 \
+  'tle -d ' "$(< "$action_log")"
+check_count "unexpected unlocked APFS recovery runs no post hooks" 0 \
+  '--phase post-unlock' "$(< "$hook_log")"
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_plaintext
+printf '%s' "$unlock_test_passphrase" \
+  > "$apfs_state/expected_unlock_passphrase"
+: > "$apfs_state/fail_keychain"
+/bin/mkdir -p "$state_dir/hooks/post-unlock.d"
+/bin/cp "$TEST_SELF" "$state_dir/hooks/post-unlock.d/keychain-post"
+/bin/chmod +x "$state_dir/hooks/post-unlock.d/keychain-post"
+if unlock_keychain_write_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "unlock keychain restore failure exits nonzero"
+else
+  check_contains "unlock keychain restore failure reports incomplete target" \
+    'keychain recovery update failed' "$unlock_keychain_write_output"
+fi
+check_count "unlock keychain failure runs no post hooks" 0 \
+  '--phase post-unlock' "$(< "$hook_log")"
+check_count "unlock keychain failure reports no false success" 0 \
+  'Result: unlocked and mounted' "$unlock_keychain_write_output"
+
+for identity_swap_kind in uuid device; do
+  reset_unlock_fixture
+  write_json_state false null null null UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  write_unlock_plaintext
+  printf '%s' "$unlock_test_passphrase" \
+    > "$apfs_state/expected_unlock_passphrase"
+  : > "$apfs_state/swap_${identity_swap_kind}_after_unlock"
+  /bin/mkdir -p "$state_dir/hooks/post-unlock.d"
+  /bin/cp "$TEST_SELF" "$state_dir/hooks/post-unlock.d/identity-post"
+  /bin/chmod +x "$state_dir/hooks/post-unlock.d/identity-post"
+  if identity_swap_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "unlock rejects mounted $identity_swap_kind swap"
+  else
+    check_contains "unlock mounted $identity_swap_kind swap reports mismatch" \
+      'expected unlocked APFS volume changed before mount' \
+      "$identity_swap_output"
+  fi
+  check_count "unlock $identity_swap_kind swap reports no false success" 0 \
+    'Result: unlocked and mounted' "$identity_swap_output"
+  check_count "unlock $identity_swap_kind swap runs no hooks" 0 \
+    '--phase ' "$(< "$hook_log")"
+  [[ ! -e "$operation_lock_dir" ]] \
+    || record_failure "unlock $identity_swap_kind swap releases operation lock"
+done
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_plaintext
+write_matching_keychain
+create_operation_lock "$$" "$fake_process_start" adopt \
+  "$fake_operation_token"
+if unlock_live_lock_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "unlock refuses live cooperative operation lock"
+else
+  check_contains "unlock live lock reports owner" \
+    'operation lock is held by live pid' "$unlock_live_lock_output"
+fi
+check_empty "unlock live lock stops before domain mutation" "$mutation_log"
+clear_operation_locks
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_plaintext
+write_matching_keychain
+create_operation_lock "$$" "$fake_process_start" lock \
+  "$fake_operation_token"
+: > "$apfs_state/ps_ambiguous"
+if unlock_ambiguous_lock_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "unlock rejects ambiguous operation lock owner"
+else
+  check_contains "unlock ambiguous lock fails closed" \
+    'cannot safely classify operation lock owner' \
+    "$unlock_ambiguous_lock_output"
+fi
+check_empty "unlock ambiguous lock stops before domain mutation" "$mutation_log"
+clear_operation_locks
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_plaintext
+write_matching_keychain
+create_operation_lock 999999 "$fake_process_start" lock \
+  "$fake_operation_token"
+printf 'owner_identity_swap\n' \
+  > "$apfs_state/transition_operation_lock_final_check"
+if unlock_owner_swap_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "unlock rejects operation lock owner identity swap"
+else
+  check_contains "unlock operation lock owner swap fails closed" \
+    'operation lock changed during final verification' \
+    "$unlock_owner_swap_output"
+fi
+check_empty "unlock operation lock owner swap stops before mutation" \
+  "$mutation_log"
+clear_operation_locks
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_plaintext
+write_matching_keychain
+create_operation_lock 999999 "$fake_process_start" lock \
+  "$fake_operation_token"
+if unlock_stale_lock_output=$(run_vaultlock unlock 2>&1); then
+  unlock_stale_lock_status=0
+else
+  unlock_stale_lock_status=$?
+fi
+check "unlock replaces verified stale operation lock" 0 \
+  "$unlock_stale_lock_status"
+check_contains "unlock reports stale lock quarantine" \
+  'Retained stale operation lock quarantine:' "$unlock_stale_lock_output"
+check "unlock retains one stale lock quarantine" 1 \
+  "$(/usr/bin/find "$test_home" -maxdepth 1 -type d \
+    -name '.vaultlock-operation.lock.quarantine.*' | /usr/bin/wc -l \
+    | /usr/bin/tr -d '[:space:]')"
+clear_operation_locks
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state true false UUID-123 disk9s1
+write_unlock_plaintext
+printf '%s' "$unlock_test_passphrase" \
+  > "$apfs_state/expected_unlock_passphrase"
+printf 'unlock_apfs_state_swap\n' \
+  > "$apfs_state/transition_plan_revalidation_before_inspection"
+if unlock_drift_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "unlock rejects post-acquisition plan drift"
+else
+  check_contains "unlock plan drift reports rerun boundary" \
+    'plan changed after operation lock acquisition' "$unlock_drift_output"
+fi
+check_count "unlock plan drift stops before APFS mutation" 0 \
+  'unlockVolume' "$(< "$mutation_log")"
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "unlock plan drift releases operation lock"
+
+for unlock_typed_drift_case in \
+    recovery state-inode hook-record deadline-round device; do
+  reset_unlock_fixture
+  if [[ "$unlock_typed_drift_case" == deadline-round ]]; then
+    write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+    write_apfs_state true false UUID-123 disk9s1
+    write_unlock_ciphertext
+    printf 'unlock_deadline_round_change\n' \
+      > "$apfs_state/transition_plan_revalidation_before_inspection"
+  elif [[ "$unlock_typed_drift_case" == state-inode ]]; then
+    write_json_state false null null null UUID-123
+    write_apfs_state false true UUID-123 disk9s1
+    write_unlock_plaintext
+    write_matching_keychain
+    printf 'state_equivalent_inode_swap\n' \
+      > "$apfs_state/transition_plan_revalidation_before_inspection"
+  else
+    write_json_state false null null null UUID-123
+    write_apfs_state true false UUID-123 disk9s1
+    write_unlock_plaintext
+    printf '%s' "$unlock_test_passphrase" \
+      > "$apfs_state/expected_unlock_passphrase"
+    if [[ "$unlock_typed_drift_case" == recovery ]]; then
+      printf 'unlock_recovery_replace\n' \
+        > "$apfs_state/transition_plan_revalidation_before_inspection"
+    elif [[ "$unlock_typed_drift_case" == device ]]; then
+      printf 'unlock_device_revalidation_swap\n' \
+        > "$apfs_state/transition_plan_revalidation_before_inspection"
+    else
+      printf 'unlock_hook_create\n' \
+        > "$apfs_state/transition_plan_revalidation_before_inspection"
+    fi
+  fi
+  if unlock_typed_drift_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "unlock rejects $unlock_typed_drift_case typed plan drift"
+  else
+    check_contains "unlock $unlock_typed_drift_case drift reports rerun boundary" \
+      'plan changed after operation lock acquisition' \
+      "$unlock_typed_drift_output"
+  fi
+  check_count "unlock $unlock_typed_drift_case drift stops before APFS mutation" 0 \
+    'unlockVolume' "$(< "$mutation_log")"
+  check_count "unlock $unlock_typed_drift_case drift runs no hooks" 0 \
+    '--phase ' "$(< "$hook_log")"
+  [[ ! -e "$operation_lock_dir" ]] \
+    || record_failure "unlock $unlock_typed_drift_case drift releases operation lock"
+done
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_plaintext
+write_matching_keychain
+: > "$apfs_state/fail_operation_lock_release"
+if unlock_release_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "unlock release failure exits nonzero"
+else
+  check_contains "unlock release failure reports retained lock" \
+    'operation lock retained' "$unlock_release_output"
+fi
+check_count "unlock release failure reports no final success" 0 \
+  'Result: unlocked and mounted' "$unlock_release_output"
+/bin/rm -f "$apfs_state/fail_operation_lock_release"
+clear_operation_locks
+
+for unlock_signal_case in HUP:129 INT:130 TERM:143; do
+  reset_unlock_fixture
+  write_json_state false null null null UUID-123
+  write_apfs_state false true UUID-123 disk9s1
+  write_unlock_plaintext
+  write_matching_keychain
+  unlock_signal=${unlock_signal_case%%:*}
+  unlock_signal_status=${unlock_signal_case##*:}
+  printf 'signal_%s\n' "$unlock_signal" \
+    > "$apfs_state/transition_unlock_before_execution"
+  if unlock_signal_output=$(run_vaultlock unlock 2>&1); then
+    unlock_signal_actual=0
+  else
+    unlock_signal_actual=$?
+  fi
+  : "$unlock_signal_output"
+  check "unlock $unlock_signal preserves signal status" \
+    "$unlock_signal_status" "$unlock_signal_actual"
+  check_count "unlock $unlock_signal reports no false success" 0 \
+    'Result: unlocked and mounted' "$unlock_signal_output"
+  check "unlock $unlock_signal preserves recorded unlocked state" false \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check_empty "unlock $unlock_signal no-op performs no domain mutation" \
+    "$mutation_log"
+  [[ ! -e "$operation_lock_dir" ]] \
+    || record_failure "unlock $unlock_signal releases operation lock"
+done
+
+reset_unlock_fixture
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_unlock_plaintext
+write_matching_keychain
+printf 'hold_unlock_execution\n' \
+  > "$apfs_state/transition_unlock_before_execution"
+unlock_background_output=$test_root/unlock-background-output
+start_vaultlock_background "$unlock_background_output" unlock
+unlock_background_pid=$BACKGROUND_VAULTLOCK_PID
+wait_for_fixture "$apfs_state/unlock_execution_entered" \
+  || record_failure "unlock no-op reaches serialized execution boundary"
+if unlock_contender_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "concurrent unlock no-op refuses live operation lock"
+else
+  check_contains "concurrent unlock no-op reports live owner" \
+    'operation lock is held by live pid' "$unlock_contender_output"
+fi
+: > "$apfs_state/release_unlock_execution"
+if ! wait "$unlock_background_pid"; then
+  record_failure "serialized unlock no-op completes after release"
+fi
+[[ ! -e "$operation_lock_dir" ]] \
+  || record_failure "serialized unlock no-op releases operation lock"
+
+reset_init_fixture
+init_expected_child_secret=$(printf 'Task6SecretOnlyInStdinChannel!!!' \
+  | /usr/bin/base64 | /usr/bin/tr -d '\n')
+printf '%s' "$init_expected_child_secret" \
+  > "$apfs_state/expected_child_init_secret"
+if imported_init_output=$(run_vaultlock_with_imported_secret_names \
+    init --yes 2>&1); then
+  imported_init_status=0
+else
+  imported_init_status=$?
+fi
+check "init clears imported secret export attributes under allexport" 0 \
+  "$imported_init_status"
+check_contains "init imported-secret run reports success" \
+  'Result: created encrypted volume' "$imported_init_output"
+[[ ! -e "$apfs_state/init_secret_in_child_environment" ]] \
+  || record_failure "init recovery secret reaches child environment"
+[[ -e "$apfs_state/init_secret_environment_probe_ran" ]] \
+  || record_failure "init secret environment probe did not run after generation"
 
 reset_operation_lock_fixture
 

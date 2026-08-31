@@ -450,7 +450,7 @@ fi
 if output=$(VAULTLOCK_STATE_DIR="$state_probe_dir" "$VL" unlock extra 2>&1); then
   printf 'FAIL unlock rejects extra argument: command succeeded\n'
   fail=1
-elif [[ "$output" == "vaultlock: usage: vaultlock unlock [--no-hooks]" ]]; then
+elif [[ "$output" == "vaultlock: usage: vaultlock unlock [--dry-run] [--no-hooks]" ]]; then
   printf 'ok   unlock rejects extra argument\n'
 else
   printf 'FAIL unlock rejects extra argument: got [%s]\n' "$output"
