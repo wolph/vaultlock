@@ -30,6 +30,9 @@ if [[ "${VAULTLOCK_HOOK_FIXTURE:-0}" == "1" ]]; then
   if [[ "$fixture_name" == "10-disable-next" ]]; then
     chmod -x "$(dirname "$0")/20-disabled"
   fi
+  if [[ "$fixture_name" == "10-swap-next" ]]; then
+    ln -sfn "$VAULTLOCK_SWAP_TARGET" "$VAULTLOCK_SWAP_PATH"
+  fi
   [[ "$fixture_name" != *fail* ]] || exit 7
   exit 0
 fi
@@ -299,6 +302,28 @@ run_hooks "$race_state" "$race_mount" post-lock UUID-123 disk9s1 \
   2026-08-31T02:00:00+0200 1788134400 314159 true >/dev/null
 check "hook disabled after discovery is skipped" \
   "10-disable-next" "$(cut -d'|' -f1 "$hook_log")"
+
+swap_state="$hook_test_root/swap state"
+swap_mount="$hook_test_root/swap mount"
+mkdir -p "$swap_state/hooks/post-lock.d" "$swap_mount"
+install_hook "$swap_state/hooks/post-lock.d/10-swap-next"
+install_hook "$swap_state/replacement-target"
+ln -s "$TEST_SELF" "$swap_state/hooks/post-lock.d/20-swapped"
+: > "$hook_log"
+export VAULTLOCK_SWAP_TARGET="$swap_state/replacement-target"
+export VAULTLOCK_SWAP_PATH="$swap_state/hooks/post-lock.d/20-swapped"
+if swap_output=$(run_hooks "$swap_state" "$swap_mount" post-lock \
+    UUID-123 disk9s1 2026-08-31T02:00:00+0200 1788134400 314159 true 2>&1); then
+  printf 'FAIL hook target swap after planning is rejected: command succeeded\n'
+  fail=1
+else
+  printf 'ok   hook target swap after planning is rejected\n'
+fi
+unset VAULTLOCK_SWAP_TARGET VAULTLOCK_SWAP_PATH
+check "hook target swap executes no replacement" \
+  "10-swap-next" "$(cut -d'|' -f1 "$hook_log")"
+check_contains "hook target swap reports plan drift" \
+  "planned hook changed before execution" "$swap_output"
 
 install_hook "$post_state/hooks/pre-unlock.d/10-global"
 install_hook "$post_mount/.vaultlock/hooks/pre-unlock.d/10-local-never"

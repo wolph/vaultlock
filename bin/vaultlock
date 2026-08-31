@@ -38,6 +38,7 @@ RM_COMMAND=/bin/rm
 RMDIR_COMMAND=/bin/rmdir
 CHMOD_COMMAND=/bin/chmod
 TRANSITION_COMMAND=""
+LOCK_CRYPTO_MARKER_LOG=""
 if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]]; then
   export VAULTLOCK_TEST_PROCESS_PID=$$
   BSD_FIND=${VAULTLOCK_TEST_BSD_FIND:-$BSD_FIND}
@@ -54,6 +55,7 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]]; then
   RMDIR_COMMAND=${VAULTLOCK_TEST_RMDIR:-$RMDIR_COMMAND}
   CHMOD_COMMAND=${VAULTLOCK_TEST_CHMOD:-$CHMOD_COMMAND}
   TRANSITION_COMMAND=${VAULTLOCK_TEST_TRANSITION:-}
+  LOCK_CRYPTO_MARKER_LOG=${VAULTLOCK_TEST_LOCK_CRYPTO_MARKER_LOG:-}
 fi
 CONFIRM_DEVICE=${VAULTLOCK_CONFIRM_DEVICE:-/dev/tty}
 KEYCHAIN_SERVICE="vaultlock-$VOLUME"
@@ -106,6 +108,8 @@ INSPECTED_LOCK_TOKEN=""
 
 unset INIT_PASSPHRASE UNLOCK_PASSPHRASE content value passphrase
 unset expected_plaintext plaintext decrypted_recovery pass error_text
+unset LOCK_PASSPHRASE LOCK_OLD_PASSPHRASE lock_old_passphrase
+unset lock_new_passphrase old_passphrase new_passphrase lock_plaintext
 INIT_PASSPHRASE=""
 export -n INIT_PASSPHRASE 2>/dev/null || true
 INIT_RECOVERY_PATH=""
@@ -171,6 +175,47 @@ UNLOCK_STAGING_PATH=""
 UNLOCK_STAGING_IDENTITY=""
 UNLOCK_STAGING_DIGEST=""
 UNLOCK_STAGING_DESCRIPTION=""
+
+LOCK_PASSPHRASE=""
+LOCK_OLD_PASSPHRASE=""
+export -n LOCK_PASSPHRASE LOCK_OLD_PASSPHRASE 2>/dev/null || true
+LOCK_STATE_DIR_IDENTITY=""
+LOCK_STATE_FILE_SIGNATURE=""
+LOCK_PLAINTEXT_SIGNATURE=""
+LOCK_CIPHERTEXT_SIGNATURE=""
+LOCK_HASH_SIGNATURE=""
+LOCK_KEYCHAIN_PRESENT=false
+LOCK_KEYCHAIN_MATCH=false
+LOCK_KEYCHAIN_DIGEST=not-inspected
+LOCK_DEADLINE_FROZEN=false
+LOCK_REQUEST_DEADLINE=""
+LOCK_REQUEST_DEADLINE_EPOCH=""
+LOCK_REQUEST_ROUND=""
+LOCK_SECURE_NOOP=false
+LOCK_REPAIR_ONLY=false
+LOCK_POST_HOOK_FAILED=false
+LOCK_PERFORM_MOUNT_RESISTANCE=false
+LOCK_DATA_SNAPSHOT_CLEANUP_FAILED=false
+LOCK_APFS_ROTATED=false
+LOCK_APFS_ROTATION_ATTEMPTED=false
+LOCK_TRANSACTION_STAGE=""
+LOCK_TRANSACTION_SIGNATURE=""
+LOCK_FIXED_STAGE_SIGNATURE=""
+LOCK_JSON_STAGE=""
+LOCK_JSON_STAGE_SIGNATURE=""
+LOCK_TLE_VERIFY_ERROR=""
+export -n LOCK_TLE_VERIFY_ERROR 2>/dev/null || true
+KEYCHAIN_SNAPSHOT_PRESENT=false
+KEYCHAIN_SNAPSHOT_MATCH=false
+KEYCHAIN_SNAPSHOT_DIGEST=absent
+PROTECTED_STATE_FILE_SIGNATURE=""
+PROTECTED_PLAINTEXT_SIGNATURE=""
+PROTECTED_CIPHERTEXT_SIGNATURE=""
+PROTECTED_HASH_SIGNATURE=""
+LOCK_STAGE_PATHS=()
+LOCK_STAGE_SIGNATURES=()
+LOCK_STAGE_DESCRIPTIONS=()
+LOCK_ARTIFACT_PATHS=()
 
 DISCOVERED_HOOK_PATHS=()
 DISCOVERED_HOOK_SCOPES=()
@@ -776,6 +821,32 @@ operation_path_identity() { # path
   "$BSD_STAT" -f '%d:%i' -- "$1" 2>/dev/null
 }
 
+hook_file_signature() { # path
+  local path=$1 link_metadata target_metadata link_digest target_digest output
+  [[ -f "$path" && -x "$path" ]] || return 1
+  if [[ -L "$path" ]]; then
+    link_metadata=$("$BSD_STAT" -f '%d:%i:%HT:%Lp:%u:%l' -- \
+      "$path" 2>/dev/null) || return 1
+    [[ "$link_metadata" == *':Symbolic Link:'* ]] || return 1
+    output=$(/usr/bin/readlink -n -- "$path" 2>/dev/null \
+      | /usr/bin/shasum -a 256) || return 1
+    [[ "$output" =~ ^([0-9a-f]{64})[[:space:]] ]] || return 1
+    link_digest=${BASH_REMATCH[1]}
+    target_metadata=$("$BSD_STAT" -L -f '%d:%i:%HT:%Lp:%u:%l' -- \
+      "$path" 2>/dev/null) || return 1
+    [[ "$target_metadata" == *':Regular File:'* ]] || return 1
+    target_digest=$(operation_owner_digest "$path") || return 1
+    printf 'symlink:%s:%s:%s:%s\n' "$link_metadata" "$link_digest" \
+      "$target_metadata" "$target_digest"
+    return 0
+  fi
+  target_metadata=$("$BSD_STAT" -f '%d:%i:%HT:%Lp:%u:%l' -- \
+    "$path" 2>/dev/null) || return 1
+  [[ "$target_metadata" == *':Regular File:'* ]] || return 1
+  target_digest=$(operation_owner_digest "$path") || return 1
+  printf 'file:%s:%s\n' "$target_metadata" "$target_digest"
+}
+
 valid_process_start_identity() { # value
   local value=$1 normalized
   [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\t'* ]] \
@@ -1071,10 +1142,128 @@ clear_unlock_staging_file() {
   UNLOCK_STAGING_DESCRIPTION=""
 }
 
+lock_staging_signature() { # path
+  protected_file_signature "$1" 600 1,2 false
+}
+
+track_lock_staging_file() { # path signature description
+  LOCK_STAGE_PATHS+=("$1")
+  LOCK_STAGE_SIGNATURES+=("$2")
+  LOCK_STAGE_DESCRIPTIONS+=("$3")
+}
+
+refresh_lock_staging_signature() { # path
+  local path=$1 index signature
+  signature=$(lock_staging_signature "$path") || return 1
+  for ((index=0; index<${#LOCK_STAGE_PATHS[@]}; index++)); do
+    if [[ "${LOCK_STAGE_PATHS[$index]}" == "$path" ]]; then
+      LOCK_STAGE_SIGNATURES[index]=$signature
+      return 0
+    fi
+  done
+  return 1
+}
+
+clear_lock_staging_file() { # path
+  local path=$1 index
+  for ((index=0; index<${#LOCK_STAGE_PATHS[@]}; index++)); do
+    if [[ "${LOCK_STAGE_PATHS[$index]}" == "$path" ]]; then
+      LOCK_STAGE_PATHS[index]=""
+      LOCK_STAGE_SIGNATURES[index]=""
+      LOCK_STAGE_DESCRIPTIONS[index]=""
+      return 0
+    fi
+  done
+}
+
+cleanup_disposable_lock_recovery_pair() {
+  local fixed=$STATE_DIR/passphrase-new.txt transaction
+  local fixed_actual transaction_actual remaining
+  local device inode mode owner links digest
+  local remaining_device remaining_inode remaining_mode remaining_owner
+  local remaining_links remaining_digest
+  transaction=$LOCK_TRANSACTION_STAGE
+  fixed_actual=$(lock_staging_signature "$fixed") || return 1
+  transaction_actual=$(lock_staging_signature "$transaction") || return 1
+  [[ "$fixed_actual" == "$LOCK_FIXED_STAGE_SIGNATURE" \
+    && "$transaction_actual" == "$LOCK_TRANSACTION_SIGNATURE" \
+    && "$fixed_actual" == "$transaction_actual" ]] || return 1
+  IFS=: read -r device inode mode owner links digest \
+    <<< "$transaction_actual"
+  [[ "$links" == 2 ]] || return 1
+  "$RM_COMMAND" -f -- "$fixed" || return 1
+  [[ ! -e "$fixed" && ! -L "$fixed" ]] || return 1
+  remaining=$(lock_staging_signature "$transaction") || return 1
+  IFS=: read -r remaining_device remaining_inode remaining_mode \
+    remaining_owner remaining_links remaining_digest <<< "$remaining"
+  [[ "$remaining_device:$remaining_inode:$remaining_mode:$remaining_owner" \
+      == "$device:$inode:$mode:$owner" \
+    && "$remaining_links" == 1 \
+    && "$remaining_digest" == "$digest" ]] || return 1
+  "$RM_COMMAND" -f -- "$transaction" || return 1
+  [[ ! -e "$transaction" && ! -L "$transaction" ]] || return 1
+  clear_lock_staging_file "$fixed"
+  clear_lock_staging_file "$transaction"
+}
+
+cleanup_lock_staging_files() {
+  local index path expected actual failed=false pair_handled=false
+  if [[ "$LOCK_APFS_ROTATION_ATTEMPTED" == false \
+      && -n "$LOCK_TRANSACTION_STAGE" \
+      && -n "$LOCK_TRANSACTION_SIGNATURE" \
+      && -n "$LOCK_FIXED_STAGE_SIGNATURE" \
+      && -e "$LOCK_TRANSACTION_STAGE" \
+      && -e "$STATE_DIR/passphrase-new.txt" ]]; then
+    pair_handled=true
+    if ! cleanup_disposable_lock_recovery_pair; then
+      printf 'vaultlock: disposable recovery staging pair retained for inspection\n' \
+        >&2
+      failed=true
+    fi
+  fi
+  for ((index=0; index<${#LOCK_STAGE_PATHS[@]}; index++)); do
+    path=${LOCK_STAGE_PATHS[$index]}
+    [[ -n "$path" ]] || continue
+    if [[ "$pair_handled" == true \
+        && ( "$path" == "$LOCK_TRANSACTION_STAGE" \
+          || "$path" == "$STATE_DIR/passphrase-new.txt" ) ]]; then
+      continue
+    fi
+    expected=${LOCK_STAGE_SIGNATURES[$index]}
+    if [[ ( "$LOCK_APFS_ROTATED" == true \
+          || "$LOCK_APFS_ROTATION_ATTEMPTED" == true ) \
+        && ( "$path" == "$LOCK_TRANSACTION_STAGE" \
+          || "$path" == "$STATE_DIR/passphrase-new.txt" ) ]]; then
+      actual=$(lock_staging_signature "$path") || actual=""
+      if [[ -n "$expected" && "$actual" == "$expected" ]]; then
+        printf 'vaultlock: verified %s retained at %s\n' \
+          "${LOCK_STAGE_DESCRIPTIONS[$index]}" "$path" >&2
+      else
+        printf 'vaultlock: unverified %s retained at %s\n' \
+          "${LOCK_STAGE_DESCRIPTIONS[$index]}" "$path" >&2
+      fi
+      failed=true
+      continue
+    fi
+    actual=$(lock_staging_signature "$path") || actual=""
+    if [[ -n "$expected" && "$actual" == "$expected" ]] \
+        && "$RM_COMMAND" -f -- "$path" \
+        && [[ ! -e "$path" && ! -L "$path" ]]; then
+      clear_lock_staging_file "$path"
+    else
+      printf 'vaultlock: %s retained at %s\n' \
+        "${LOCK_STAGE_DESCRIPTIONS[$index]}" "$path" >&2
+      failed=true
+    fi
+  done
+  [[ "$failed" == false ]]
+}
+
 operation_cleanup_dispatcher() { # signal
   local signal=$1 status=$? release_failed=false staging_cleanup_failed=false
   trap - EXIT HUP INT TERM
   cleanup_unlock_staging_file || staging_cleanup_failed=true
+  cleanup_lock_staging_files || staging_cleanup_failed=true
   if [[ "$signal" != EXIT && "$ADOPT_TRANSACTION_PHASE" != none ]]; then
     cleanup_adopt_transaction_after_signal "$signal"
   elif [[ "$signal" != EXIT ]]; then
@@ -1388,11 +1577,11 @@ serialize_common_plan_fields() { # command
       "${PLAN_HOOK_SCOPES[$index]}"
     append_serialized_plan_field "hook_directory_$index" \
       "${PLAN_HOOK_DIRECTORIES[$index]}"
-    if [[ "$1" == unlock \
+    if [[ ( "$1" == unlock || "$1" == lock ) \
         && "${PLAN_OPERATION_IDS[$index]}" == hook ]]; then
-      hook_signature=$(unlock_file_signature \
+      hook_signature=$(hook_file_signature \
         "${PLAN_HOOK_PATHS[$index]}") \
-        || die "planned unlock hook must remain an owned real file"
+        || die "planned hook must remain an executable regular file or resolving symlink"
       append_serialized_plan_field "hook_signature_$index" \
         "$hook_signature"
     else
@@ -1419,7 +1608,7 @@ serialize_common_plan_fields() { # command
 }
 
 serialize_planned_command_snapshot() { # target command
-  local target=$1 command=$2 state_dir_identity state_file_identity
+  local target=$1 command=$2 state_dir_identity state_file_identity index
   SERIALIZED_PLAN_FIELD_NAMES=()
   SERIALIZED_PLAN_FIELD_VALUES=()
   serialize_common_plan_fields "$command"
@@ -1494,6 +1683,33 @@ serialize_planned_command_snapshot() { # target command
       append_serialized_plan_field unlock_actual_apfs_unlock \
         "$UNLOCK_ACTUAL_APFS_UNLOCK"
       ;;
+    lock)
+      append_serialized_plan_field typed_operand_count 1
+      append_serialized_plan_field typed_operand_0_name deadline_expression
+      append_serialized_plan_field typed_operand_0_value "$OPTION_OPERANDS"
+      append_serialized_plan_field lock_state_dir_identity \
+        "$LOCK_STATE_DIR_IDENTITY"
+      append_serialized_plan_field lock_state_file_signature \
+        "$LOCK_STATE_FILE_SIGNATURE"
+      append_serialized_plan_field lock_plaintext_signature \
+        "$LOCK_PLAINTEXT_SIGNATURE"
+      append_serialized_plan_field lock_ciphertext_signature \
+        "$LOCK_CIPHERTEXT_SIGNATURE"
+      append_serialized_plan_field lock_hash_signature \
+        "$LOCK_HASH_SIGNATURE"
+      append_serialized_plan_field lock_keychain_present \
+        "$LOCK_KEYCHAIN_PRESENT"
+      append_serialized_plan_field lock_keychain_match "$LOCK_KEYCHAIN_MATCH"
+      append_serialized_plan_field lock_keychain_digest "$LOCK_KEYCHAIN_DIGEST"
+      append_serialized_plan_field lock_secure_noop "$LOCK_SECURE_NOOP"
+      append_serialized_plan_field lock_repair_only "$LOCK_REPAIR_ONLY"
+      append_serialized_plan_field lock_artifact_count \
+        "${#LOCK_ARTIFACT_PATHS[@]}"
+      for ((index=0; index<${#LOCK_ARTIFACT_PATHS[@]}; index++)); do
+        append_serialized_plan_field \
+          "lock_artifact_path_$index" "${LOCK_ARTIFACT_PATHS[$index]}"
+      done
+      ;;
   esac
 }
 
@@ -1552,12 +1768,21 @@ revalidate_plan_under_operation_lock() { # command
       classify_runtime_state
       revalidate_unlock_inputs_before_candidate_plan
       ;;
+    lock)
+      run_named_transition plan_revalidation_before_inspection "$state_file"
+      inspect_runtime_state
+      classify_runtime_state
+      capture_lock_artifact_inventory
+      [[ "${#LOCK_ARTIFACT_PATHS[@]}" -eq 0 ]] \
+        || die "plan changed after operation lock acquisition: lock staging artifact must be resolved"
+      ;;
   esac
   plan_reset
   plan_add_coordination_start
   case "$command" in
     init) build_init_plan ;;
     adopt) build_adopt_plan ;;
+    lock) build_lock_plan ;;
     unlock) build_unlock_plan ;;
   esac
   plan_add_coordination_finish
@@ -1607,7 +1832,7 @@ plan_add() { # operation_id public_description
 
   case "$operation_id" in
     repair_verify_plaintext|repair_unlock_apfs|repair_mount|verify_mount_identity|\
-hooks_disabled|tm_exclude|\
+hooks_disabled|tm_exclude_state|tm_exclude|\
 tm_delete_vault_snapshots|unmount_vault|stage_recovery|rotate_apfs_recovery|\
 keychain_update|\
 tle_encrypt|tle_verify_future|persist_locked_recovery|remove_plaintext|\
@@ -1838,100 +2063,82 @@ discover_hook_directory() { # directory scope
     done
 }
 
-run_hook_directory() { # mode phase scope dir uuid device deadline epoch round locked
-    local mode=$1 phase=$2 scope=$3 directory=$4 uuid=$5 device=$6
-    local deadline=$7 deadline_epoch=$8 round=$9
-    shift 9
-    local locked=$1 hook hook_scope status index
-    local -i failed=0
+plan_test_hook_phase() { # phase
+  local phase=$1
+  plan_reset
+  case "$phase" in
+    pre-lock)
+      verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+        || return
+      plan_discovered_hook_file pre-lock global "$STATE_DIR/pre-lock.sh"
+      plan_discovered_hook_directory pre-lock global \
+        "$STATE_DIR/hooks/pre-lock.d"
+      plan_discovered_hook_directory pre-lock vault \
+        "$MOUNT_POINT/.vaultlock/hooks/pre-lock.d"
+      ;;
+    post-lock)
+      plan_discovered_hook_directory post-lock global \
+        "$STATE_DIR/hooks/post-lock.d"
+      ;;
+    pre-unlock)
+      plan_discovered_hook_directory pre-unlock global \
+        "$STATE_DIR/hooks/pre-unlock.d"
+      ;;
+    post-unlock)
+      verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+        || return
+      plan_discovered_hook_directory post-unlock vault \
+        "$MOUNT_POINT/.vaultlock/hooks/post-unlock.d"
+      plan_discovered_hook_directory post-unlock global \
+        "$STATE_DIR/hooks/post-unlock.d"
+      ;;
+    *) die "unknown hook phase: $phase" ;;
+  esac
+}
 
-    discover_hooks_reset
-    discover_hook_directory "$directory" "$scope"
-    for ((index=0; index<${#DISCOVERED_HOOK_PATHS[@]}; index++)); do
-    hook=${DISCOVERED_HOOK_PATHS[$index]}
-    hook_scope=${DISCOVERED_HOOK_SCOPES[$index]}
-    [[ -f "$hook" && -x "$hook" ]] || continue
-    if run_hook_file "$mode" "$phase" "$hook_scope" "$hook" "$uuid" "$device" \
-        "$deadline" "$deadline_epoch" "$round" "$locked"; then
+freeze_test_hook_plan() { # phase
+  local command=unlock
+  [[ "$1" == *-lock ]] && command=lock
+  SERIALIZED_PLAN_FIELD_NAMES=()
+  SERIALIZED_PLAN_FIELD_VALUES=()
+  serialize_common_plan_fields "$command"
+  copy_serialized_plan_snapshot frozen
+}
+
+execute_test_hook_plan() { # phase
+  local phase=$1 index status
+  local -i failed=0
+  for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
+    [[ "${PLAN_OPERATION_IDS[$index]}" == hook ]] || continue
+    [[ -f "${PLAN_HOOK_PATHS[$index]}" \
+      && -x "${PLAN_HOOK_PATHS[$index]}" ]] || continue
+    if [[ "$phase" == pre-lock || "$phase" == post-unlock ]]; then
+      verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+        || return
+    fi
+    if run_verified_planned_hook "$index"; then
       continue
     else
       status=$?
     fi
-    if [[ "$mode" == "pre" ]]; then return "$status"; fi
+    [[ "$phase" == pre-* ]] && return "$status"
     failed=1
   done
   (( failed == 0 ))
 }
 
-run_pre_lock_hooks() { # uuid device deadline epoch round locked
-    local uuid=$1 device=$2 deadline=$3 epoch=$4 round=$5 locked=$6
-    local legacy="$STATE_DIR/pre-lock.sh" index
-
-    verify_mount_identity "$uuid" "$device" || return
-    discover_hooks_reset
-    discover_hook_file "$legacy" global
-    for ((index=0; index<${#DISCOVERED_HOOK_PATHS[@]}; index++)); do
-      [[ -f "${DISCOVERED_HOOK_PATHS[$index]}" \
-          && -x "${DISCOVERED_HOOK_PATHS[$index]}" ]] || continue
-      run_hook_file pre pre-lock "${DISCOVERED_HOOK_SCOPES[$index]}" \
-        "${DISCOVERED_HOOK_PATHS[$index]}" "$uuid" "$device" \
-        "$deadline" "$epoch" "$round" "$locked" || return
-    done
-    run_hook_directory pre pre-lock global "$STATE_DIR/hooks/pre-lock.d" \
-        "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked" || return
-    verify_mount_identity "$uuid" "$device" || return
-    run_hook_directory pre pre-lock vault "$MOUNT_POINT/.vaultlock/hooks/pre-lock.d" \
-        "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked"
-}
-
-run_post_unlock_hooks() { # uuid device deadline epoch round locked
-    local uuid=$1 device=$2 deadline=$3 epoch=$4 round=$5 locked=$6
-    local -i failed=0
-
-    verify_mount_identity "$uuid" "$device" || return
-    run_hook_directory post post-unlock vault \
-    "$MOUNT_POINT/.vaultlock/hooks/post-unlock.d" \
-    "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked" || failed=1
-  run_hook_directory post post-unlock global "$STATE_DIR/hooks/post-unlock.d" \
-    "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked" || failed=1
-  (( failed == 0 ))
-}
-
-run_hook_phase() { # phase uuid device deadline epoch round locked
-  local phase=$1 uuid=$2 device=$3 deadline=$4 epoch=$5 round=$6 locked=$7
-  case "$phase" in
-    pre-lock)
-      run_pre_lock_hooks "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked"
-      ;;
-    post-lock)
-      run_hook_directory post post-lock global "$STATE_DIR/hooks/post-lock.d" \
-        "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked"
-      ;;
-    pre-unlock)
-      run_hook_directory pre pre-unlock global "$STATE_DIR/hooks/pre-unlock.d" \
-        "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked"
-      ;;
-    post-unlock)
-      run_post_unlock_hooks "$uuid" "$device" "$deadline" "$epoch" "$round" "$locked"
-      ;;
-    *)
-      die "unknown hook phase: $phase"
-      ;;
-  esac
-}
-
-# Mount the vault if it is crypto-unlocked but unmounted. Die if locked.
-require_mounted() {
-    local uuid device
-
-    uuid=$(vol_uuid)
-    device=$(vol_device)
-    if ! "$MOUNT_COMMAND" | grep -Fq -- "on $MOUNT_POINT ("; then
-        diskutil mount "$device" >/dev/null 2>&1 \
-            || die "vault is not mountable (locked?), see: vaultlock status"
-    fi
-    verify_mount_identity "$uuid" "$device" \
-        || die "expected vault is not mounted at $MOUNT_POINT"
+run_test_hook_phase() { # phase uuid device deadline epoch round locked
+  local phase=$1
+  PLAN_CONTEXT_UUID=$2
+  PLAN_CONTEXT_DEVICE=$3
+  PLAN_CONTEXT_DEADLINE=$4
+  PLAN_CONTEXT_DEADLINE_EPOCH=$5
+  PLAN_CONTEXT_ROUND=$6
+  [[ "$(hook_locked_value "$phase")" == "$7" ]] \
+    || die "hook locked argument does not match phase"
+  plan_test_hook_phase "$phase"
+  freeze_test_hook_plan "$phase"
+  execute_test_hook_plan "$phase"
 }
 
 inspect_init_volume_absence() {
@@ -4194,24 +4401,33 @@ sha256_of() {
   printf '%s' "$1" | /usr/bin/shasum -a 256 | /usr/bin/cut -d' ' -f1
 }
 
-unlock_file_signature() { # path [required_mode]
-  local path=$1 required_mode=${2:-}
+protected_file_signature() { # path required_mode allowed_links allow_absent
+  local path=$1 required_mode=$2 allowed_links=$3 allow_absent=$4
   local metadata digest device inode mode owner link_count
   if [[ ! -e "$path" && ! -L "$path" ]]; then
+    [[ "$allow_absent" == true ]] || return 1
     printf 'absent\n'
-    return 0
+    return
   fi
   [[ -f "$path" && ! -L "$path" ]] || return 1
   metadata=$("$BSD_STAT" -f '%d:%i:%Lp:%u:%l' -- "$path" 2>/dev/null) \
     || return 1
   IFS=: read -r device inode mode owner link_count <<< "$metadata"
-  [[ "$owner" == "$UID" && "$link_count" == 1 \
+  [[ "$owner" == "$UID" \
     && ( -z "$required_mode" || "$mode" == "$required_mode" ) ]] \
     || return 1
+  case ",$allowed_links," in
+    *,$link_count,*) ;;
+    *) return 1 ;;
+  esac
   private_path_acl_is_absent "$path" || return 1
   digest=$(operation_owner_digest "$path") || return 1
   printf '%s:%s:%s:%s:%s:%s\n' \
     "$device" "$inode" "$mode" "$owner" "$link_count" "$digest"
+}
+
+unlock_file_signature() { # path [required_mode]
+  protected_file_signature "$1" "${2:-}" 1 true
 }
 
 unlock_state_directory_signature() {
@@ -4225,6 +4441,160 @@ unlock_state_directory_signature() {
   private_path_acl_is_absent "$STATE_DIR" || return 1
   printf '%s:%s:%s:%s:%s\n' \
     "$device" "$inode" "$mode" "$owner" "$link_count"
+}
+
+capture_lock_artifact_inventory() {
+  local artifact encoded_inventory sort_key insert_at index
+  LOCK_ARTIFACT_PATHS=()
+  encoded_inventory=$("$BSD_FIND" -P "$STATE_DIR" \
+    -mindepth 1 -maxdepth 1 \
+    \( -name 'passphrase-new.txt' -o -name '.unlock-recovery.*' \
+      -o -name '.tle-unlock.*' -o -name '.state-unlock.*' \
+      -o -name '.passphrase-lock.*' -o -name '.tle-lock.*' \
+      -o -name '.hash-lock.*' -o -name '.state-lock.*' \
+      -o -name '.tle-verify.*' -o -name '.security-output.*' \) \
+    -print0 2>/dev/null \
+    | while IFS= read -r -d '' artifact; do
+        printf '%s' "$artifact" \
+          | /usr/bin/od -An -v -tx1 \
+          | tr -d ' \n'
+        printf '\n'
+      done) \
+    || die "cannot inspect lock staging artifacts in $STATE_DIR"
+  if [[ -n "$encoded_inventory" ]]; then
+    while IFS= read -r artifact; do
+      [[ -n "$artifact" ]] \
+        || die "cannot inspect lock staging artifacts in $STATE_DIR"
+      LOCK_ARTIFACT_PATHS+=("$artifact")
+    done <<< "$encoded_inventory"
+  fi
+  for ((index=1; index<${#LOCK_ARTIFACT_PATHS[@]}; index++)); do
+    sort_key=${LOCK_ARTIFACT_PATHS[$index]}
+    insert_at=$((index - 1))
+    while (( insert_at >= 0 )) \
+        && [[ "${LOCK_ARTIFACT_PATHS[$insert_at]}" > "$sort_key" ]]; do
+      LOCK_ARTIFACT_PATHS[insert_at + 1]=${LOCK_ARTIFACT_PATHS[$insert_at]}
+      insert_at=$((insert_at - 1))
+    done
+    LOCK_ARTIFACT_PATHS[insert_at + 1]=$sort_key
+  done
+}
+
+require_no_lock_staging_artifacts() {
+  capture_lock_artifact_inventory
+  [[ "${#LOCK_ARTIFACT_PATHS[@]}" -eq 0 ]] \
+    || die "untracked lock staging artifact must be resolved in $STATE_DIR"
+}
+
+capture_keychain_snapshot() { # optional expected plaintext
+  local expected_plaintext=${1:-} value status
+  export -n expected_plaintext value 2>/dev/null || true
+  KEYCHAIN_SNAPSHOT_PRESENT=false
+  KEYCHAIN_SNAPSHOT_MATCH=false
+  KEYCHAIN_SNAPSHOT_DIGEST=absent
+  preflight_keychain_target
+  if value=$(security find-generic-password -a "$USER" \
+      -s "$KEYCHAIN_SERVICE" -w 2>/dev/null); then
+    export -n value 2>/dev/null || true
+    KEYCHAIN_SNAPSHOT_PRESENT=true
+    KEYCHAIN_SNAPSHOT_DIGEST=$(sha256_of "$value") \
+      || die "cannot fingerprint keychain recovery material"
+    [[ -n "$expected_plaintext" && "$value" == "$expected_plaintext" ]] \
+      && KEYCHAIN_SNAPSHOT_MATCH=true
+    value=""
+    export -n value 2>/dev/null || true
+    return 0
+  else
+    status=$?
+  fi
+  [[ "$status" -eq 44 ]] || return 1
+}
+
+read_lock_keychain_snapshot() { # optional expected plaintext
+  capture_keychain_snapshot "${1:-}" || return
+  LOCK_KEYCHAIN_PRESENT=$KEYCHAIN_SNAPSHOT_PRESENT
+  LOCK_KEYCHAIN_MATCH=$KEYCHAIN_SNAPSHOT_MATCH
+  LOCK_KEYCHAIN_DIGEST=$KEYCHAIN_SNAPSHOT_DIGEST
+}
+
+capture_protected_file_signatures() {
+  [[ -f "$state_file" && ! -L "$state_file" ]] \
+    || die "unsafe protected state metadata at $state_file"
+  PROTECTED_STATE_FILE_SIGNATURE=$(unlock_file_signature "$state_file" 600) \
+    || die "unsafe protected state metadata at $state_file"
+  PROTECTED_PLAINTEXT_SIGNATURE=$(unlock_file_signature \
+    "$STATE_DIR/passphrase.txt" 600) \
+    || die "unsafe protected state metadata at $STATE_DIR/passphrase.txt"
+  PROTECTED_CIPHERTEXT_SIGNATURE=$(unlock_file_signature \
+    "$STATE_DIR/passphrase.tle" 600) \
+    || die "unsafe protected state metadata at $STATE_DIR/passphrase.tle"
+  PROTECTED_HASH_SIGNATURE=$(unlock_file_signature \
+    "$STATE_DIR/passphrase.sha256" 600) \
+    || die "unsafe protected state metadata at $STATE_DIR/passphrase.sha256"
+}
+
+capture_lock_boundary_signatures() {
+  LOCK_STATE_DIR_IDENTITY=$(lock_state_directory_signature) \
+    || die "unsafe protected state metadata at $STATE_DIR"
+  capture_protected_file_signatures
+  LOCK_STATE_FILE_SIGNATURE=$PROTECTED_STATE_FILE_SIGNATURE
+  LOCK_PLAINTEXT_SIGNATURE=$PROTECTED_PLAINTEXT_SIGNATURE
+  LOCK_CIPHERTEXT_SIGNATURE=$PROTECTED_CIPHERTEXT_SIGNATURE
+  LOCK_HASH_SIGNATURE=$PROTECTED_HASH_SIGNATURE
+}
+
+protected_file_boundaries_match() { # state plaintext ciphertext hash
+  local expected_state=$1 expected_plaintext=$2
+  local expected_ciphertext=$3 expected_hash=$4
+  local state plaintext ciphertext hash
+  state=$(unlock_file_signature "$state_file" 600) || return 1
+  plaintext=$(unlock_file_signature "$STATE_DIR/passphrase.txt" 600) \
+    || return 1
+  ciphertext=$(unlock_file_signature "$STATE_DIR/passphrase.tle" 600) \
+    || return 1
+  hash=$(unlock_file_signature "$STATE_DIR/passphrase.sha256" 600) \
+    || return 1
+  [[ "$state" == "$expected_state" \
+    && "$plaintext" == "$expected_plaintext" \
+    && "$ciphertext" == "$expected_ciphertext" \
+    && "$hash" == "$expected_hash" ]]
+}
+
+lock_protected_boundaries_match() {
+  local directory
+  directory=$(lock_state_directory_signature) || return 1
+  [[ "$directory" == "$LOCK_STATE_DIR_IDENTITY" ]] || return 1
+  protected_file_boundaries_match \
+    "$LOCK_STATE_FILE_SIGNATURE" "$LOCK_PLAINTEXT_SIGNATURE" \
+    "$LOCK_CIPHERTEXT_SIGNATURE" "$LOCK_HASH_SIGNATURE"
+}
+
+lock_state_directory_signature() {
+  unlock_state_directory_signature
+}
+
+require_lock_protected_boundaries_match() { # boundary
+  local boundary=$1 current
+  current=$(lock_state_directory_signature) \
+    || die "state directory metadata changed $boundary"
+  [[ "$current" == "$LOCK_STATE_DIR_IDENTITY" ]] \
+    || die "state directory metadata changed $boundary"
+  current=$(unlock_file_signature "$state_file" 600) \
+    || die "state file metadata changed $boundary"
+  [[ "$current" == "$LOCK_STATE_FILE_SIGNATURE" ]] \
+    || die "state file metadata changed $boundary"
+  current=$(unlock_file_signature "$STATE_DIR/passphrase.txt" 600) \
+    || die "plaintext recovery metadata changed $boundary"
+  [[ "$current" == "$LOCK_PLAINTEXT_SIGNATURE" ]] \
+    || die "plaintext recovery metadata changed $boundary"
+  current=$(unlock_file_signature "$STATE_DIR/passphrase.tle" 600) \
+    || die "ciphertext metadata changed $boundary"
+  [[ "$current" == "$LOCK_CIPHERTEXT_SIGNATURE" ]] \
+    || die "ciphertext metadata changed $boundary"
+  current=$(unlock_file_signature "$STATE_DIR/passphrase.sha256" 600) \
+    || die "recovery hash metadata changed $boundary"
+  [[ "$current" == "$LOCK_HASH_SIGNATURE" ]] \
+    || die "recovery hash metadata changed $boundary"
 }
 
 require_no_untracked_unlock_staging() {
@@ -4241,19 +4611,11 @@ capture_unlock_boundary_signatures() {
   UNLOCK_STATE_DIR_IDENTITY=$(unlock_state_directory_signature) \
     || die "unsafe protected state metadata at $STATE_DIR"
   require_no_untracked_unlock_staging
-  [[ -f "$state_file" && ! -L "$state_file" ]] \
-    || die "unsafe protected state metadata at $state_file"
-  UNLOCK_STATE_FILE_SIGNATURE=$(unlock_file_signature "$state_file" 600) \
-    || die "unsafe protected state metadata at $state_file"
-  UNLOCK_PLAINTEXT_SIGNATURE=$(unlock_file_signature \
-    "$STATE_DIR/passphrase.txt" 600) \
-    || die "unsafe protected state metadata at $STATE_DIR/passphrase.txt"
-  UNLOCK_CIPHERTEXT_SIGNATURE=$(unlock_file_signature \
-    "$STATE_DIR/passphrase.tle" 600) \
-    || die "unsafe protected state metadata at $STATE_DIR/passphrase.tle"
-  UNLOCK_HASH_SIGNATURE=$(unlock_file_signature \
-    "$STATE_DIR/passphrase.sha256" 600) \
-    || die "unsafe protected state metadata at $STATE_DIR/passphrase.sha256"
+  capture_protected_file_signatures
+  UNLOCK_STATE_FILE_SIGNATURE=$PROTECTED_STATE_FILE_SIGNATURE
+  UNLOCK_PLAINTEXT_SIGNATURE=$PROTECTED_PLAINTEXT_SIGNATURE
+  UNLOCK_CIPHERTEXT_SIGNATURE=$PROTECTED_CIPHERTEXT_SIGNATURE
+  UNLOCK_HASH_SIGNATURE=$PROTECTED_HASH_SIGNATURE
 }
 
 verify_unlock_target_metadata() {
@@ -4282,30 +4644,10 @@ verify_unlock_target_metadata() {
 }
 
 read_unlock_keychain_snapshot() { # expected_plaintext
-  local expected_plaintext value status
-  export -n expected_plaintext value 2>/dev/null || true
-  expected_plaintext=$1
-  UNLOCK_KEYCHAIN_PRESENT=false
-  UNLOCK_KEYCHAIN_MATCH=false
-  UNLOCK_KEYCHAIN_DIGEST=absent
-  safe_public_token "${USER:-}" \
-    || die "USER is missing or unsafe for keychain inspection"
-  safe_public_token "$KEYCHAIN_SERVICE" \
-    || die "keychain service is unsafe for inspection"
-  if value=$(security find-generic-password -a "$USER" \
-      -s "$KEYCHAIN_SERVICE" -w 2>/dev/null); then
-    UNLOCK_KEYCHAIN_PRESENT=true
-    UNLOCK_KEYCHAIN_DIGEST=$(sha256_of "$value") \
-      || die "cannot fingerprint keychain recovery material"
-    [[ "$value" == "$expected_plaintext" ]] \
-      && UNLOCK_KEYCHAIN_MATCH=true
-    value=""
-    return 0
-  else
-    status=$?
-  fi
-  [[ "$status" -eq 44 ]] || return 1
-  return 0
+  capture_keychain_snapshot "$1" || return
+  UNLOCK_KEYCHAIN_PRESENT=$KEYCHAIN_SNAPSHOT_PRESENT
+  UNLOCK_KEYCHAIN_MATCH=$KEYCHAIN_SNAPSHOT_MATCH
+  UNLOCK_KEYCHAIN_DIGEST=$KEYCHAIN_SNAPSHOT_DIGEST
 }
 
 read_unlock_hash() {
@@ -4356,20 +4698,10 @@ unlock_state_directory_matches_snapshot() {
 }
 
 unlock_protected_boundaries_match() {
-  local state plaintext ciphertext hash
   unlock_state_directory_matches_snapshot || return 1
-  state=$(unlock_file_signature "$state_file" 600) \
-    || return 1
-  plaintext=$(unlock_file_signature "$STATE_DIR/passphrase.txt" 600) \
-    || return 1
-  ciphertext=$(unlock_file_signature "$STATE_DIR/passphrase.tle" 600) \
-    || return 1
-  hash=$(unlock_file_signature "$STATE_DIR/passphrase.sha256" 600) \
-    || return 1
-  [[ "$state" == "$UNLOCK_STATE_FILE_SIGNATURE" \
-    && "$plaintext" == "$UNLOCK_PLAINTEXT_SIGNATURE" \
-    && "$ciphertext" == "$UNLOCK_CIPHERTEXT_SIGNATURE" \
-    && "$hash" == "$UNLOCK_HASH_SIGNATURE" ]]
+  protected_file_boundaries_match \
+    "$UNLOCK_STATE_FILE_SIGNATURE" "$UNLOCK_PLAINTEXT_SIGNATURE" \
+    "$UNLOCK_CIPHERTEXT_SIGNATURE" "$UNLOCK_HASH_SIGNATURE"
 }
 
 verify_unlock_recovery_boundaries() {
@@ -4432,6 +4764,8 @@ plan_lock_hooks() {
   plan_discovered_hook_directory pre-lock global \
     "$STATE_DIR/hooks/pre-lock.d"
   if [[ "$SNAPSHOT_APFS_MOUNTED" == "true" ]]; then
+    verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+      || die "mounted vault identity changed before pre-lock hook discovery"
     plan_discovered_hook_directory pre-lock vault \
       "$MOUNT_POINT/.vaultlock/hooks/pre-lock.d"
   else
@@ -4477,6 +4811,8 @@ plan_lock_repair() {
 plan_lock_transition() {
   require_plan_network_tools
   plan_lock_hooks
+  plan_add tm_exclude_state \
+    "Persistently exclude the protected state directory from Time Machine and verify the exclusion"
   plan_add tm_exclude \
     "Add the vault volume root to Time Machine exclusions"
   plan_add tm_delete_vault_snapshots \
@@ -4504,43 +4840,158 @@ plan_lock_transition() {
   plan_post_lock_hooks
 }
 
-build_lock_plan() {
-  local now target deadline_iso round
-
+initialize_lock_plan() {
+  local now
+  if [[ "$LOCK_DEADLINE_FROZEN" == false ]]; then
+    now=$(/bin/date +%s)
+    LOCK_REQUEST_DEADLINE_EPOCH=$(resolve_deadline \
+      "$OPTION_OPERANDS" "$now") \
+      || die "cannot resolve '$OPTION_OPERANDS' to a future deadline, see: vaultlock help"
+    LOCK_REQUEST_DEADLINE=$(/bin/date -j -r \
+      "$LOCK_REQUEST_DEADLINE_EPOCH" '+%Y-%m-%dT%H:%M:%S%z') \
+      || die "deadline is outside the supported date range"
+    LOCK_REQUEST_ROUND=$(round_for_epoch "$LOCK_REQUEST_DEADLINE_EPOCH")
+    LOCK_DEADLINE_FROZEN=true
+  fi
   require_plan_snapshot
-  now=$(/bin/date +%s)
-  target=$(resolve_deadline "$OPTION_OPERANDS" "$now") \
-    || die "cannot resolve '$OPTION_OPERANDS' to a future deadline, see: vaultlock help"
-  deadline_iso=$(/bin/date -j -r "$target" '+%Y-%m-%dT%H:%M:%S%z') \
-    || die "deadline is outside the supported date range"
-  round=$(round_for_epoch "$target")
+  require_no_lock_staging_artifacts
+
+  LOCK_SECURE_NOOP=false
+  LOCK_REPAIR_ONLY=false
+  LOCK_POST_HOOK_FAILED=false
+  LOCK_PERFORM_MOUNT_RESISTANCE=false
+  LOCK_DATA_SNAPSHOT_CLEANUP_FAILED=false
+  LOCK_KEYCHAIN_PRESENT=false
+  LOCK_KEYCHAIN_MATCH=false
+  LOCK_KEYCHAIN_DIGEST=not-inspected
+  LOCK_PASSPHRASE=""
+  LOCK_OLD_PASSPHRASE=""
+  export -n LOCK_PASSPHRASE LOCK_OLD_PASSPHRASE 2>/dev/null || true
+  capture_lock_boundary_signatures
+  preflight_keychain_target
 
   PLAN_CONTEXT_UUID=$SNAPSHOT_EXPECTED_UUID
   PLAN_CONTEXT_DEVICE=$SNAPSHOT_DEVICE
-  PLAN_CONTEXT_DEADLINE=$deadline_iso
-  PLAN_CONTEXT_DEADLINE_EPOCH=$target
-  PLAN_CONTEXT_ROUND=$round
+  PLAN_CONTEXT_DEADLINE=$LOCK_REQUEST_DEADLINE
+  PLAN_CONTEXT_DEADLINE_EPOCH=$LOCK_REQUEST_DEADLINE_EPOCH
+  PLAN_CONTEXT_ROUND=$LOCK_REQUEST_ROUND
   PLAN_TARGET_TEXT="locked at the resolved deadline"
-  PLAN_REQUEST_TEXT="Requested deadline: $deadline_iso (epoch $target)"$'\n'\
-"Resolved drand round: target $round, current $(current_round)"
+  PLAN_REQUEST_TEXT="Requested deadline: $LOCK_REQUEST_DEADLINE (epoch $LOCK_REQUEST_DEADLINE_EPOCH)"$'\n'\
+"Resolved drand round: target $LOCK_REQUEST_ROUND, current $(current_round)"
+}
 
-  if [[ "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
-    if [[ "$RUNTIME_ASSESSMENT" == "securely locked" ]]; then
-      PLAN_TARGET_TEXT="already securely locked until $SNAPSHOT_DEADLINE"
-      PLAN_REQUEST_TEXT="$PLAN_REQUEST_TEXT"$'\n'\
-"Existing locked deadline preserved: $SNAPSHOT_DEADLINE, existing drand round $SNAPSHOT_ROUND"
-      if [[ "$OPTION_HOOKS" == "false" ]]; then
-        plan_add hooks_disabled "Hooks disabled by --no-hooks"
-      fi
-      plan_add verify_secure_target \
-        "Verify the existing locked state, recovery files, and APFS postconditions"
-      return 0
-    fi
-    die "cannot build a trustworthy lock plan from assessment: $RUNTIME_ASSESSMENT"
+prepare_recorded_locked_plan() {
+  PLAN_CONTEXT_DEADLINE=$SNAPSHOT_DEADLINE
+  PLAN_CONTEXT_DEADLINE_EPOCH=$SNAPSHOT_DEADLINE_EPOCH
+  PLAN_CONTEXT_ROUND=$SNAPSHOT_ROUND
+  [[ "$SNAPSHOT_CIPHERTEXT_PRESENT" == true \
+    && "$SNAPSHOT_HASH_PRESENT" == true \
+    && -s "$STATE_DIR/passphrase.tle" ]] \
+    || die "cannot build a trustworthy lock plan: locked recovery material is incomplete"
+  read_unlock_hash >/dev/null \
+    || die "recovery hash is missing or malformed"
+  if [[ "$SNAPSHOT_PLAINTEXT_PRESENT" == true ]]; then
+    verify_local_plaintext
+    LOCK_OLD_PASSPHRASE=$UNLOCK_PASSPHRASE
+    export -n LOCK_OLD_PASSPHRASE 2>/dev/null || true
+    read_lock_keychain_snapshot "$LOCK_OLD_PASSPHRASE" \
+      || die "cannot inspect keychain recovery material"
+  else
+    read_lock_keychain_snapshot \
+      || die "cannot inspect keychain recovery material"
   fi
+}
 
+plan_recorded_locked_plaintext_repair() {
+  LOCK_REPAIR_ONLY=true
+  PLAN_TARGET_TEXT="remove retained plaintext recovery material and preserve the existing lock until $SNAPSHOT_DEADLINE"
+  PLAN_REQUEST_TEXT="$PLAN_REQUEST_TEXT"$'\n'\
+"Existing locked deadline preserved: $SNAPSHOT_DEADLINE, existing drand round $SNAPSHOT_ROUND"
+  if [[ "$OPTION_HOOKS" == "false" ]]; then
+    plan_add hooks_disabled "Hooks disabled by --no-hooks"
+  fi
+  plan_add remove_plaintext \
+    "Remove retained plaintext and keychain recovery material"
+  plan_add verify_secure_target \
+    "Verify the repaired locked state, recovery files, and APFS postconditions"
+}
+
+plan_recorded_locked_secure_state() {
+  PLAN_TARGET_TEXT="already securely locked until $SNAPSHOT_DEADLINE"
+  PLAN_REQUEST_TEXT="$PLAN_REQUEST_TEXT"$'\n'\
+"Existing locked deadline preserved: $SNAPSHOT_DEADLINE, existing drand round $SNAPSHOT_ROUND"
+  if [[ "$LOCK_KEYCHAIN_PRESENT" == true ]]; then
+    LOCK_REPAIR_ONLY=true
+    PLAN_TARGET_TEXT="remove retained keychain recovery material and preserve the existing lock until $SNAPSHOT_DEADLINE"
+    if [[ "$OPTION_HOOKS" == "false" ]]; then
+      plan_add hooks_disabled "Hooks disabled by --no-hooks"
+    fi
+    plan_add remove_plaintext \
+      "Remove retained keychain recovery material"
+    plan_add verify_secure_target \
+      "Verify the repaired locked state, recovery files, and APFS postconditions"
+    return 0
+  fi
+  LOCK_SECURE_NOOP=true
+  if [[ "$OPTION_HOOKS" == "false" ]]; then
+    plan_add hooks_disabled "Hooks disabled by --no-hooks"
+  fi
+  plan_add verify_secure_target \
+    "Verify the existing locked state, recovery files, and APFS postconditions"
+}
+
+plan_recorded_locked_apfs_repair() {
+  [[ "$SNAPSHOT_APFS_LOCKED" == false \
+    && ( "$SNAPSHOT_APFS_MOUNTED" == false \
+      || ( "$SNAPSHOT_APFS_MOUNTED" == true \
+        && "$SNAPSHOT_ACTUAL_MOUNT_POINT" == "$MOUNT_POINT" ) ) ]] \
+    || die "cannot build a trustworthy lock plan from assessment: $RUNTIME_ASSESSMENT"
+  LOCK_REPAIR_ONLY=true
+  PLAN_TARGET_TEXT="restore the existing secure lock until $SNAPSHOT_DEADLINE"
+  PLAN_REQUEST_TEXT="$PLAN_REQUEST_TEXT"$'\n'\
+"Existing locked deadline preserved: $SNAPSHOT_DEADLINE, existing drand round $SNAPSHOT_ROUND"
+  if [[ "$OPTION_HOOKS" == "false" ]]; then
+    plan_add hooks_disabled "Hooks disabled by --no-hooks"
+  fi
+  if [[ "$SNAPSHOT_APFS_MOUNTED" == true ]]; then
+    plan_add unmount_vault "Unmount the unexpectedly mounted locked vault"
+  fi
+  plan_add remove_plaintext \
+    "Remove any retained plaintext and keychain recovery material"
+  plan_add apfs_lock "Restore the APFS locked state"
+  plan_add verify_locked_postconditions \
+    "Verify the restored secure lock target"
+}
+
+plan_unlocked_lock_state() {
+  verify_local_plaintext
+  LOCK_OLD_PASSPHRASE=$UNLOCK_PASSPHRASE
+  export -n LOCK_OLD_PASSPHRASE 2>/dev/null || true
+  read_lock_keychain_snapshot "$LOCK_OLD_PASSPHRASE" \
+    || die "cannot inspect keychain recovery material"
+  [[ "$LOCK_KEYCHAIN_PRESENT" == true \
+    && "$LOCK_KEYCHAIN_MATCH" == true ]] \
+    || die "keychain recovery material does not match local plaintext"
   plan_lock_repair
   plan_lock_transition
+}
+
+build_lock_plan() {
+  initialize_lock_plan
+  if [[ "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
+    prepare_recorded_locked_plan
+    if [[ "$SNAPSHOT_APFS_LOCKED" == true \
+        && "$SNAPSHOT_APFS_MOUNTED" == false \
+        && "$SNAPSHOT_PLAINTEXT_PRESENT" == true ]]; then
+      plan_recorded_locked_plaintext_repair
+    elif [[ "$RUNTIME_ASSESSMENT" == "securely locked" ]]; then
+      plan_recorded_locked_secure_state
+    else
+      plan_recorded_locked_apfs_repair
+    fi
+    return 0
+  fi
+  plan_unlocked_lock_state
 }
 
 plan_pre_unlock_hooks() {
@@ -4691,23 +5142,6 @@ build_unlock_plan() {
   fi
 }
 
-run_dry_run_plan() { # command
-  local command=$1
-
-  inspect_runtime_state
-  classify_runtime_state
-  plan_reset
-  plan_add_coordination_start
-  case "$command" in
-    lock) build_lock_plan ;;
-    unlock) build_unlock_plan ;;
-    *) die "no dry-run planner for command: $command" ;;
-  esac
-  plan_add_coordination_finish
-  render_plan "$command"
-  printf 'Result: no changes made\n'
-}
-
 frozen_plan_field_value() { # name
   local wanted=$1 index
   for ((index=0; index<${#FROZEN_PLAN_FIELD_NAMES[@]}; index++)); do
@@ -4801,6 +5235,31 @@ verify_unlock_inputs_after_revalidation() {
       && "$UNLOCK_KEYCHAIN_MATCH" == "$expected_match" \
       && "$UNLOCK_KEYCHAIN_DIGEST" == "$expected_digest" ]] \
       || die "unlock inputs changed after plan revalidation"
+  fi
+}
+
+verify_lock_inputs_after_revalidation() {
+  local expected_present=$LOCK_KEYCHAIN_PRESENT
+  local expected_match=$LOCK_KEYCHAIN_MATCH
+  local expected_digest=$LOCK_KEYCHAIN_DIGEST plaintext
+  export -n plaintext 2>/dev/null || true
+  require_no_lock_staging_artifacts
+  lock_protected_boundaries_match \
+    || die "lock inputs changed after plan revalidation"
+  if [[ "$expected_digest" != not-inspected ]]; then
+    if [[ "$LOCK_PLAINTEXT_SIGNATURE" != absent ]]; then
+      plaintext=$(cat -- "$STATE_DIR/passphrase.txt") \
+        || die "lock inputs changed after plan revalidation"
+      read_lock_keychain_snapshot "$plaintext" \
+        || die "lock inputs changed after plan revalidation"
+    else
+      read_lock_keychain_snapshot \
+        || die "lock inputs changed after plan revalidation"
+    fi
+    [[ "$LOCK_KEYCHAIN_PRESENT" == "$expected_present" \
+      && "$LOCK_KEYCHAIN_MATCH" == "$expected_match" \
+      && "$LOCK_KEYCHAIN_DIGEST" == "$expected_digest" ]] \
+      || die "lock inputs changed after plan revalidation"
   fi
 }
 
@@ -5038,30 +5497,36 @@ verify_unlock_target() {
     || die "cannot verify matching keychain recovery material"
 }
 
-verify_planned_unlock_hook() { # index
+verify_planned_hook() { # index
   local index=$1 expected actual
   expected=$(frozen_plan_field_value "hook_signature_$index") \
-    || die "planned unlock hook signature is missing"
-  actual=$(unlock_file_signature "${PLAN_HOOK_PATHS[$index]}") \
-    || die "planned unlock hook changed before execution"
+    || die "planned hook signature is missing"
+  actual=$(hook_file_signature "${PLAN_HOOK_PATHS[$index]}") \
+    || die "planned hook changed before execution"
   [[ "$actual" == "$expected" ]] \
-    || die "planned unlock hook changed before execution"
+    || die "planned hook changed before execution"
 }
 
-execute_planned_unlock_hook() { # index
-  local index=$1 phase scope path locked status
+run_verified_planned_hook() { # index
+  local index=$1 phase scope path locked
   phase=${PLAN_HOOK_PHASES[$index]}
   scope=${PLAN_HOOK_SCOPES[$index]}
   path=${PLAN_HOOK_PATHS[$index]}
-  verify_planned_unlock_hook "$index"
+  verify_planned_hook "$index"
   locked=$(hook_locked_value "$phase")
+  run_hook_file "${phase%%-*}" "$phase" "$scope" "$path" \
+    "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+    "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
+    "$PLAN_CONTEXT_ROUND" "$locked"
+}
+
+execute_planned_unlock_hook() { # index
+  local index=$1 phase status
+  phase=${PLAN_HOOK_PHASES[$index]}
   if [[ "$phase" == post-unlock ]]; then
     verify_unlock_target
   fi
-  if run_hook_file "${phase%%-*}" "$phase" "$scope" "$path" \
-      "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
-      "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
-      "$PLAN_CONTEXT_ROUND" "$locked"; then
+  if run_verified_planned_hook "$index"; then
     return 0
   else
     status=$?
@@ -5093,8 +5558,8 @@ execute_deferred_unlock_hooks() { # index
     verify_unlock_target
     hook=${DISCOVERED_HOOK_PATHS[$hook_index]}
     hook_scope=${DISCOVERED_HOOK_SCOPES[$hook_index]}
-    hook_signature=$(unlock_file_signature "$hook") \
-      || die "discovered unlock hook must be an owned real file"
+    hook_signature=$(hook_file_signature "$hook") \
+      || die "discovered unlock hook is no longer executable and regular"
     printf 'Discovered hook %q' "$hook"
     build_hook_argv "$phase" "$hook_scope" "$PLAN_CONTEXT_UUID" \
       "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
@@ -5103,7 +5568,7 @@ execute_deferred_unlock_hooks() { # index
       printf ' %q' "$hook_argument"
     done
     printf '\n'
-    current_signature=$(unlock_file_signature "$hook") \
+    current_signature=$(hook_file_signature "$hook") \
       || die "discovered unlock hook changed before execution"
     [[ "$current_signature" == "$hook_signature" ]] \
       || die "discovered unlock hook changed before execution"
@@ -5120,50 +5585,969 @@ execute_deferred_unlock_hooks() { # index
   done
 }
 
-execute_plan() {
-  local index operation_id decrypted_recovery
+lock_crypto_marker() { # public marker
+  local marker=$1
+  if [[ -n "$LOCK_CRYPTO_MARKER_LOG" ]]; then
+    printf '%s\n' "$marker" >> "$LOCK_CRYPTO_MARKER_LOG"
+  fi
+  run_named_transition "lock_crypto_$marker" "$STATE_DIR"
+}
+
+complete_lock_crypto_operation() { # marker operation [argv...]
+  local marker=$1 operation=$2
+  shift 2
+  "$operation" "$@"
+  lock_crypto_marker "$marker"
+}
+
+require_lock_state_directory_match() { # boundary
+  local boundary=$1 current
+  current=$(lock_state_directory_signature) \
+    || die "state directory metadata changed $boundary"
+  [[ "$current" == "$LOCK_STATE_DIR_IDENTITY" ]] \
+    || die "state directory metadata changed $boundary"
+}
+
+record_lock_state_directory_entry_change() { # delta boundary
+  local delta=$1 boundary=$2 current
+  local old_device old_inode old_mode old_owner old_links
+  local new_device new_inode new_mode new_owner new_links
+  current=$(lock_state_directory_signature) \
+    || die "state directory metadata changed $boundary"
+  IFS=: read -r old_device old_inode old_mode old_owner old_links \
+    <<< "$LOCK_STATE_DIR_IDENTITY"
+  IFS=: read -r new_device new_inode new_mode new_owner new_links \
+    <<< "$current"
+  [[ "$new_device:$new_inode:$new_mode:$new_owner" \
+      == "$old_device:$old_inode:$old_mode:$old_owner" \
+    && "$new_links" -eq $((old_links + delta)) ]] \
+    || die "state directory metadata changed $boundary"
+  LOCK_STATE_DIR_IDENTITY=$current
+}
+
+require_lock_destination_match() { # path expected description
+  local path=$1 expected=$2 description=$3 current
+  require_lock_state_directory_match "before $description installation"
+  current=$(unlock_file_signature "$path" 600) \
+    || die "$description destination changed before installation"
+  [[ "$current" == "$expected" ]] \
+    || die "$description destination changed before installation"
+}
+
+create_lock_staging_file() { # template description
+  local template=$1 description=$2 path signature
+  require_lock_state_directory_match "before staging"
+  run_named_transition lock_before_stage_create "$STATE_DIR"
+  require_lock_state_directory_match "before staging"
+  begin_operation_signal_deferral
+  path=$("$MKTEMP_COMMAND" "$STATE_DIR/$template") \
+    || die "cannot create $description"
+  case "$path" in
+    "$STATE_DIR"/${template%XXXXXX}*) ;;
+    *) die "$description path is outside the protected state directory" ;;
+  esac
+  [[ "${path#"$STATE_DIR"/}" != */* ]] \
+    || die "$description path is outside the protected state directory"
+  record_lock_state_directory_entry_change 1 \
+    "while creating $description staging"
+  [[ -f "$path" && ! -L "$path" ]] \
+    || die "$description staging metadata is unsafe"
+  unlock_file_signature "$path" 600 >/dev/null \
+    || die "$description staging metadata is unsafe"
+  signature=$(lock_staging_signature "$path") \
+    || die "$description staging metadata is unsafe"
+  track_lock_staging_file "$path" "$signature" "$description staging file"
+  LOCK_CREATED_STAGE=$path
+  run_named_transition lock_after_stage_create "$path"
+  "$CHMOD_COMMAND" -N "$path" \
+    || die "cannot remove $description staging ACL"
+  "$CHMOD_COMMAND" 600 "$path" \
+    || die "cannot protect $description staging file"
+  refresh_lock_staging_signature "$path" \
+    || die "$description staging metadata changed while protecting it"
+  end_operation_signal_deferral
+}
+
+verify_lock_stage_signature() { # path expected description
+  local actual
+  actual=$(lock_staging_signature "$1") || return 1
+  [[ "$actual" == "$2" ]] || return 1
+  : "$3"
+}
+
+execute_repair_for_lock() { # operation ID
+  case "$1" in
+    repair_verify_plaintext)
+      lock_protected_boundaries_match \
+        || die "protected state changed before lock repair"
+      verify_local_plaintext
+      ;;
+    repair_unlock_apfs) execute_apfs_unlock ;;
+    repair_mount) execute_mount_expected_volume ;;
+    verify_mount_identity)
+      verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+        || die "expected vault is not mounted at $MOUNT_POINT"
+      ;;
+    *) die "unknown lock repair operation: $1" ;;
+  esac
+}
+
+execute_pre_lock_hooks() { # index
+  execute_planned_lock_hook "$1"
+}
+
+time_machine_exclusion_plist_is_active() { # plist expected_path
+  local plist=$1 expected_path=$2 excluded path
+  printf '%s' "$plist" | plutil -lint - >/dev/null 2>&1 \
+    || return 1
+  excluded=$(printf '%s' "$plist" \
+    | plutil -extract 0.IsExcluded raw -expect integer -o - - \
+      2>/dev/null) \
+    || return 1
+  path=$(printf '%s' "$plist" \
+    | plutil -extract 0.Path raw -expect string -o - - 2>/dev/null) \
+    || return 1
+  [[ "$excluded" == 1 && "$path" == "$expected_path" ]] || return 1
+  if printf '%s' "$plist" \
+      | plutil -extract 1 raw -o - - >/dev/null 2>&1; then
+    return 1
+  fi
+}
+
+verify_lock_time_machine_boundary() {
+  verify_lock_inputs_after_revalidation
+  verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+    || die "mounted vault identity changed before Time Machine preflight"
+}
+
+execute_state_time_machine_exclusion() {
+  local canonical_state_dir output
+  verify_lock_time_machine_boundary
+  canonical_state_dir=$(cd -P -- "$STATE_DIR" 2>/dev/null && pwd -P) \
+    || die "cannot canonicalize protected state directory"
+  sudo tmutil addexclusion -p "$canonical_state_dir" \
+    || die "cannot establish protected state directory Time Machine exclusion"
+  output=$(tmutil isexcluded -X "$canonical_state_dir" 2>/dev/null) \
+    || die "cannot verify protected state directory Time Machine exclusion"
+  time_machine_exclusion_plist_is_active "$output" "$canonical_state_dir" \
+    || die "protected state directory Time Machine exclusion is not active"
+}
+
+execute_vault_time_machine_exclusion() {
+  verify_lock_time_machine_boundary
+  sudo tmutil addexclusion -v "$MOUNT_POINT" \
+    || die "cannot add the vault Time Machine exclusion"
+}
+
+execute_vault_snapshot_cleanup() {
+  verify_lock_time_machine_boundary
+  sudo tmutil deletelocalsnapshots "$MOUNT_POINT" >/dev/null 2>&1 \
+    || die "cannot delete local Time Machine snapshots for the vault"
+}
+
+execute_data_snapshot_cleanup() {
+  if ! sudo tmutil deletelocalsnapshots /System/Volumes/Data \
+      >/dev/null 2>&1; then
+    LOCK_DATA_SNAPSHOT_CLEANUP_FAILED=true
+  fi
+}
+
+execute_unmount() {
+  inspect_runtime_state
+  [[ "$SNAPSHOT_VALID" == true \
+    && "$SNAPSHOT_ACTUAL_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_DEVICE" == "$PLAN_CONTEXT_DEVICE" \
+    && "$SNAPSHOT_APFS_LOCKED" == false ]] \
+    || die "lock target identity changed before unmount"
+  if [[ "$SNAPSHOT_APFS_MOUNTED" == true ]]; then
+    verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+      || die "mounted vault identity changed before unmount"
+    if ! diskutil unmount "$MOUNT_POINT"; then
+      note "vault is busy, offending processes:"
+      lsof +f -- "$MOUNT_POINT" || true
+      die "close them and rerun vaultlock lock (no crypto state was changed)"
+    fi
+  fi
+}
+
+generate_rotated_recovery_plaintext() {
+  LOCK_PASSPHRASE=$(head -c 32 /dev/urandom | base64)
+  export -n LOCK_PASSPHRASE 2>/dev/null || true
+  [[ -n "$LOCK_PASSPHRASE" ]] \
+    || die "generated recovery material is empty"
+  safe_base64_token "$LOCK_PASSPHRASE" \
+    || die "generated recovery material is not valid base64"
+}
+
+stage_rotated_recovery_plaintext() {
+  local transaction_signature fixed_signature
+  create_lock_staging_file '.passphrase-lock.XXXXXX' \
+    "rotated recovery"
+  LOCK_TRANSACTION_STAGE=$LOCK_CREATED_STAGE
+  begin_operation_signal_deferral
+  printf '%s' "$LOCK_PASSPHRASE" > "$LOCK_TRANSACTION_STAGE" \
+    || die "cannot write rotated recovery staging file"
+  run_named_transition lock_after_recovery_stage_write \
+    "$LOCK_TRANSACTION_STAGE"
+  refresh_lock_staging_signature "$LOCK_TRANSACTION_STAGE" \
+    || die "rotated recovery staging metadata changed"
+  end_operation_signal_deferral
+  run_named_transition lock_before_recovery_stage \
+    "$STATE_DIR/passphrase-new.txt"
+  [[ ! -e "$STATE_DIR/passphrase-new.txt" \
+      && ! -L "$STATE_DIR/passphrase-new.txt" ]] \
+    || die "cannot install recovery staging file without clobbering an existing path"
+  begin_operation_signal_deferral
+  "$LN_COMMAND" -- "$LOCK_TRANSACTION_STAGE" \
+    "$STATE_DIR/passphrase-new.txt" \
+    || die "cannot install recovery staging file without clobbering an existing path"
+  run_named_transition lock_after_fixed_stage_link \
+    "$STATE_DIR/passphrase-new.txt"
+  record_lock_state_directory_entry_change 1 \
+    "while installing fixed recovery staging"
+  refresh_lock_staging_signature "$LOCK_TRANSACTION_STAGE" \
+    || die "rotated recovery transaction metadata changed"
+  transaction_signature=$(lock_staging_signature "$LOCK_TRANSACTION_STAGE") \
+    || die "rotated recovery transaction metadata changed"
+  fixed_signature=$(lock_staging_signature "$STATE_DIR/passphrase-new.txt") \
+    || die "rotated recovery fixed staging metadata changed"
+  [[ "$transaction_signature" == "$fixed_signature" ]] \
+    || die "rotated recovery staging links do not share one identity"
+  track_lock_staging_file "$STATE_DIR/passphrase-new.txt" \
+    "$fixed_signature" "fixed rotated recovery"
+  LOCK_TRANSACTION_SIGNATURE=$transaction_signature
+  LOCK_FIXED_STAGE_SIGNATURE=$fixed_signature
+  end_operation_signal_deferral
+}
+
+generate_and_stage_rotated_recovery() {
+  complete_lock_crypto_operation generate-new-plaintext \
+    generate_rotated_recovery_plaintext
+  complete_lock_crypto_operation write-staged-plaintext \
+    stage_rotated_recovery_plaintext
+}
+
+verify_frozen_lock_keychain() { # boundary
+  local boundary=$1 expected_present expected_match expected_digest
+  expected_present=$(frozen_plan_field_value lock_keychain_present) \
+    || die "frozen keychain state is missing"
+  expected_match=$(frozen_plan_field_value lock_keychain_match) \
+    || die "frozen keychain match is missing"
+  expected_digest=$(frozen_plan_field_value lock_keychain_digest) \
+    || die "frozen keychain digest is missing"
+  if [[ -n "$LOCK_OLD_PASSPHRASE" ]]; then
+    read_lock_keychain_snapshot "$LOCK_OLD_PASSPHRASE" \
+      || die "keychain state changed $boundary"
+  else
+    read_lock_keychain_snapshot || die "keychain state changed $boundary"
+  fi
+  [[ "$LOCK_KEYCHAIN_PRESENT" == "$expected_present" \
+    && "$LOCK_KEYCHAIN_MATCH" == "$expected_match" \
+    && "$LOCK_KEYCHAIN_DIGEST" == "$expected_digest" ]] \
+    || die "keychain state changed $boundary"
+}
+
+verify_staged_recovery_pair() { # boundary
+  local boundary=$1 transaction_signature fixed_signature
+  require_lock_state_directory_match "$boundary"
+  transaction_signature=$(lock_staging_signature \
+    "$LOCK_TRANSACTION_STAGE") \
+    || die "staged recovery changed $boundary"
+  fixed_signature=$(lock_staging_signature \
+    "$STATE_DIR/passphrase-new.txt") \
+    || die "staged recovery changed $boundary"
+  [[ "$transaction_signature" == "$LOCK_TRANSACTION_SIGNATURE" \
+    && "$fixed_signature" == "$LOCK_FIXED_STAGE_SIGNATURE" \
+    && "$transaction_signature" == "$fixed_signature" ]] \
+    || die "staged recovery changed $boundary"
+}
+
+require_lock_rotation_boundaries_match() { # boundary
+  local boundary=$1 current
+  require_lock_state_directory_match "$boundary"
+  current=$(unlock_file_signature "$state_file" 600) \
+    || die "state file metadata changed $boundary"
+  [[ "$current" == "$LOCK_STATE_FILE_SIGNATURE" ]] \
+    || die "state file metadata changed $boundary"
+  current=$(lock_staging_signature "$STATE_DIR/passphrase.txt") \
+    || die "plaintext recovery metadata changed $boundary"
+  [[ "$current" == "$LOCK_PLAINTEXT_SIGNATURE" ]] \
+    || die "plaintext recovery metadata changed $boundary"
+  current=$(unlock_file_signature "$STATE_DIR/passphrase.tle" 600) \
+    || die "ciphertext metadata changed $boundary"
+  [[ "$current" == "$LOCK_CIPHERTEXT_SIGNATURE" ]] \
+    || die "ciphertext metadata changed $boundary"
+  current=$(unlock_file_signature "$STATE_DIR/passphrase.sha256" 600) \
+    || die "recovery hash metadata changed $boundary"
+  [[ "$current" == "$LOCK_HASH_SIGNATURE" ]] \
+    || die "recovery hash metadata changed $boundary"
+}
+
+verify_before_apfs_rotation() {
+  local old_passphrase
+  export -n old_passphrase 2>/dev/null || true
+  run_named_transition lock_before_change_passphrase \
+    "$PLAN_CONTEXT_DEVICE"
+  inspect_runtime_state
+  [[ "$SNAPSHOT_VALID" == true \
+    && "$SNAPSHOT_EXPECTED_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_ACTUAL_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_DEVICE" == "$PLAN_CONTEXT_DEVICE" \
+    && "$SNAPSHOT_APFS_MOUNTED" == false ]] \
+    || die "APFS identity or state changed before passphrase rotation"
+  require_lock_protected_boundaries_match "before passphrase rotation"
+  verify_staged_recovery_pair "before passphrase rotation"
+  verify_frozen_lock_keychain "before passphrase rotation"
+  old_passphrase=$(cat -- "$STATE_DIR/passphrase.txt") \
+    || die "cannot read existing recovery material for APFS rotation"
+  export -n old_passphrase 2>/dev/null || true
+  [[ "$old_passphrase" == "$LOCK_OLD_PASSPHRASE" ]] \
+    || die "plaintext recovery changed before APFS rotation"
+}
+
+change_apfs_recovery_passphrase() {
+  LOCK_APFS_ROTATION_ATTEMPTED=true
+  if ! { printf '%s\n' "$LOCK_OLD_PASSPHRASE"; \
+      printf '%s\n' "$LOCK_PASSPHRASE"; } \
+      | sudo diskutil apfs changePassphrase "$PLAN_CONTEXT_DEVICE" \
+        -user disk -oldStdinpassphrase -newStdinpassphrase \
+        >/dev/null 2>&1; then
+    die "APFS passphrase rotation failed, staged recovery retained"
+  fi
+  LOCK_APFS_ROTATED=true
+}
+
+install_rotated_plaintext() {
+  local transaction_signature
+  run_named_transition lock_before_plaintext_install \
+    "$STATE_DIR/passphrase.txt"
+  require_lock_protected_boundaries_match \
+    "before rotated plaintext installation"
+  verify_staged_recovery_pair "before rotated plaintext installation"
+  require_lock_destination_match "$STATE_DIR/passphrase.txt" \
+    "$LOCK_PLAINTEXT_SIGNATURE" "plaintext"
+  verify_lock_stage_signature "$STATE_DIR/passphrase-new.txt" \
+    "$LOCK_FIXED_STAGE_SIGNATURE" "fixed rotated recovery" \
+    || die "fixed rotated recovery changed before installation"
+  "$MV_COMMAND" -f -- "$STATE_DIR/passphrase-new.txt" \
+    "$STATE_DIR/passphrase.txt" \
+    || die "cannot install rotated plaintext recovery"
+  record_lock_state_directory_entry_change -1 \
+    "while installing rotated plaintext"
+  [[ ! -e "$STATE_DIR/passphrase-new.txt" \
+      && ! -L "$STATE_DIR/passphrase-new.txt" ]] \
+    || die "fixed rotated recovery remains after installation"
+  clear_lock_staging_file "$STATE_DIR/passphrase-new.txt"
+  refresh_lock_staging_signature "$LOCK_TRANSACTION_STAGE" \
+    || die "rotated recovery transaction changed after installation"
+  LOCK_TRANSACTION_SIGNATURE=$(lock_staging_signature \
+    "$LOCK_TRANSACTION_STAGE") \
+    || die "rotated recovery transaction changed after installation"
+  LOCK_PLAINTEXT_SIGNATURE=$(lock_staging_signature \
+    "$STATE_DIR/passphrase.txt") \
+    || die "installed rotated plaintext metadata is unsafe"
+}
+
+update_rotated_keychain() {
+  run_named_transition lock_before_keychain_update "$KEYCHAIN_SERVICE"
+  require_lock_rotation_boundaries_match "before keychain recovery update"
+  verify_frozen_lock_keychain "before recovery update"
+  keychain_store_passphrase "$LOCK_PASSPHRASE" \
+    || die "keychain recovery update failed"
+  read_lock_keychain_snapshot "$LOCK_PASSPHRASE" \
+    || die "cannot verify keychain recovery update"
+  [[ "$LOCK_KEYCHAIN_PRESENT" == true && "$LOCK_KEYCHAIN_MATCH" == true ]] \
+    || die "cannot verify keychain recovery update"
+}
+
+rotate_and_install_recovery() {
+  verify_before_apfs_rotation
+  complete_lock_crypto_operation change-apfs-passphrase \
+    change_apfs_recovery_passphrase
+  complete_lock_crypto_operation install-rotated-plaintext \
+    install_rotated_plaintext
+  complete_lock_crypto_operation update-keychain update_rotated_keychain
+}
+
+encrypt_and_install_lock_ciphertext() {
+  local tle stage stage_signature install_delta=0
+  tle=$(tle_bin) || die "tle not found"
+  create_lock_staging_file '.tle-lock.XXXXXX' "TLE ciphertext"
+  stage=$LOCK_CREATED_STAGE
+  if ! printf '%s\n' "$LOCK_PASSPHRASE" \
+      | "$tle" -e -n "$DRAND_URL" -c "$QUICKNET_CHAIN" \
+        -r "$PLAN_CONTEXT_ROUND" -o "$stage" >/dev/null 2>&1; then
+    die "TLE encryption failed"
+  fi
+  refresh_lock_staging_signature "$stage" \
+    || die "TLE ciphertext staging metadata changed"
+  stage_signature=$(lock_staging_signature "$stage") \
+    || die "TLE ciphertext staging metadata changed"
+  run_named_transition lock_before_ciphertext_install \
+    "$STATE_DIR/passphrase.tle"
+  require_lock_rotation_boundaries_match \
+    "before ciphertext installation"
+  verify_lock_stage_signature "$stage" "$stage_signature" \
+    "TLE ciphertext" \
+    || die "TLE ciphertext staging changed before installation"
+  require_lock_destination_match "$STATE_DIR/passphrase.tle" \
+    "$LOCK_CIPHERTEXT_SIGNATURE" "ciphertext"
+  [[ "$LOCK_CIPHERTEXT_SIGNATURE" == absent ]] || install_delta=-1
+  "$MV_COMMAND" -f -- "$stage" "$STATE_DIR/passphrase.tle" \
+    || die "cannot install TLE ciphertext"
+  record_lock_state_directory_entry_change "$install_delta" \
+    "while installing ciphertext"
+  clear_lock_staging_file "$stage"
+  LOCK_CIPHERTEXT_SIGNATURE=$(unlock_file_signature \
+    "$STATE_DIR/passphrase.tle" 600) \
+    || die "installed TLE ciphertext metadata is unsafe"
+}
+
+verify_lock_ciphertext_nonempty() {
+  [[ -s "$STATE_DIR/passphrase.tle" ]] \
+    || die "empty ciphertext, NOT locking"
+}
+
+verify_lock_ciphertext_not_early() {
+  local tle status
+  tle=$(tle_bin) || die "tle not found"
+  export -n LOCK_TLE_VERIFY_ERROR 2>/dev/null || true
+  if LOCK_TLE_VERIFY_ERROR=$("$tle" -d -n "$DRAND_URL" \
+      -c "$QUICKNET_CHAIN" \
+      "$STATE_DIR/passphrase.tle" 2>&1); then
+    die "ciphertext decrypts right now (past round?), NOT locking"
+  else
+    status=$?
+  fi
+  : "$status"
+  export -n LOCK_TLE_VERIFY_ERROR 2>/dev/null || true
+}
+
+verify_expected_lock_ciphertext_error() {
+  grep -qiE "$EARLY_RE" <<< "$LOCK_TLE_VERIFY_ERROR" \
+    || die "unexpected TLE verification failure, NOT locking"
+  LOCK_TLE_VERIFY_ERROR=""
+  export -n LOCK_TLE_VERIFY_ERROR 2>/dev/null || true
+}
+
+encrypt_and_verify_lock_ciphertext() {
+  complete_lock_crypto_operation create-tle-ciphertext \
+    encrypt_and_install_lock_ciphertext
+  complete_lock_crypto_operation verify-ciphertext-nonempty \
+    verify_lock_ciphertext_nonempty
+  complete_lock_crypto_operation verify-ciphertext-not-early \
+    verify_lock_ciphertext_not_early
+  complete_lock_crypto_operation verify-expected-early-error \
+    verify_expected_lock_ciphertext_error
+}
+
+install_lock_recovery_hash() {
+  local stage stage_signature
+  local install_delta=0
+  create_lock_staging_file '.hash-lock.XXXXXX' "recovery hash"
+  stage=$LOCK_CREATED_STAGE
+  sha256_of "$LOCK_PASSPHRASE" > "$stage" \
+    || die "cannot write recovery hash staging file"
+  refresh_lock_staging_signature "$stage" \
+    || die "recovery hash staging metadata changed"
+  stage_signature=$(lock_staging_signature "$stage") \
+    || die "recovery hash staging metadata changed"
+  run_named_transition lock_before_hash_install \
+    "$STATE_DIR/passphrase.sha256"
+  require_lock_rotation_boundaries_match \
+    "before recovery hash installation"
+  verify_lock_stage_signature "$stage" "$stage_signature" "recovery hash" \
+    || die "recovery hash staging changed before installation"
+  require_lock_destination_match "$STATE_DIR/passphrase.sha256" \
+    "$LOCK_HASH_SIGNATURE" "recovery hash"
+  [[ "$LOCK_HASH_SIGNATURE" == absent ]] || install_delta=-1
+  "$MV_COMMAND" -f -- "$stage" "$STATE_DIR/passphrase.sha256" \
+    || die "cannot install recovery hash"
+  record_lock_state_directory_entry_change "$install_delta" \
+    "while installing recovery hash"
+  clear_lock_staging_file "$stage"
+  LOCK_HASH_SIGNATURE=$(unlock_file_signature \
+    "$STATE_DIR/passphrase.sha256" 600) \
+    || die "installed recovery hash metadata is unsafe"
+}
+
+write_locked_json_stage() {
+  local stage
+  create_lock_staging_file '.state-lock.XXXXXX' "locked JSON state"
+  stage=$LOCK_CREATED_STAGE
+  jq --arg d "$PLAN_CONTEXT_DEADLINE" \
+    --argjson e "$PLAN_CONTEXT_DEADLINE_EPOCH" \
+    --argjson r "$PLAN_CONTEXT_ROUND" \
+    '.locked = true | .deadline = $d | .deadline_epoch = $e | .round = $r' \
+    "$state_file" > "$stage" \
+    || die "cannot build locked JSON state"
+  refresh_lock_staging_signature "$stage" \
+    || die "locked JSON staging metadata changed"
+  LOCK_JSON_STAGE_SIGNATURE=$(lock_staging_signature "$stage") \
+    || die "locked JSON staging metadata changed"
+  LOCK_JSON_STAGE=$stage
+}
+
+install_locked_json_state() {
+  local state_signature install_delta=0
+  run_named_transition lock_before_state_install "$state_file"
+  require_lock_rotation_boundaries_match \
+    "before locked state installation"
+  verify_lock_stage_signature "$LOCK_JSON_STAGE" \
+    "$LOCK_JSON_STAGE_SIGNATURE" \
+    "locked JSON state" \
+    || die "locked JSON staging changed before installation"
+  require_lock_destination_match "$state_file" \
+    "$LOCK_STATE_FILE_SIGNATURE" "state"
+  install_delta=0
+  [[ "$LOCK_STATE_FILE_SIGNATURE" == absent ]] || install_delta=-1
+  "$MV_COMMAND" -f -- "$LOCK_JSON_STAGE" "$state_file" \
+    || die "cannot install locked JSON state"
+  record_lock_state_directory_entry_change "$install_delta" \
+    "while installing locked state"
+  clear_lock_staging_file "$LOCK_JSON_STAGE"
+  LOCK_JSON_STAGE=""
+  LOCK_JSON_STAGE_SIGNATURE=""
+  state_signature=$(unlock_file_signature "$state_file" 600) \
+    || die "installed locked JSON metadata is unsafe"
+  LOCK_STATE_FILE_SIGNATURE=$state_signature
+}
+
+commit_lock_recovery_transaction() {
+  local transaction_signature
+  transaction_signature=$(lock_staging_signature "$LOCK_TRANSACTION_STAGE") \
+    || die "rotated recovery transaction changed before commit"
+  [[ "$transaction_signature" == "$LOCK_TRANSACTION_SIGNATURE" ]] \
+    || die "rotated recovery transaction changed before commit"
+  "$RM_COMMAND" -f -- "$LOCK_TRANSACTION_STAGE" \
+    || die "cannot remove committed recovery transaction staging file"
+  record_lock_state_directory_entry_change -1 \
+    "while removing committed recovery transaction staging"
+  clear_lock_staging_file "$LOCK_TRANSACTION_STAGE"
+  LOCK_TRANSACTION_STAGE=""
+  LOCK_APFS_ROTATED=false
+  LOCK_APFS_ROTATION_ATTEMPTED=false
+  LOCK_PLAINTEXT_SIGNATURE=$(unlock_file_signature \
+    "$STATE_DIR/passphrase.txt" 600) \
+    || die "committed rotated plaintext metadata is unsafe"
+}
+
+install_and_commit_locked_json() {
+  install_locked_json_state
+  commit_lock_recovery_transaction
+}
+
+persist_locked_recovery_state() {
+  complete_lock_crypto_operation write-plaintext-hash \
+    install_lock_recovery_hash
+  complete_lock_crypto_operation write-locked-json write_locked_json_stage
+  complete_lock_crypto_operation install-locked-json \
+    install_and_commit_locked_json
+}
+
+execute_rotate_and_encrypt() {
+  generate_and_stage_rotated_recovery
+  rotate_and_install_recovery
+  encrypt_and_verify_lock_ciphertext
+  persist_locked_recovery_state
+}
+
+remove_verified_lock_plaintext() {
+  local current
+  [[ -e "$STATE_DIR/passphrase.txt" \
+      || -L "$STATE_DIR/passphrase.txt" ]] || return 0
+  current=$(unlock_file_signature "$STATE_DIR/passphrase.txt" 600) \
+    || die "plaintext recovery changed before removal"
+  [[ "$current" == "$LOCK_PLAINTEXT_SIGNATURE" ]] \
+    || die "plaintext recovery changed before removal"
+  run_named_transition lock_before_plaintext_remove \
+    "$STATE_DIR/passphrase.txt"
+  if [[ "$LOCK_REPAIR_ONLY" == true ]]; then
+    verify_lock_repair_deletion_boundary true
+  else
+    verify_lock_deletion_boundary true
+  fi
+  current=$(unlock_file_signature "$STATE_DIR/passphrase.txt" 600) \
+    || die "plaintext recovery changed before removal"
+  [[ "$current" == "$LOCK_PLAINTEXT_SIGNATURE" ]] \
+    || die "plaintext recovery changed before removal"
+  "$RM_COMMAND" -f -- "$STATE_DIR/passphrase.txt" \
+    || die "cannot verify removal of plaintext recovery material"
+  [[ ! -e "$STATE_DIR/passphrase.txt" \
+      && ! -L "$STATE_DIR/passphrase.txt" ]] \
+    || die "cannot verify removal of plaintext recovery material"
+  record_lock_state_directory_entry_change -1 \
+    "while removing plaintext recovery material"
+  LOCK_PLAINTEXT_SIGNATURE=absent
+}
+
+verify_lock_repair_deletion_boundary() { # plaintext_expected
+  local plaintext_expected=$1
+  inspect_runtime_state
+  [[ "$SNAPSHOT_VALID" == true \
+    && "$SNAPSHOT_EXPECTED_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_ACTUAL_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_DEVICE" == "$PLAN_CONTEXT_DEVICE" \
+    && "$SNAPSHOT_APFS_MOUNTED" == false \
+    && "$SNAPSHOT_RECORDED_LOCKED" == true \
+    && "$SNAPSHOT_DEADLINE" == "$PLAN_CONTEXT_DEADLINE" \
+    && "$SNAPSHOT_DEADLINE_EPOCH" == "$PLAN_CONTEXT_DEADLINE_EPOCH" \
+    && "$SNAPSHOT_ROUND" == "$PLAN_CONTEXT_ROUND" \
+    && "$SNAPSHOT_PLAINTEXT_PRESENT" == "$plaintext_expected" \
+    && "$SNAPSHOT_CIPHERTEXT_PRESENT" == true \
+    && "$SNAPSHOT_HASH_PRESENT" == true \
+    && -s "$STATE_DIR/passphrase.tle" ]] \
+    || die "protected recovery state changed before repair removal"
+  lock_protected_boundaries_match \
+    || die "protected recovery state changed before repair removal"
+  if [[ "$plaintext_expected" == true ]]; then
+    verify_local_plaintext
+  fi
+  verify_frozen_lock_keychain "before repair removal"
+}
+
+verify_lock_deletion_boundary() { # plaintext_expected
+  local plaintext_expected=$1 wanted actual
+  inspect_runtime_state
+  [[ "$SNAPSHOT_VALID" == true \
+    && "$SNAPSHOT_EXPECTED_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_ACTUAL_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_DEVICE" == "$PLAN_CONTEXT_DEVICE" \
+    && "$SNAPSHOT_APFS_MOUNTED" == false \
+    && "$SNAPSHOT_RECORDED_LOCKED" == true \
+    && "$SNAPSHOT_DEADLINE" == "$PLAN_CONTEXT_DEADLINE" \
+    && "$SNAPSHOT_DEADLINE_EPOCH" == "$PLAN_CONTEXT_DEADLINE_EPOCH" \
+    && "$SNAPSHOT_ROUND" == "$PLAN_CONTEXT_ROUND" \
+    && "$SNAPSHOT_PLAINTEXT_PRESENT" == "$plaintext_expected" \
+    && "$SNAPSHOT_CIPHERTEXT_PRESENT" == true \
+    && "$SNAPSHOT_HASH_PRESENT" == true \
+    && -s "$STATE_DIR/passphrase.tle" ]] \
+    || die "protected recovery state changed before plaintext removal"
+  lock_protected_boundaries_match \
+    || die "protected recovery state changed before plaintext removal"
+  wanted=$(read_unlock_hash) \
+    || die "protected recovery hash changed before plaintext removal"
+  actual=$(sha256_of "$LOCK_PASSPHRASE") \
+    || die "cannot verify recovery hash before plaintext removal"
+  [[ "$wanted" == "$actual" ]] \
+    || die "protected recovery hash changed before plaintext removal"
+  read_lock_keychain_snapshot "$LOCK_PASSPHRASE" \
+    || die "keychain state changed before plaintext removal"
+  [[ "$LOCK_KEYCHAIN_PRESENT" == true \
+    && "$LOCK_KEYCHAIN_MATCH" == true ]] \
+    || die "keychain state changed before plaintext removal"
+}
+
+delete_and_verify_lock_keychain() {
+  local value status
+  export -n value 2>/dev/null || true
+  security delete-generic-password -a "$USER" \
+    -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
+  if value=$(security find-generic-password -a "$USER" \
+      -s "$KEYCHAIN_SERVICE" -w 2>/dev/null); then
+    value=""
+    export -n value 2>/dev/null || true
+    die "cannot verify removal of keychain recovery material"
+  else
+    status=$?
+  fi
+  [[ "$status" -eq 44 ]] \
+    || die "cannot verify removal of keychain recovery material"
+  LOCK_KEYCHAIN_PRESENT=false
+  LOCK_KEYCHAIN_MATCH=false
+  LOCK_KEYCHAIN_DIGEST=absent
+}
+
+execute_remove_plaintext() {
+  complete_lock_crypto_operation remove-plaintext \
+    remove_verified_lock_plaintext
+  if [[ "$LOCK_REPAIR_ONLY" == true ]]; then
+    run_named_transition lock_before_repair_keychain_remove \
+      "$KEYCHAIN_SERVICE"
+    verify_lock_repair_deletion_boundary false
+  else
+    verify_lock_deletion_boundary false
+  fi
+  complete_lock_crypto_operation remove-keychain-plaintext \
+    delete_and_verify_lock_keychain
+}
+
+lock_apfs_volume() {
+  local lock_output status
+  run_named_transition lock_before_apfs_lock "$PLAN_CONTEXT_DEVICE"
+  inspect_runtime_state
+  [[ "$SNAPSHOT_VALID" == true \
+    && "$SNAPSHOT_EXPECTED_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_ACTUAL_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_DEVICE" == "$PLAN_CONTEXT_DEVICE" \
+    && "$SNAPSHOT_APFS_MOUNTED" == false \
+    && "$SNAPSHOT_RECORDED_LOCKED" == true \
+    && "$SNAPSHOT_DEADLINE" == "$PLAN_CONTEXT_DEADLINE" \
+    && "$SNAPSHOT_DEADLINE_EPOCH" == "$PLAN_CONTEXT_DEADLINE_EPOCH" \
+    && "$SNAPSHOT_ROUND" == "$PLAN_CONTEXT_ROUND" \
+    && "$SNAPSHOT_PLAINTEXT_PRESENT" == false \
+    && "$SNAPSHOT_CIPHERTEXT_PRESENT" == true \
+    && "$SNAPSHOT_HASH_PRESENT" == true ]] \
+    || die "APFS identity or state changed before lockVolume"
+  lock_protected_boundaries_match \
+    || die "protected locked state changed before lockVolume"
+  read_lock_keychain_snapshot \
+    || die "keychain state changed before lockVolume"
+  [[ "$LOCK_KEYCHAIN_PRESENT" == false ]] \
+    || die "keychain state changed before lockVolume"
+  if lock_output=$(sudo diskutil apfs lockVolume \
+      "$PLAN_CONTEXT_DEVICE" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "$status" -ne 0 ]] \
+      && ! grep -qi 'already locked' <<< "$lock_output"; then
+    die "APFS lock failed after recovery material removal, target security is unverified"
+  fi
+  [[ -z "$lock_output" ]] || note "$lock_output"
+}
+
+execute_apfs_lock() {
+  complete_lock_crypto_operation lock-apfs lock_apfs_volume
+}
+
+verify_lock_filevault() {
+  local filevault_output
+  filevault_output=$(diskutil info "$PLAN_CONTEXT_DEVICE") \
+    || die "lock target verification failed: cannot inspect FileVault"
+  grep -q 'FileVault:.*Yes' <<< "$filevault_output" \
+    || die "lock target verification failed: volume does not report FileVault"
+}
+
+verify_lock_mount_resistance() {
+  if diskutil mount "$PLAN_CONTEXT_DEVICE" >/dev/null 2>&1; then
+    die "lock target verification failed: volume mounted without a passphrase"
+  fi
+}
+
+verify_lock_target() {
+  require_no_lock_staging_artifacts
+  inspect_runtime_state
+  [[ "$SNAPSHOT_VALID" == true \
+    && "$SNAPSHOT_RECORDED_LOCKED" == true \
+    && "$SNAPSHOT_APFS_LOCKED" == true \
+    && "$SNAPSHOT_APFS_MOUNTED" == false \
+    && "$SNAPSHOT_EXPECTED_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_ACTUAL_UUID" == "$PLAN_CONTEXT_UUID" \
+    && "$SNAPSHOT_DEVICE" == "$PLAN_CONTEXT_DEVICE" \
+    && "$SNAPSHOT_DEADLINE" == "$PLAN_CONTEXT_DEADLINE" \
+    && "$SNAPSHOT_DEADLINE_EPOCH" == "$PLAN_CONTEXT_DEADLINE_EPOCH" \
+    && "$SNAPSHOT_ROUND" == "$PLAN_CONTEXT_ROUND" \
+    && "$SNAPSHOT_PLAINTEXT_PRESENT" == false \
+    && "$SNAPSHOT_CIPHERTEXT_PRESENT" == true \
+    && "$SNAPSHOT_HASH_PRESENT" == true ]] \
+    || die "lock target verification failed: recorded and APFS state is not securely locked"
+  lock_protected_boundaries_match \
+    || die "lock target verification failed: protected recovery state changed"
+  unlock_file_signature "$state_file" 600 >/dev/null \
+    || die "lock target verification failed: locked JSON metadata is unsafe"
+  unlock_file_signature "$STATE_DIR/passphrase.tle" 600 >/dev/null \
+    || die "lock target verification failed: ciphertext metadata is unsafe"
+  unlock_file_signature "$STATE_DIR/passphrase.sha256" 600 >/dev/null \
+    || die "lock target verification failed: recovery hash metadata is unsafe"
+  read_unlock_hash >/dev/null \
+    || die "lock target verification failed: recovery hash is malformed"
+  read_lock_keychain_snapshot \
+    || die "lock target verification failed: cannot inspect keychain"
+  [[ "$LOCK_KEYCHAIN_PRESENT" == false ]] \
+    || die "lock target verification failed: keychain plaintext remains"
+  if [[ "$LOCK_PERFORM_MOUNT_RESISTANCE" == true ]]; then
+    complete_lock_crypto_operation verify-filevault verify_lock_filevault
+    complete_lock_crypto_operation verify-mount-resistance \
+      verify_lock_mount_resistance
+    LOCK_PERFORM_MOUNT_RESISTANCE=false
+  else
+    verify_lock_filevault
+  fi
+}
+
+execute_post_lock_hooks() { # index
+  execute_planned_lock_hook "$1"
+}
+
+execute_planned_lock_hook() { # index
+  local index=$1 phase status
+  phase=${PLAN_HOOK_PHASES[$index]}
+  if [[ "$phase" == pre-lock ]]; then
+    verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+      || die "mounted vault identity changed before pre-lock hook"
+  fi
+  if [[ "$phase" == post-lock ]]; then
+    verify_lock_target
+  fi
+  if run_verified_planned_hook "$index"; then
+    return 0
+  else
+    status=$?
+  fi
+  if [[ "$phase" == pre-lock ]]; then
+    die "pre-lock hooks failed, vault remains unlocked"
+  fi
+  : "$status"
+  LOCK_POST_HOOK_FAILED=true
+  return 0
+}
+
+execute_deferred_lock_hooks() { # index
+  local index=$1 phase scope directory hook hook_scope hook_index locked status
+  local hook_signature current_signature
+  phase=${PLAN_HOOK_PHASES[$index]}
+  scope=${PLAN_HOOK_SCOPES[$index]}
+  directory=${PLAN_HOOK_DIRECTORIES[$index]}
+  [[ "$phase" == pre-lock ]] \
+    || die "unsupported deferred lock hook phase: $phase"
+  verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+    || die "mounted vault identity changed before deferred pre-lock hooks"
+  discover_hooks_reset
+  discover_hook_directory "$directory" "$scope"
+  locked=$(hook_locked_value "$phase")
+  for ((hook_index=0; hook_index<${#DISCOVERED_HOOK_PATHS[@]}; \
+      hook_index++)); do
+    verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+      || die "mounted vault identity changed before deferred pre-lock hook"
+    hook=${DISCOVERED_HOOK_PATHS[$hook_index]}
+    hook_scope=${DISCOVERED_HOOK_SCOPES[$hook_index]}
+    hook_signature=$(hook_file_signature "$hook") \
+      || die "discovered pre-lock hook is no longer executable and regular"
+    printf 'Discovered hook %q' "$hook"
+    build_hook_argv "$phase" "$hook_scope" "$PLAN_CONTEXT_UUID" \
+      "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
+      "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
+    printf ' %q' "${HOOK_ARGV[@]}"
+    printf '\n'
+    run_named_transition lock_before_deferred_hook "$hook"
+    current_signature=$(hook_file_signature "$hook") \
+      || die "discovered pre-lock hook changed before execution"
+    [[ "$current_signature" == "$hook_signature" ]] \
+      || die "discovered pre-lock hook changed before execution"
+    if run_hook_file pre "$phase" "$hook_scope" "$hook" \
+        "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+        "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
+        "$PLAN_CONTEXT_ROUND" "$locked"; then
+      continue
+    else
+      status=$?
+    fi
+    : "$status"
+    die "pre-lock hooks failed, vault remains unlocked"
+  done
+}
+
+execute_init_plan_operation() { # operation_id
+  case "$1" in
+    init_prepare_state) execute_init_prepare_state ;;
+    init_create_volume) execute_init_create_volume ;;
+    init_write_state) execute_init_write_state ;;
+    *) die "no init executor for plan operation: $1" ;;
+  esac
+}
+
+execute_adopt_plan_operation() { # operation_id
+  case "$1" in
+    adopt_copy) execute_adopt_copy ;;
+    adopt_verify) execute_adopt_verify ;;
+    adopt_replace_source) execute_adopt_replace_source ;;
+    *) die "no adopt executor for plan operation: $1" ;;
+  esac
+}
+
+execute_unlock_plan_operation() { # index operation_id
+  local index=$1 operation_id=$2 decrypted_recovery
   export -n decrypted_recovery 2>/dev/null || true
+  case "$operation_id" in
+    repair_verify_plaintext)
+      verify_unlock_recovery_boundaries
+      verify_local_plaintext
+      ;;
+    repair_unlock_apfs|apfs_unlock) execute_apfs_unlock ;;
+    repair_mount) execute_mount_expected_volume ;;
+    verify_mount_identity)
+      verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
+        || die "expected vault is not mounted at $MOUNT_POINT"
+      ;;
+    tle_decrypt) execute_tle_recovery ;;
+    verify_decrypted_hash)
+      [[ "$UNLOCK_DECRYPTED_VERIFIED" == true ]] \
+        || die "decrypted recovery material is not verified"
+      if [[ "$SNAPSHOT_PLAINTEXT_PRESENT" == true ]]; then
+        decrypted_recovery=$UNLOCK_PASSPHRASE
+        verify_local_plaintext
+        [[ "$UNLOCK_PASSPHRASE" == "$decrypted_recovery" ]] \
+          || die "retained plaintext does not match decrypted recovery material"
+        UNLOCK_PASSPHRASE=$decrypted_recovery
+        UNLOCK_PASSPHRASE_SOURCE=tle
+      fi
+      ;;
+    persist_plaintext) execute_restore_plaintext ;;
+    keychain_update) execute_unlock_keychain_update ;;
+    persist_unlocked_state) execute_persist_unlocked_state ;;
+    verify_unlocked_target) verify_unlock_target ;;
+    hook) execute_planned_unlock_hook "$index" ;;
+    deferred_hook_discovery) execute_deferred_unlock_hooks "$index" ;;
+    *) die "no unlock executor for plan operation: $operation_id" ;;
+  esac
+}
+
+execute_lock_plan_operation() { # index operation_id
+  local index=$1 operation_id=$2
+  case "$operation_id" in
+    repair_verify_plaintext|repair_unlock_apfs|repair_mount|\
+verify_mount_identity)
+      execute_repair_for_lock "$operation_id"
+      ;;
+    hook)
+      case "${PLAN_HOOK_PHASES[$index]}" in
+        pre-lock) execute_pre_lock_hooks "$index" ;;
+        post-lock)
+          [[ "$LOCK_DATA_SNAPSHOT_CLEANUP_FAILED" == true ]] \
+            || execute_post_lock_hooks "$index"
+          ;;
+        *) die "unsupported lock hook phase" ;;
+      esac
+      ;;
+    deferred_hook_discovery) execute_deferred_lock_hooks "$index" ;;
+      tm_exclude_state) execute_state_time_machine_exclusion ;;
+      tm_exclude) execute_vault_time_machine_exclusion ;;
+      tm_delete_vault_snapshots) execute_vault_snapshot_cleanup ;;
+      unmount_vault) execute_unmount ;;
+      stage_recovery) execute_rotate_and_encrypt ;;
+      rotate_apfs_recovery|keychain_update|tle_encrypt|tle_verify_future|\
+persist_locked_recovery) ;;
+      remove_plaintext) execute_remove_plaintext ;;
+      tm_delete_data_snapshots) execute_data_snapshot_cleanup ;;
+      apfs_lock) execute_apfs_lock ;;
+      verify_locked_postconditions)
+        LOCK_PERFORM_MOUNT_RESISTANCE=true
+        verify_lock_target
+        ;;
+      verify_secure_target)
+        LOCK_PERFORM_MOUNT_RESISTANCE=true
+        verify_lock_target
+        ;;
+      *) die "no lock executor for plan operation: $operation_id" ;;
+  esac
+}
+
+execute_plan() {
+  local index operation_id
   for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
     operation_id=${PLAN_OPERATION_IDS[$index]}
     case "$operation_id" in
-      init_prepare_state) execute_init_prepare_state ;;
-      init_create_volume) execute_init_create_volume ;;
-      init_write_state) execute_init_write_state ;;
-      adopt_copy) execute_adopt_copy ;;
-      adopt_verify) execute_adopt_verify ;;
-      adopt_replace_source) execute_adopt_replace_source ;;
-      repair_verify_plaintext)
-        verify_unlock_recovery_boundaries
-        verify_local_plaintext
-        ;;
-      repair_unlock_apfs|apfs_unlock) execute_apfs_unlock ;;
-      repair_mount) execute_mount_expected_volume ;;
-      verify_mount_identity)
-        verify_mount_identity "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
-          || die "expected vault is not mounted at $MOUNT_POINT"
-        ;;
-      tle_decrypt) execute_tle_recovery ;;
-      verify_decrypted_hash)
-        [[ "$UNLOCK_DECRYPTED_VERIFIED" == true ]] \
-          || die "decrypted recovery material is not verified"
-        if [[ "$SNAPSHOT_PLAINTEXT_PRESENT" == true ]]; then
-          decrypted_recovery=$UNLOCK_PASSPHRASE
-          verify_local_plaintext
-          [[ "$UNLOCK_PASSPHRASE" == "$decrypted_recovery" ]] \
-            || die "retained plaintext does not match decrypted recovery material"
-          UNLOCK_PASSPHRASE=$decrypted_recovery
-          UNLOCK_PASSPHRASE_SOURCE=tle
-        fi
-        ;;
-      persist_plaintext) execute_restore_plaintext ;;
-      keychain_update) execute_unlock_keychain_update ;;
-      persist_unlocked_state) execute_persist_unlocked_state ;;
-      verify_unlocked_target) verify_unlock_target ;;
-      hook) execute_planned_unlock_hook "$index" ;;
-      deferred_hook_discovery) execute_deferred_unlock_hooks "$index" ;;
-      hooks_disabled) ;;
-      operation_lock_acquire|operation_lock_quarantine|operation_lock_release) ;;
-      *) die "no executor for plan operation: $operation_id" ;;
+      hooks_disabled|operation_lock_acquire|operation_lock_quarantine|\
+operation_lock_release) continue ;;
+    esac
+    case "$OPERATION_LOCK_COMMAND" in
+      init) execute_init_plan_operation "$operation_id" ;;
+      adopt) execute_adopt_plan_operation "$operation_id" ;;
+      unlock) execute_unlock_plan_operation "$index" "$operation_id" ;;
+      lock) execute_lock_plan_operation "$index" "$operation_id" ;;
+      *) die "no executor for planned command: $OPERATION_LOCK_COMMAND" ;;
     esac
   done
 }
@@ -5193,6 +6577,14 @@ run_planned_command() { # command
       build_unlock_plan
       plan_add_coordination_finish
       ;;
+    lock)
+      inspect_runtime_state
+      classify_runtime_state
+      plan_reset
+      plan_add_coordination_start
+      build_lock_plan
+      plan_add_coordination_finish
+      ;;
     *) die "no planned command runner for: $command" ;;
   esac
   freeze_planned_command_snapshot "$command"
@@ -5207,6 +6599,9 @@ run_planned_command() { # command
   if [[ "$command" == unlock ]]; then
     run_named_transition unlock_before_execution "$state_file"
     verify_unlock_inputs_after_revalidation
+  elif [[ "$command" == lock ]]; then
+    run_named_transition lock_before_execution "$state_file"
+    verify_lock_inputs_after_revalidation
   fi
   execute_plan
   case "$command" in
@@ -5218,8 +6613,16 @@ run_planned_command() { # command
         die "vault is unlocked and mounted at $MOUNT_POINT, but one or more post-unlock hooks failed"
       fi
       ;;
+    lock) verify_lock_target ;;
   esac
   finish_operation_lock
+  if [[ "$command" == lock \
+      && "$LOCK_DATA_SNAPSHOT_CLEANUP_FAILED" == true ]]; then
+    die "cannot delete local Time Machine snapshots for the data volume"
+  fi
+  if [[ "$command" == lock && "$LOCK_POST_HOOK_FAILED" == true ]]; then
+    die "vault is locked until $PLAN_CONTEXT_DEADLINE, but one or more post-lock hooks failed"
+  fi
   case "$command" in
     init)
       note "Result: created encrypted volume $VOLUME ($PLAN_CONTEXT_UUID), state in $STATE_DIR"
@@ -5230,6 +6633,9 @@ run_planned_command() { # command
     unlock)
       note "Result: unlocked and mounted at $MOUNT_POINT"
       note "next: cd ~/your-project && ./run.sh"
+      ;;
+    lock)
+      note "Result: locked until $PLAN_CONTEXT_DEADLINE (drand round $PLAN_CONTEXT_ROUND)"
       ;;
   esac
 }
@@ -5245,122 +6651,14 @@ dispatch_adopt() {
 }
 
 dispatch_lock() {
-  local argument
-  for argument in "$@"; do
-    if [[ "$argument" == "--dry-run" ]]; then
-      parse_command_options lock "$@"
-      run_dry_run_plan lock
-      return 0
-    fi
-  done
-  cmd_lock "$@"
+  parse_command_options lock "$@"
+  run_planned_command lock
 }
 
 dispatch_unlock() {
   parse_command_options unlock "$@"
   [[ -f "$state_file" ]] || die "no state"
   run_planned_command unlock
-}
-
-cmd_lock() {
-  local when tle target now round dev pass errfile lock_out deadline_iso uuid
-  export -n pass 2>/dev/null || true
-  local skip_hooks=false
-  if [[ "${1:-}" == "--no-hooks" ]]; then
-    skip_hooks=true
-    shift
-  fi
-  if [[ "${1:-}" == --* ]]; then
-    die "unknown lock option: $1"
-  fi
-  [[ $# -gt 0 ]] || die "usage: vaultlock lock <deadline>"
-  when=$*
-  now=$(/bin/date +%s)
-  target=$(resolve_deadline "$when" "$now") \
-    || die "cannot resolve '$when' to a future deadline, see: vaultlock help"
-  deadline_iso=$(/bin/date -j -r "$target" '+%Y-%m-%dT%H:%M:%S%z') \
-    || die "deadline is outside the supported date range"
-  [[ -f "$state_file" ]] || die "no state, run vaultlock init first"
-  [[ "$(state_get .locked)" == "false" ]] || die "already locked until $(state_get .deadline)"
-  [[ -f "$STATE_DIR/passphrase.txt" ]] || die "missing $STATE_DIR/passphrase.txt, cannot rotate"
-  tle=$(tle_bin) || die "tle not found"
-  curl -fsS --max-time 10 "$DRAND_URL/$QUICKNET_CHAIN/info" >/dev/null \
-    || die "drand chain info unreachable, refusing to lock"
-  require_mounted
-  dev=$(vol_device)
-  uuid=$(vol_uuid)
-  round=$(round_for_epoch "$target")
-
-  if [[ "$skip_hooks" == "false" ]]; then
-    run_hook_phase pre-lock "$uuid" "$dev" "$deadline_iso" "$target" "$round" false \
-      || die "pre-lock hooks failed, vault remains unlocked"
-  fi
-
-  # Backup hatches, while the mount point still exists.
-  # -v (volume-level) is the only exclusion kind tmutil accepts for a
-  # volume root; sticky and -p (fixed-path) exclusions both fail with
-  # "Invalid argument" on a mount point (verified against tmutil(8)).
-  sudo tmutil addexclusion -v "$MOUNT_POINT"
-  sudo tmutil deletelocalsnapshots "$MOUNT_POINT" >/dev/null 2>&1 || true
-
-  if ! diskutil unmount "$MOUNT_POINT"; then
-    note "vault is busy, offending processes:"
-    lsof +f -- "$MOUNT_POINT" || true
-    die "close them and rerun vaultlock lock (no crypto state was changed)"
-  fi
-
-  pass=$(head -c 32 /dev/urandom | base64)
-  umask 077
-  # New passphrase hits disk BEFORE the volume learns it. A crash between
-  # these steps leaves the volume passphrase known on disk either way.
-  printf '%s' "$pass" > "$STATE_DIR/passphrase-new.txt"
-  sudo diskutil apfs changePassphrase "$dev" -user disk \
-    -oldpassphrase "$(cat "$STATE_DIR/passphrase.txt")" -newpassphrase "$pass"
-  mv "$STATE_DIR/passphrase-new.txt" "$STATE_DIR/passphrase.txt"
-  security add-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" -w "$pass" -U
-
-  printf '%s' "$pass" | "$tle" -e -n "$DRAND_URL" -c "$QUICKNET_CHAIN" -r "$round" \
-    -o "$STATE_DIR/passphrase.tle"
-  [[ -s "$STATE_DIR/passphrase.tle" ]] || die "empty ciphertext, NOT locking"
-  errfile="$STATE_DIR/.tle-verify-err"
-  if "$tle" -d -n "$DRAND_URL" -c "$QUICKNET_CHAIN" "$STATE_DIR/passphrase.tle" \
-      >/dev/null 2>"$errfile"; then
-    die "ciphertext decrypts right now (past round?), NOT locking"
-  fi
-  grep -qiE "$EARLY_RE" "$errfile" \
-    || die "unexpected tle verify error: $(cat "$errfile"), NOT locking"
-  sha256_of "$pass" > "$STATE_DIR/passphrase.sha256"
-
-  jq --arg d "$deadline_iso" --argjson e "$target" --argjson r "$round" \
-     '.locked = true | .deadline = $d | .deadline_epoch = $e | .round = $r' \
-     "$state_file" > "$state_file.tmp" || die "state update failed, NOT deleting plaintext"
-  mv "$state_file.tmp" "$state_file" || die "state rename failed, NOT deleting plaintext"
-
-  # Only now, with a verified ciphertext on disk, destroy the plaintext.
-  rm -f "$STATE_DIR/passphrase.txt"
-  security delete-generic-password -a "$USER" -s "$KEYCHAIN_SERVICE" >/dev/null 2>&1 || true
-  sudo tmutil deletelocalsnapshots /System/Volumes/Data >/dev/null || true
-
-  # On this platform, unmounting a "-stdinpassphrase disk" APFS volume
-  # (no macOS-user SecureToken backing it) auto-relocks it, so lockVolume
-  # here normally reports "already locked" - that is the safe outcome,
-  # not a failure. Any other lockVolume error is fatal. Either way, the
-  # checks below are the real proof: they inspect actual disk state.
-  lock_out=$(sudo diskutil apfs lockVolume "$dev" 2>&1) || {
-    grep -qi 'already locked' <<<"$lock_out" \
-      || die "lockVolume failed after plaintext was already destroyed - vault security UNVERIFIED, check diskutil apfs list manually: $lock_out"
-  }
-  note "$lock_out"
-  diskutil info "$dev" | grep -q 'FileVault:.*Yes' || die "volume does not report FileVault"
-  if diskutil mount "$dev" >/dev/null 2>&1; then
-    die "PANIC: volume mounted without a passphrase, lock is NOT effective"
-  fi
-  if [[ "$skip_hooks" == "false" ]] \
-      && ! run_hook_phase post-lock "$uuid" "$dev" "$deadline_iso" \
-        "$target" "$round" true; then
-    die "vault is locked until $deadline_iso, but one or more post-lock hooks failed"
-  fi
-  note "locked until $deadline_iso (drand round $round)"
 }
 
 cmd_status() {
@@ -5374,7 +6672,7 @@ usage() {
 usage: vaultlock <command>
   init                       create the encrypted vault volume
   adopt <dir>                move a directory onto the vault, leave a symlink
-  lock [--no-hooks] <deadline>
+  lock [--dry-run] [--yes] [--no-hooks] <deadline>
                              time-lock the vault until a future deadline
   unlock [--dry-run] [--no-hooks]
                              unlock after the deadline (needs internet)
@@ -5454,11 +6752,10 @@ case "${1:-}" in
     resolve_deadline "$*" "$now"
     ;;
   __hooks)
-    # Legacy test seam shared with lock. Task 8 routes lock hooks through plans.
     [[ $# -eq 8 ]] \
       || die "usage: vaultlock __hooks <phase> <uuid> <device> <deadline> <epoch> <round> <locked>"
     shift
-    run_hook_phase "$@"
+    run_test_hook_phase "$@"
     ;;
   init) shift; dispatch_init "$@" ;;
   adopt) shift; dispatch_adopt "$@" ;;
