@@ -6,9 +6,7 @@
 # exists, the decryption key material does not exist anywhere.
 #
 # Env overrides (for tests): VAULTLOCK_STATE_DIR, VAULTLOCK_VOLUME,
-# VAULTLOCK_CONTAINER, VAULTLOCK_MOUNT_POINT, VAULTLOCK_MOUNT_COMMAND,
-# VAULTLOCK_CONFIRM_DEVICE.
-# shellcheck disable=SC2034  # Constants are used by later tasks
+# VAULTLOCK_CONTAINER, VAULTLOCK_MOUNT_POINT, VAULTLOCK_CONFIRM_DEVICE.
 set -euo pipefail
 set +a
 
@@ -23,7 +21,6 @@ STATE_DIR=${VAULTLOCK_STATE_DIR:-$HOME/.vaultlock}
 VOLUME=${VAULTLOCK_VOLUME:-vault}
 CONTAINER=${VAULTLOCK_CONTAINER:-disk3}
 MOUNT_POINT=${VAULTLOCK_MOUNT_POINT:-/Volumes/$VOLUME}
-MOUNT_COMMAND=${VAULTLOCK_MOUNT_COMMAND:-mount}
 BSD_FIND=/usr/bin/find
 BSD_LS=/bin/ls
 BSD_STAT=/usr/bin/stat
@@ -857,7 +854,7 @@ valid_process_start_identity() { # value
 }
 
 inspect_operation_lock() {
-  local directory_metadata owner_metadata line1 line2 line3 line4 line5 extra
+  local directory_metadata owner_metadata line1 line2 line3 line4 line5
   local directory_link_count
   [[ -d "$OPERATION_LOCK_DIR" && ! -L "$OPERATION_LOCK_DIR" ]] \
     || return 1
@@ -887,7 +884,7 @@ inspect_operation_lock() {
     IFS= read -r line3
     IFS= read -r line4
     IFS= read -r line5
-    ! IFS= read -r extra
+    ! IFS= read -r
   } < "$OPERATION_LOCK_DIR/owner" || return 1
   [[ "$line1" == "version=1" \
     && "$line2" =~ ^pid=([1-9][0-9]*)$ \
@@ -5098,10 +5095,11 @@ plan_unlocked_repair() {
   if [[ "$SNAPSHOT_APFS_LOCKED" == false ]]; then
     read_unlock_keychain_snapshot "$UNLOCK_PASSPHRASE" \
       || die "cannot verify matching keychain recovery material"
-    [[ "$UNLOCK_KEYCHAIN_PRESENT" == true ]] \
-      || die "cannot verify matching keychain recovery material"
-    [[ "$UNLOCK_KEYCHAIN_MATCH" == true ]] \
-      || die "keychain recovery material does not match local plaintext"
+    if [[ "$UNLOCK_KEYCHAIN_PRESENT" != true \
+        || "$UNLOCK_KEYCHAIN_MATCH" != true ]]; then
+      plan_add keychain_update \
+        "Update the keychain with the verified recovery material"
+    fi
   fi
 }
 
@@ -5414,11 +5412,38 @@ execute_restore_plaintext() {
     "$STATE_DIR/passphrase.txt"
 }
 
+verify_frozen_unlock_keychain() { # boundary
+  local boundary=$1 expected_present expected_match expected_digest
+  expected_present=$(frozen_plan_field_value unlock_keychain_present) \
+    || die "frozen keychain state is missing"
+  expected_match=$(frozen_plan_field_value unlock_keychain_match) \
+    || die "frozen keychain match is missing"
+  expected_digest=$(frozen_plan_field_value unlock_keychain_digest) \
+    || die "frozen keychain digest is missing"
+  read_unlock_keychain_snapshot "$UNLOCK_PASSPHRASE" \
+    || die "keychain state changed $boundary"
+  [[ "$UNLOCK_KEYCHAIN_PRESENT" == "$expected_present" \
+    && "$UNLOCK_KEYCHAIN_MATCH" == "$expected_match" \
+    && "$UNLOCK_KEYCHAIN_DIGEST" == "$expected_digest" ]] \
+    || die "keychain state changed $boundary"
+}
+
 execute_unlock_keychain_update() {
   [[ -n "$UNLOCK_PASSPHRASE" ]] \
     || die "verified recovery material is unavailable for keychain update"
+  run_named_transition unlock_before_keychain_update "$KEYCHAIN_SERVICE"
+  if [[ "$(frozen_plan_field_value unlock_keychain_digest)" \
+      != not-inspected ]]; then
+    verify_unlock_recovery_boundaries
+    verify_frozen_unlock_keychain "before recovery update"
+  fi
   keychain_store_passphrase "$UNLOCK_PASSPHRASE" \
     || die "keychain recovery update failed"
+  read_unlock_keychain_snapshot "$UNLOCK_PASSPHRASE" \
+    || die "cannot verify keychain recovery update"
+  [[ "$UNLOCK_KEYCHAIN_PRESENT" == true \
+    && "$UNLOCK_KEYCHAIN_MATCH" == true ]] \
+    || die "cannot verify keychain recovery update"
 }
 
 execute_persist_unlocked_state() {
@@ -6662,6 +6687,7 @@ dispatch_unlock() {
 }
 
 cmd_status() {
+  [[ $# -eq 0 ]] || die_usage "usage: vaultlock status"
   inspect_runtime_state
   classify_runtime_state
   render_runtime_summary
@@ -6670,8 +6696,9 @@ cmd_status() {
 usage() {
   cat >&2 <<'EOF'
 usage: vaultlock <command>
-  init                       create the encrypted vault volume
-  adopt <dir>                move a directory onto the vault, leave a symlink
+  init [--dry-run] [--yes] create the encrypted vault volume
+  adopt [--dry-run] [--yes] <dir>
+                             move a directory onto the vault, leave a symlink
   lock [--dry-run] [--yes] [--no-hooks] <deadline>
                              time-lock the vault until a future deadline
   unlock [--dry-run] [--no-hooks]

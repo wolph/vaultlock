@@ -2494,6 +2494,34 @@ reject_options "adopt rejects extra operands" adopt source extra
 reject_options "init rejects no-hooks" init --no-hooks
 reject_options "adopt rejects no-hooks" adopt --no-hooks source
 
+for status_operand in extra --dry-run; do
+  : > "$action_log"
+  if status_operand_output=$(run_vaultlock status "$status_operand" 2>&1); then
+    status_operand_status=0
+    record_failure "status rejects trailing operand $status_operand"
+  else
+    status_operand_status=$?
+  fi
+  check "status trailing operand $status_operand exits with usage status" \
+    64 "$status_operand_status"
+  check_contains "status trailing operand $status_operand reports usage" \
+    'usage: vaultlock status' "$status_operand_output"
+  check_empty "status trailing operand $status_operand performs no inspection" \
+    "$action_log"
+done
+
+if help_output=$(run_vaultlock help 2>&1); then
+  help_status=0
+else
+  help_status=$?
+fi
+check "help exits with usage status" 64 "$help_status"
+check_line "help lists init safety options" \
+  '  init [--dry-run] [--yes] create the encrypted vault volume' \
+  "$help_output"
+check_line "help lists adopt safety options" \
+  '  adopt [--dry-run] [--yes] <dir>' "$help_output"
+
 check "confirmation accepts y" true \
   "$(run_vaultlock __confirm_response y)"
 check "confirmation accepts yes case-insensitively" true \
@@ -2961,6 +2989,31 @@ check_count "usable unlock plans no hook execution" 0 \
   'Run hook ' "$usable_unlock_hooks_plan"
 check_count "usable unlock plans no deferred hook discovery" 0 \
   'hook discovery' "$usable_unlock_hooks_plan"
+
+for keychain_plan_mount_state in mounted unmounted; do
+  for keychain_plan_material in missing stale; do
+    write_json_state false null null null UUID-123
+    if [[ "$keychain_plan_mount_state" == mounted ]]; then
+      write_apfs_state false true UUID-123 disk9s1
+    else
+      write_apfs_state false false UUID-123 disk9s1
+    fi
+    printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
+    printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
+    rm -f "$state_dir/passphrase.tle" "$apfs_state/keychain_value"
+    if [[ "$keychain_plan_material" == stale ]]; then
+      printf 'stale-keychain-value' > "$apfs_state/keychain_value"
+    fi
+    keychain_repair_plan=$(run_vaultlock unlock --dry-run)
+    check_contains \
+      "$keychain_plan_mount_state $keychain_plan_material keychain repair is typed as an update" \
+      'Update the keychain with the verified recovery material' \
+      "$keychain_repair_plan"
+    check_count \
+      "$keychain_plan_mount_state $keychain_plan_material keychain repair plans no hooks" \
+      0 'Run hook ' "$keychain_repair_plan"
+  done
+done
 
 write_json_state false null null null UUID-123
 write_apfs_state false false UUID-123 disk9s1
@@ -6120,41 +6173,110 @@ check_contains "usable unlock no-op verifies keychain read-only" \
 check_count "usable unlock no-op never writes keychain" 0 \
   'security -i' "$(< "$action_log")"
 
-for keychain_failure_case in absent unreadable; do
-  reset_unlock_fixture
-  write_json_state false null null null UUID-123
-  write_apfs_state false true UUID-123 disk9s1
-  write_unlock_plaintext
-  if [[ "$keychain_failure_case" == unreadable ]]; then
-    write_matching_keychain
-    : > "$apfs_state/fail_keychain_read"
-  fi
-  if keychain_failure_output=$(run_vaultlock unlock 2>&1); then
-    record_failure "usable unlock rejects $keychain_failure_case keychain plaintext"
-  else
-    check_contains "usable unlock reports $keychain_failure_case keychain plaintext" \
-      'cannot verify matching keychain recovery material' \
-      "$keychain_failure_output"
-  fi
-  check_empty "usable unlock $keychain_failure_case keychain performs no mutation" \
-    "$mutation_log"
-done
-
 reset_unlock_fixture
 write_json_state false null null null UUID-123
 write_apfs_state false true UUID-123 disk9s1
 write_unlock_plaintext
-printf 'wrong-keychain-value' > "$apfs_state/keychain_value"
-if keychain_mismatch_output=$(run_vaultlock unlock 2>&1); then
-  record_failure "usable unlock rejects mismatched keychain plaintext"
+write_matching_keychain
+: > "$apfs_state/fail_keychain_read"
+if keychain_read_error_output=$(run_vaultlock unlock 2>&1); then
+  record_failure "usable unlock rejects unreadable keychain plaintext"
 else
-  check_contains "usable unlock reports mismatched keychain plaintext" \
-    'keychain recovery material does not match local plaintext' \
-    "$keychain_mismatch_output"
+  check_contains "usable unlock reports unreadable keychain plaintext" \
+    'cannot verify matching keychain recovery material' \
+    "$keychain_read_error_output"
 fi
-check_empty "keychain mismatch causes no domain mutation" "$mutation_log"
-check_count "keychain mismatch reports no false success" 0 \
-  'Result: unlocked and mounted' "$keychain_mismatch_output"
+check_empty "unreadable keychain performs no mutation" "$mutation_log"
+
+for keychain_mount_state in mounted unmounted; do
+  for keychain_material in missing stale; do
+    reset_unlock_fixture
+    write_json_state false null null null UUID-123
+    if [[ "$keychain_mount_state" == mounted ]]; then
+      write_apfs_state false true UUID-123 disk9s1
+    else
+      write_apfs_state false false UUID-123 disk9s1
+    fi
+    write_unlock_plaintext
+    if [[ "$keychain_material" == stale ]]; then
+      printf 'wrong-keychain-value' > "$apfs_state/keychain_value"
+    fi
+    /bin/mkdir -p "$state_dir/hooks/pre-unlock.d" \
+      "$state_dir/hooks/post-unlock.d" \
+      "$mount_point/.vaultlock/hooks/post-unlock.d"
+    for unused_unlock_hook in \
+        "$state_dir/hooks/pre-unlock.d/10-pre" \
+        "$state_dir/hooks/post-unlock.d/20-post" \
+        "$mount_point/.vaultlock/hooks/post-unlock.d/30-vault-post"; do
+      /bin/cp "$TEST_SELF" "$unused_unlock_hook"
+      /bin/chmod +x "$unused_unlock_hook"
+    done
+    if keychain_repair_output=$(run_vaultlock unlock 2>&1); then
+      keychain_repair_status=0
+    else
+      keychain_repair_status=$?
+    fi
+    check "$keychain_mount_state $keychain_material keychain repair exits successfully" \
+      0 "$keychain_repair_status"
+    assert_unlock_usable \
+      "$keychain_mount_state $keychain_material keychain repair"
+    check_contains \
+      "$keychain_mount_state $keychain_material keychain repair plans typed update" \
+      'Update the keychain with the verified recovery material' \
+      "$keychain_repair_output"
+    check_plan_coordination \
+      "$keychain_mount_state $keychain_material keychain repair" \
+      "$keychain_repair_output"
+    [[ -e "$apfs_state/token_generated" ]] \
+      || record_failure "$keychain_mount_state $keychain_material keychain repair acquires operation lock"
+    check_count \
+      "$keychain_mount_state $keychain_material keychain repair writes keychain once" \
+      1 'security -i' "$(< "$action_log")"
+    check_count \
+      "$keychain_mount_state $keychain_material keychain repair does not APFS-unlock" \
+      0 'unlockVolume' "$(< "$mutation_log")"
+    check_count \
+      "$keychain_mount_state $keychain_material keychain repair runs no lifecycle hooks" \
+      0 '--phase ' "$(< "$hook_log")"
+    if [[ "$keychain_mount_state" == unmounted ]]; then
+      check_action_order \
+        "$keychain_material keychain repair mounts before keychain update" \
+        'diskutil mount disk9s1' 'security -i'
+    else
+      check_count \
+        "$keychain_material mounted keychain repair does not remount" \
+        0 'diskutil mount disk9s1' "$(< "$mutation_log")"
+    fi
+  done
+done
+
+for keychain_drift_mount_state in mounted unmounted; do
+  reset_unlock_fixture
+  write_json_state false null null null UUID-123
+  if [[ "$keychain_drift_mount_state" == mounted ]]; then
+    write_apfs_state false true UUID-123 disk9s1
+  else
+    write_apfs_state false false UUID-123 disk9s1
+  fi
+  write_unlock_plaintext
+  printf 'stale-before-plan' > "$apfs_state/keychain_value"
+  printf 'unlock_keychain_change\n' \
+    > "$apfs_state/transition_unlock_before_keychain_update"
+  if keychain_drift_output=$(run_vaultlock unlock 2>&1); then
+    record_failure "$keychain_drift_mount_state keychain repair rejects execution drift"
+  else
+    check_contains \
+      "$keychain_drift_mount_state keychain repair reports execution drift" \
+      'keychain state changed before recovery update' \
+      "$keychain_drift_output"
+  fi
+  check_count \
+    "$keychain_drift_mount_state keychain drift stops before keychain write" \
+    0 'security -i' "$(< "$action_log")"
+  check_count \
+    "$keychain_drift_mount_state keychain drift runs no lifecycle hooks" \
+    0 '--phase ' "$(< "$hook_log")"
+done
 
 reset_unlock_fixture
 write_json_state false null null null UUID-123

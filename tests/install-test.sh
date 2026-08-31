@@ -162,6 +162,13 @@ run_install_in() { # repository destination
     /usr/bin/make -s -C "$1" install BIN_DIR="$2"
 }
 
+run_installer_direct() { # repository destination
+  VAULTLOCK_INSTALL_REPO_ROOT="$1" \
+  VAULTLOCK_INSTALL_BIN_DIR="$2" \
+  VAULTLOCK_INSTALL_BIN_DIR_MODE=explicit \
+    "$fixture_repo/scripts/install.sh"
+}
+
 run_install() {
   VAULTLOCK_INSTALL_TEST_NESTED=1 \
     /usr/bin/make -s -C "$fixture_repo" install BIN_DIR="$bin_dir"
@@ -301,6 +308,90 @@ check_link 'default HOME preserves literal Make syntax' \
 check_link 'default HOME installs both targets' "$test_target" "$test_source"
 check 'default HOME cannot execute a Make shell function' false \
   "$([[ -e "$fixture_repo/home-make-injected-marker" ]] \
+    && printf true || printf false)"
+
+newline_free_bin=$test_root/newline-bin
+newline_bin=$newline_free_bin$'\n'
+/bin/mkdir -p "$newline_free_bin" "$newline_bin"
+newline_bin_output=''
+if newline_bin_output=$(run_installer_direct \
+    "$fixture_repo" "$newline_bin" 2>&1); then
+  printf 'FAIL BIN_DIR with a newline was accepted\n'
+  fail=1
+else
+  printf 'ok   BIN_DIR with a newline is refused\n'
+fi
+check_contains 'newline BIN_DIR reports the pathname byte policy' \
+  'BIN_DIR must contain only printable ASCII bytes' "$newline_bin_output"
+check 'newline BIN_DIR cannot redirect to its newline-free sibling' false \
+  "$([[ -e "$newline_free_bin/vaultlock" \
+      || -L "$newline_free_bin/vaultlock" \
+      || -e "$newline_free_bin/vaultlock-test.sh" \
+      || -L "$newline_free_bin/vaultlock-test.sh" ]] \
+    && printf true || printf false)"
+check 'newline BIN_DIR is unchanged before refusal' false \
+  "$([[ -e "$newline_bin/vaultlock" || -L "$newline_bin/vaultlock" \
+      || -e "$newline_bin/vaultlock-test.sh" \
+      || -L "$newline_bin/vaultlock-test.sh" ]] \
+    && printf true || printf false)"
+
+tab_bin=$test_root/$'tab\tbin'
+/bin/mkdir -p "$tab_bin"
+tab_bin_output=''
+if tab_bin_output=$(run_installer_direct \
+    "$fixture_repo" "$tab_bin" 2>&1); then
+  printf 'FAIL BIN_DIR with a tab was accepted\n'
+  fail=1
+else
+  printf 'ok   BIN_DIR with a tab is refused\n'
+fi
+check_contains 'tab BIN_DIR reports the pathname byte policy' \
+  'BIN_DIR must contain only printable ASCII bytes' "$tab_bin_output"
+check 'tab BIN_DIR is unchanged before refusal' false \
+  "$([[ -e "$tab_bin/vaultlock" || -L "$tab_bin/vaultlock" \
+      || -e "$tab_bin/vaultlock-test.sh" \
+      || -L "$tab_bin/vaultlock-test.sh" ]] \
+    && printf true || printf false)"
+
+newline_repo=$fixture_repo$'\n'
+newline_repo_bin=$test_root/newline-repo-bin
+/bin/mkdir -p "$newline_repo"
+newline_repo_output=''
+if newline_repo_output=$(run_installer_direct \
+    "$newline_repo" "$newline_repo_bin" 2>&1); then
+  printf 'FAIL repository root with a newline was accepted\n'
+  fail=1
+else
+  printf 'ok   repository root with a newline is refused\n'
+fi
+check_contains 'newline repository root reports the pathname byte policy' \
+  'repository root must contain only printable ASCII bytes' \
+  "$newline_repo_output"
+check 'newline repository root cannot redirect to its newline-free sibling' \
+  false \
+  "$([[ -e "$newline_repo_bin/vaultlock" \
+      || -L "$newline_repo_bin/vaultlock" \
+      || -e "$newline_repo_bin/vaultlock-test.sh" \
+      || -L "$newline_repo_bin/vaultlock-test.sh" ]] \
+    && printf true || printf false)"
+
+tab_repo=$test_root/$'tab\trepository'
+tab_repo_bin=$test_root/tab-repo-bin
+create_one_commit_fixture "$tab_repo"
+tab_repo_output=''
+if tab_repo_output=$(run_installer_direct \
+    "$tab_repo" "$tab_repo_bin" 2>&1); then
+  printf 'FAIL repository root with a tab was accepted\n'
+  fail=1
+else
+  printf 'ok   repository root with a tab is refused\n'
+fi
+check_contains 'tab repository root reports the pathname byte policy' \
+  'repository root must contain only printable ASCII bytes' "$tab_repo_output"
+check 'tab repository root is unchanged before refusal' false \
+  "$([[ -e "$tab_repo_bin/vaultlock" || -L "$tab_repo_bin/vaultlock" \
+      || -e "$tab_repo_bin/vaultlock-test.sh" \
+      || -L "$tab_repo_bin/vaultlock-test.sh" ]] \
     && printf true || printf false)"
 
 empty_home_bin=$test_root/empty-home-bin

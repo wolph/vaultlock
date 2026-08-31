@@ -23,6 +23,16 @@ die() {
   exit 1
 }
 
+validate_path_input() { # label value
+  local label=$1 value=$2
+  local LC_ALL=C
+  case "$value" in
+    *[![:print:]]*)
+      die "$label must contain only printable ASCII bytes"
+      ;;
+  esac
+}
+
 resolve_bin_dir_input() {
   local mode=${VAULTLOCK_INSTALL_BIN_DIR_MODE-}
   case "$mode" in
@@ -305,6 +315,8 @@ apply_target() { # index
 main() {
   local index actual_bin_dir
   resolve_bin_dir_input
+  validate_path_input 'repository root' "$REPO_ROOT_INPUT"
+  validate_path_input 'BIN_DIR' "$BIN_DIR_INPUT"
   normalize_repo_root
   normalize_bin_dir
   precompute_paths
