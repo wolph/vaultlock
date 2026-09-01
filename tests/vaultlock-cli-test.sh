@@ -230,6 +230,9 @@ if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" \
           [[ ! -f "$VAULTLOCK_TEST_APFS_STATE/fail_unmount" ]] || exit 1
           fixture_write mounted false
           fixture_write mount_point ""
+          if [[ -f "$VAULTLOCK_TEST_APFS_STATE/unmount_emits_success" ]]; then
+            /usr/bin/printf 'Volume vault unmounted\n'
+          fi
           ;;
         apfs)
           case "${2:-}" in
@@ -630,6 +633,9 @@ $fixture_ditto_destination_parent/$fixture_ditto_destination_leaf
         fixture_write device disk99s9
       fi
       : > "$VAULTLOCK_TEST_APFS_STATE/copy_complete"
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/ditto_emits_success" ]]; then
+        /usr/bin/printf 'Copy completed\n'
+      fi
       ;;
     dirname) /usr/bin/dirname "$@" ;;
     basename) /usr/bin/basename "$@" ;;
@@ -1262,12 +1268,21 @@ $fixture_ditto_destination_parent/$fixture_ditto_destination_leaf
           : > "$VAULTLOCK_TEST_MUTATION_LOG"
           : > "$VAULTLOCK_TEST_HOOK_LOG"
           ;;
+        mark_validation_transition)
+          : > "$VAULTLOCK_TEST_APFS_STATE/validation_transition_ran"
+          ;;
         wait_for_presentation_reader_close)
+          fixture_wait_attempts=0
           : > "$VAULTLOCK_TEST_APFS_STATE/${fixture_transition}_entered"
           while [[ ! -f \
-              "$VAULTLOCK_TEST_APFS_STATE/${fixture_transition}_release" ]]; do
-            /bin/sleep 0.001
+              "$VAULTLOCK_TEST_APFS_STATE/${fixture_transition}_release" \
+              && "$fixture_wait_attempts" -lt 5000 ]]; do
+            /bin/sleep 0.01
+            fixture_wait_attempts=$((fixture_wait_attempts + 1))
           done
+          [[ -f \
+            "$VAULTLOCK_TEST_APFS_STATE/${fixture_transition}_release" ]] \
+            || exit 124
           ;;
       signal_HUP|signal_INT|signal_TERM|signal_KILL)
         fixture_transition_signal=${fixture_transition_action#signal_}
@@ -1651,6 +1666,13 @@ $VAULTLOCK_STATE_DIR/hooks/pre-lock.d/10-planned-link
               && -f "$VAULTLOCK_TEST_APFS_STATE/fail_state_tm_exclusion" ]]; then
             exit 75
           fi
+          if [[ -f "$VAULTLOCK_TEST_APFS_STATE/tmutil_emits_success" ]]; then
+            /usr/bin/printf 'Added exclusion\n'
+          fi
+          if [[ -f \
+              "$VAULTLOCK_TEST_APFS_STATE/tmutil_emits_success_stderr" ]]; then
+            /usr/bin/printf 'Added exclusion diagnostic\n' >&2
+          fi
           ;;
         isexcluded)
           [[ $# -eq 3 && "${2:-}" == -X ]] || exit 64
@@ -1786,7 +1808,9 @@ fi
 VL=${1:-$(cd "$(dirname "$0")/.." && pwd)/bin/vaultlock}
 fail=0
 test_root=$(mktemp -d "/tmp/vaultlock cli.XXXXXX")
-trap 'rm -rf "$test_root"' EXIT
+# shellcheck disable=SC2329  # EXIT trap fallback before helper definition.
+cleanup_epipe_processes() { :; }
+trap 'cleanup_epipe_processes; rm -rf "$test_root"' EXIT
 
 fake_bin="$test_root/bin"
 gnu_bin="$test_root/gnu-bin"
@@ -2023,9 +2047,9 @@ start_vaultlock_background() { # output command...
   BACKGROUND_VAULTLOCK_PID=$!
 }
 
-wait_for_fixture() { # path
-  local path=$1 attempts=0
-  while [[ ! -e "$path" && "$attempts" -lt 500 ]]; do
+wait_for_fixture() { # path maximum_attempts
+  local path=$1 maximum_attempts=${2:-500} attempts=0
+  while [[ ! -e "$path" && "$attempts" -lt "$maximum_attempts" ]]; do
     /bin/sleep 0.01
     attempts=$((attempts + 1))
   done
@@ -2258,6 +2282,11 @@ reset_operation_lock_fixture() {
     "$apfs_state/held_ditto_pid" \
     "$apfs_state/ditto_entered" \
     "$apfs_state/release_ditto" \
+    "$apfs_state/tmutil_emits_success" \
+    "$apfs_state/tmutil_emits_success_stderr" \
+    "$apfs_state/unmount_emits_success" \
+    "$apfs_state/ditto_emits_success" \
+    "$apfs_state/validation_transition_ran" \
     "$apfs_state"/transition_*
 }
 
@@ -2754,7 +2783,7 @@ test_task3_progress_mapper_prevalidation() {
 
   task3_prepare_lock_fixture
   printf 'confirmation sentinel\n' > "$confirm_device"
-  printf 'clear_effect_logs\n' \
+  printf 'mark_validation_transition\n' \
     > "$apfs_state/transition_progress_plan_before_validation"
   if output=$(VAULTLOCK_TEST_PROGRESS_MAPPING_FAIL_OPERATION=tm_exclude \
       run_vaultlock lock -v --yes --no-hooks '2099-01-02 03:04' 2>&1); then
@@ -2772,7 +2801,11 @@ test_task3_progress_mapper_prevalidation() {
   check "progress mapper failure leaves operation lock absent" false \
     "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
       && printf true || printf false)"
-  check_empty "progress mapper failure performs no action" "$action_log"
+  check "progress mapper failure runs no post-plan transition" false \
+    "$([[ -f "$apfs_state/validation_transition_ran" ]] \
+      && printf true || printf false)"
+  check_not_contains "progress mapper failure performs no coordination action" \
+    'transition-fixture progress_plan_before_validation' "$action_log"
   check_empty "progress mapper failure performs no mutation" "$mutation_log"
   check_empty "progress mapper failure runs no hook" "$hook_log"
 }
@@ -2861,9 +2894,10 @@ test_task3_adopt_progress() {
 start_epipe_vaultlock() { # stdout stderr command arguments...
   local stdout_path=$1 stderr_path=$2
   shift 2
-  /usr/bin/perl -e '
+  /usr/bin/perl -MPOSIX=setpgid -e '
     $SIG{INT} = "DEFAULT";
     $SIG{PIPE} = "DEFAULT";
+    setpgid(0, 0) == 0 or die "setpgid failed: $!\n";
     exec @ARGV or die "exec failed: $!\n";
   ' /usr/bin/env \
     "HOME=$test_home" \
@@ -2897,23 +2931,107 @@ start_epipe_vaultlock() { # stdout stderr command arguments...
   EPIPE_WRITER_PID=$!
 }
 
+wait_for_child_bounded() { # pid attempts
+  local pid=$1 attempts=$2 attempt=0 state
+  while [[ "$attempt" -lt "$attempts" ]]; do
+    state=$(/bin/ps -p "$pid" -o stat= 2>/dev/null) || return 0
+    state=${state//[[:space:]]/}
+    [[ -n "$state" && "$state" != Z* ]] || return 0
+    /bin/sleep 0.01
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+terminate_epipe_child() { # pid
+  local pid=$1
+  [[ -n "$pid" ]] || return 0
+  /bin/kill -TERM "$pid" 2>/dev/null || true
+  if ! wait_for_child_bounded "$pid" 200; then
+    /bin/kill -KILL "$pid" 2>/dev/null || true
+    wait_for_child_bounded "$pid" 200 || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+terminate_epipe_writer() { # pid
+  local pid=$1
+  [[ -n "$pid" ]] || return 0
+  /bin/kill -TERM -- "-$pid" 2>/dev/null || true
+  if ! wait_for_child_bounded "$pid" 200; then
+    /bin/kill -KILL -- "-$pid" 2>/dev/null || true
+    wait_for_child_bounded "$pid" 200 || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+EPIPE_ACTIVE_WRITER_PID=""
+EPIPE_ACTIVE_READER_PIDS=()
+EPIPE_ACTIVE_RELEASE_PATHS=()
+EPIPE_ACTIVE_FIFO_PATHS=()
+
+cleanup_epipe_processes() {
+  local path pid
+  for path in \
+      ${EPIPE_ACTIVE_RELEASE_PATHS[@]+"${EPIPE_ACTIVE_RELEASE_PATHS[@]}"}; do
+    : > "$path"
+  done
+  [[ -z "$EPIPE_ACTIVE_WRITER_PID" ]] \
+    || terminate_epipe_writer "$EPIPE_ACTIVE_WRITER_PID"
+  EPIPE_ACTIVE_WRITER_PID=""
+  for pid in \
+      ${EPIPE_ACTIVE_READER_PIDS[@]+"${EPIPE_ACTIVE_READER_PIDS[@]}"}; do
+    terminate_epipe_child "$pid"
+  done
+  EPIPE_ACTIVE_READER_PIDS=()
+  for path in \
+      ${EPIPE_ACTIVE_FIFO_PATHS[@]+"${EPIPE_ACTIVE_FIFO_PATHS[@]}"}; do
+    /bin/rm -f "$path"
+  done
+  EPIPE_ACTIVE_RELEASE_PATHS=()
+  EPIPE_ACTIVE_FIFO_PATHS=()
+}
+
+wait_for_epipe_entry() { # path
+  local path=$1 attempts=${EPIPE_ENTRY_WAIT_ATTEMPTS:-500}
+  wait_for_fixture "$path" "$attempts"
+}
+
+wait_for_epipe_writer() { # pid
+  local pid=$1 attempts=${EPIPE_WRITER_WAIT_ATTEMPTS:-12000}
+  if ! wait_for_child_bounded "$pid" "$attempts"; then
+    terminate_epipe_writer "$pid"
+    EPIPE_ACTIVE_WRITER_PID=""
+    EPIPE_STATUS=124
+    return 0
+  fi
+  if wait "$pid"; then EPIPE_STATUS=0; else EPIPE_STATUS=$?; fi
+  EPIPE_ACTIVE_WRITER_PID=""
+}
+
 run_with_stdout_epipe() { # transition command arguments...
   local transition=$1 fifo=$test_root/epipe-stdout.fifo writer_pid
+  local entered=$apfs_state/presentation_stdout_${transition}_entered
+  local release=$apfs_state/presentation_stdout_${transition}_release
   shift
   /bin/rm -f "$fifo"
   /usr/bin/mkfifo "$fifo"
   /bin/cat "$fifo" > "$test_root/epipe-stdout" &
   EPIPE_READER_PID=$!
-  /bin/rm -f "$apfs_state/presentation_stdout_${transition}_entered" \
-    "$apfs_state/presentation_stdout_${transition}_release"
+  EPIPE_ACTIVE_READER_PIDS=("$EPIPE_READER_PID")
+  EPIPE_ACTIVE_RELEASE_PATHS=("$release")
+  EPIPE_ACTIVE_FIFO_PATHS=("$fifo")
+  /bin/rm -f "$entered" "$release"
   printf 'wait_for_presentation_reader_close\n' \
     > "$apfs_state/transition_presentation_stdout_$transition"
   start_epipe_vaultlock "$fifo" "$test_root/epipe-stderr" "$@"
   writer_pid=$EPIPE_WRITER_PID
-  while [[ ! -f \
-      "$apfs_state/presentation_stdout_${transition}_entered" ]]; do
-    /bin/sleep 0.001
-  done
+  EPIPE_ACTIVE_WRITER_PID=$writer_pid
+  if ! wait_for_epipe_entry "$entered"; then
+    EPIPE_STATUS=124
+    cleanup_epipe_processes
+    return 0
+  fi
   /bin/cp "$mutation_log" "$test_root/epipe-mutations-at-failure"
   if [[ -f "$apfs_state/lock-crypto-markers" ]]; then
     /bin/cp "$apfs_state/lock-crypto-markers" \
@@ -2921,35 +3039,88 @@ run_with_stdout_epipe() { # transition command arguments...
   else
     : > "$test_root/epipe-crypto-at-failure"
   fi
-  /bin/kill -TERM "$EPIPE_READER_PID"
-  wait "$EPIPE_READER_PID" 2>/dev/null || true
-  : > "$apfs_state/presentation_stdout_${transition}_release"
-  if wait "$writer_pid"; then EPIPE_STATUS=0; else EPIPE_STATUS=$?; fi
+  terminate_epipe_child "$EPIPE_READER_PID"
+  EPIPE_READER_PID=""
+  EPIPE_ACTIVE_READER_PIDS=()
+  : > "$release"
+  wait_for_epipe_writer "$writer_pid"
   /bin/rm -f "$fifo"
+  EPIPE_ACTIVE_RELEASE_PATHS=()
+  EPIPE_ACTIVE_FIFO_PATHS=()
+}
+
+run_with_stream_closed_at_transition() { # stream transition command arguments...
+  local stream=$1 transition=$2 writer_pid reader_pid
+  local fifo=$test_root/epipe-domain-$stream.fifo
+  local entered=$apfs_state/${transition}_entered
+  local release=$apfs_state/${transition}_release
+  shift 2
+  /bin/rm -f "$fifo" "$entered" "$release"
+  /usr/bin/mkfifo "$fifo"
+  if [[ "$stream" == stdout ]]; then
+    /bin/cat "$fifo" > "$test_root/epipe-stdout" &
+    reader_pid=$!
+  else
+    /bin/cat "$fifo" > "$test_root/epipe-stderr" &
+    reader_pid=$!
+  fi
+  EPIPE_ACTIVE_READER_PIDS=("$reader_pid")
+  EPIPE_ACTIVE_RELEASE_PATHS=("$release")
+  EPIPE_ACTIVE_FIFO_PATHS=("$fifo")
+  printf 'wait_for_presentation_reader_close\n' \
+    > "$apfs_state/transition_$transition"
+  if [[ "$stream" == stdout ]]; then
+    start_epipe_vaultlock "$fifo" "$test_root/epipe-stderr" "$@"
+  else
+    start_epipe_vaultlock "$test_root/epipe-stdout" "$fifo" "$@"
+  fi
+  writer_pid=$EPIPE_WRITER_PID
+  EPIPE_ACTIVE_WRITER_PID=$writer_pid
+  if ! wait_for_epipe_entry "$entered"; then
+    EPIPE_STATUS=124
+    cleanup_epipe_processes
+    return 0
+  fi
+  terminate_epipe_child "$reader_pid"
+  EPIPE_ACTIVE_READER_PIDS=()
+  : > "$release"
+  wait_for_epipe_writer "$writer_pid"
+  /bin/rm -f "$fifo"
+  EPIPE_ACTIVE_RELEASE_PATHS=()
+  EPIPE_ACTIVE_FIFO_PATHS=()
 }
 
 run_with_stderr_epipe() { # transition command arguments...
   local transition=$1 fifo=$test_root/epipe-stderr.fifo writer_pid
+  local entered=$apfs_state/presentation_stderr_${transition}_entered
+  local release=$apfs_state/presentation_stderr_${transition}_release
   shift
   /bin/rm -f "$fifo"
   /usr/bin/mkfifo "$fifo"
   /bin/cat "$fifo" > "$test_root/epipe-stderr" &
   EPIPE_READER_PID=$!
-  /bin/rm -f "$apfs_state/presentation_stderr_${transition}_entered" \
-    "$apfs_state/presentation_stderr_${transition}_release"
+  EPIPE_ACTIVE_READER_PIDS=("$EPIPE_READER_PID")
+  EPIPE_ACTIVE_RELEASE_PATHS=("$release")
+  EPIPE_ACTIVE_FIFO_PATHS=("$fifo")
+  /bin/rm -f "$entered" "$release"
   printf 'wait_for_presentation_reader_close\n' \
     > "$apfs_state/transition_presentation_stderr_$transition"
   start_epipe_vaultlock "$test_root/epipe-stdout" "$fifo" "$@"
   writer_pid=$EPIPE_WRITER_PID
-  while [[ ! -f \
-      "$apfs_state/presentation_stderr_${transition}_entered" ]]; do
-    /bin/sleep 0.001
-  done
-  /bin/kill -TERM "$EPIPE_READER_PID"
-  wait "$EPIPE_READER_PID" 2>/dev/null || true
-  : > "$apfs_state/presentation_stderr_${transition}_release"
-  if wait "$writer_pid"; then EPIPE_STATUS=0; else EPIPE_STATUS=$?; fi
+  EPIPE_ACTIVE_WRITER_PID=$writer_pid
+  if ! wait_for_epipe_entry "$entered"; then
+    EPIPE_STATUS=124
+    cleanup_epipe_processes
+    return 0
+  fi
+  terminate_epipe_child "$EPIPE_READER_PID"
+  EPIPE_READER_PID=""
+  EPIPE_ACTIVE_READER_PIDS=()
+  : > "$release"
+  wait_for_epipe_writer "$writer_pid"
   /bin/rm -f "$fifo"
+  EPIPE_ACTIVE_RELEASE_PATHS=()
+  EPIPE_ACTIVE_FIFO_PATHS=()
 }
 
 run_with_both_epipe() { # stdout_transition stderr_transition command arguments...
@@ -2957,6 +3128,10 @@ run_with_both_epipe() { # stdout_transition stderr_transition command arguments.
   local stdout_fifo=$test_root/epipe-both-stdout.fifo
   local stderr_fifo=$test_root/epipe-both-stderr.fifo writer_pid
   local stdout_reader_pid stderr_reader_pid
+  local stdout_entered=$apfs_state/presentation_stdout_${stdout_transition}_entered
+  local stdout_release=$apfs_state/presentation_stdout_${stdout_transition}_release
+  local stderr_entered=$apfs_state/presentation_stderr_${stderr_transition}_entered
+  local stderr_release=$apfs_state/presentation_stderr_${stderr_transition}_release
   shift 2
   /bin/rm -f "$stdout_fifo" "$stderr_fifo"
   /usr/bin/mkfifo "$stdout_fifo" "$stderr_fifo"
@@ -2964,33 +3139,38 @@ run_with_both_epipe() { # stdout_transition stderr_transition command arguments.
   stdout_reader_pid=$!
   /bin/cat "$stderr_fifo" > "$test_root/epipe-stderr" &
   stderr_reader_pid=$!
-  /bin/rm -f \
-    "$apfs_state/presentation_stdout_${stdout_transition}_entered" \
-    "$apfs_state/presentation_stdout_${stdout_transition}_release" \
-    "$apfs_state/presentation_stderr_${stderr_transition}_entered" \
-    "$apfs_state/presentation_stderr_${stderr_transition}_release"
+  EPIPE_ACTIVE_READER_PIDS=("$stdout_reader_pid" "$stderr_reader_pid")
+  EPIPE_ACTIVE_RELEASE_PATHS=("$stdout_release" "$stderr_release")
+  EPIPE_ACTIVE_FIFO_PATHS=("$stdout_fifo" "$stderr_fifo")
+  /bin/rm -f "$stdout_entered" "$stdout_release" \
+    "$stderr_entered" "$stderr_release"
   printf 'wait_for_presentation_reader_close\n' \
     > "$apfs_state/transition_presentation_stdout_$stdout_transition"
   printf 'wait_for_presentation_reader_close\n' \
     > "$apfs_state/transition_presentation_stderr_$stderr_transition"
   start_epipe_vaultlock "$stdout_fifo" "$stderr_fifo" "$@"
   writer_pid=$EPIPE_WRITER_PID
-  while [[ ! -f \
-      "$apfs_state/presentation_stdout_${stdout_transition}_entered" ]]; do
-    /bin/sleep 0.001
-  done
-  /bin/kill -TERM "$stdout_reader_pid"
-  wait "$stdout_reader_pid" 2>/dev/null || true
-  : > "$apfs_state/presentation_stdout_${stdout_transition}_release"
-  while [[ ! -f \
-      "$apfs_state/presentation_stderr_${stderr_transition}_entered" ]]; do
-    /bin/sleep 0.001
-  done
-  /bin/kill -TERM "$stderr_reader_pid"
-  wait "$stderr_reader_pid" 2>/dev/null || true
-  : > "$apfs_state/presentation_stderr_${stderr_transition}_release"
-  if wait "$writer_pid"; then EPIPE_STATUS=0; else EPIPE_STATUS=$?; fi
+  EPIPE_ACTIVE_WRITER_PID=$writer_pid
+  if ! wait_for_epipe_entry "$stdout_entered"; then
+    EPIPE_STATUS=124
+    cleanup_epipe_processes
+    return 0
+  fi
+  terminate_epipe_child "$stdout_reader_pid"
+  EPIPE_ACTIVE_READER_PIDS=("$stderr_reader_pid")
+  : > "$stdout_release"
+  if ! wait_for_epipe_entry "$stderr_entered"; then
+    EPIPE_STATUS=124
+    cleanup_epipe_processes
+    return 0
+  fi
+  terminate_epipe_child "$stderr_reader_pid"
+  EPIPE_ACTIVE_READER_PIDS=()
+  : > "$stderr_release"
+  wait_for_epipe_writer "$writer_pid"
   /bin/rm -f "$stdout_fifo" "$stderr_fifo"
+  EPIPE_ACTIVE_RELEASE_PATHS=()
+  EPIPE_ACTIVE_FIFO_PATHS=()
 }
 
 check_task4_locked_convergence() { # description
@@ -3027,6 +3207,9 @@ test_task4_epipe_presentation() {
       progress_time-machine progress_time-lock progress_apfs-lock; do
     task3_prepare_lock_fixture
     /bin/rm -f "$apfs_state/lock-crypto-markers"
+    if [[ "$epipe_group" == progress_time-machine ]]; then
+      : > "$apfs_state/tmutil_emits_success"
+    fi
     run_with_stdout_epipe "$epipe_group" lock -v --yes --no-hooks \
       '2099-01-02 03:04'
     check "$epipe_group EPIPE exits with presentation status" \
@@ -3055,6 +3238,35 @@ test_task4_epipe_presentation() {
         ;;
     esac
   done
+
+  task3_prepare_lock_fixture
+  : > "$apfs_state/unmount_emits_success"
+  run_with_stdout_epipe progress_unmount lock -v --yes --no-hooks \
+    '2099-01-02 03:04'
+  check "unmount incidental stdout EPIPE preserves presentation status" \
+    74 "$EPIPE_STATUS"
+  check_task4_locked_convergence "unmount incidental stdout EPIPE"
+  check "unmount incidental stdout EPIPE preserves exact crypto order" \
+    "$expected_crypto_markers" "$(< "$apfs_state/lock-crypto-markers")"
+
+  task3_prepare_lock_fixture
+  : > "$apfs_state/unmount_emits_success"
+  run_with_stream_closed_at_transition stdout lock_before_execution \
+    lock --yes --no-hooks '2099-01-02 03:04'
+  check "default lock child-first stdout EPIPE preserves presentation status" \
+    74 "$EPIPE_STATUS"
+  check_task4_locked_convergence "default lock child-first stdout EPIPE"
+  check "default lock child-first stdout EPIPE preserves exact crypto order" \
+    "$expected_crypto_markers" "$(< "$apfs_state/lock-crypto-markers")"
+
+  task3_prepare_lock_fixture
+  : > "$apfs_state/tmutil_emits_success_stderr"
+  run_with_stream_closed_at_transition stderr lock_before_execution \
+    lock --yes --no-hooks '2099-01-02 03:04'
+  check "successful mutator cannot observe closed caller stderr" 0 "$EPIPE_STATUS"
+  check_task4_locked_convergence "closed caller stderr lock"
+  check "closed caller stderr lock preserves exact crypto order" \
+    "$expected_crypto_markers" "$(< "$apfs_state/lock-crypto-markers")"
 
   task3_prepare_unlock_fixture
   /bin/rm -f "$apfs_state/unlock_leaves_unmounted"
@@ -3113,6 +3325,51 @@ test_task4_epipe_presentation() {
       && printf true || printf false)"
 
   reset_task2_deferred_fixture
+  write_json_state false null null null UUID-INIT
+  write_apfs_state false true UUID-INIT disk8s1
+  printf '%s' "$task2_unlock_passphrase" > "$state_dir/passphrase.txt"
+  EPIPE_ADOPT_SOURCE="$test_root/epipe adopt incidental output source"
+  /bin/mkdir -p "$EPIPE_ADOPT_SOURCE"
+  printf 'payload\n' > "$EPIPE_ADOPT_SOURCE/file"
+  : > "$apfs_state/ditto_emits_success"
+  run_with_stdout_epipe progress_adopt-copy adopt -v --yes \
+    "$EPIPE_ADOPT_SOURCE"
+  check "adopt copy incidental stdout EPIPE preserves presentation status" \
+    74 "$EPIPE_STATUS"
+  check "adopt copy incidental stdout EPIPE converges" true \
+    "$([[ -L "$EPIPE_ADOPT_SOURCE" ]] && printf true || printf false)"
+  check "adopt copy incidental stdout EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  reset_task2_deferred_fixture
+  write_json_state false null null null UUID-INIT
+  write_apfs_state false true UUID-INIT disk8s1
+  printf '%s' "$task2_unlock_passphrase" > "$state_dir/passphrase.txt"
+  EPIPE_ADOPT_SOURCE="$test_root/stale quarantine stream source"
+  /bin/mkdir -p "$EPIPE_ADOPT_SOURCE"
+  printf 'payload\n' > "$EPIPE_ADOPT_SOURCE/file"
+  create_operation_lock 999999 "$fake_process_start" adopt \
+    "$fake_operation_token"
+  if run_vaultlock adopt --color=never --yes "$EPIPE_ADOPT_SOURCE" \
+      > "$test_root/stale-quarantine-stdout" \
+      2> "$test_root/stale-quarantine-stderr"; then
+    stale_quarantine_status=0
+  else
+    stale_quarantine_status=$?
+  fi
+  check "stale quarantine compatibility execution succeeds" \
+    0 "$stale_quarantine_status"
+  stale_quarantine_path=$(/usr/bin/find "$test_home" -maxdepth 1 -type d \
+    -name '.vaultlock-operation.lock.quarantine.*' -print -quit)
+  stale_quarantine_line="Retained stale operation lock quarantine: $stale_quarantine_path"
+  check "stale quarantine preserves exact legacy stdout line" 1 \
+    "$(/usr/bin/grep -Fxc -- "$stale_quarantine_line" \
+      "$test_root/stale-quarantine-stdout" || true)"
+  check_empty "stale quarantine preserves empty stderr stream" \
+    "$test_root/stale-quarantine-stderr"
+
+  reset_task2_deferred_fixture
   write_json_state true 2099-01-02T03:04:00+0100 4070999040 \
     792731235 UUID-123
   write_apfs_state true false UUID-123 disk9s1
@@ -3160,6 +3417,35 @@ test_task4_epipe_presentation() {
     '2099-01-02 03:04'
   check "domain failure takes precedence over stdout EPIPE" 1 "$EPIPE_STATUS"
   check "domain failure after stdout EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  task3_prepare_lock_fixture
+  EPIPE_ENTRY_WAIT_ATTEMPTS=5 \
+    run_with_stdout_epipe missing-transition lock -v --dry-run --no-hooks \
+      '2099-01-02 03:04'
+  check "missing EPIPE transition exits through bounded timeout" 124 \
+    "$EPIPE_STATUS"
+  check "missing EPIPE transition clears active writer PID" '' \
+    "$EPIPE_ACTIVE_WRITER_PID"
+  check "missing EPIPE transition removes FIFO" false \
+    "$([[ -e "$test_root/epipe-stdout.fifo" ]] \
+      && printf true || printf false)"
+  check_empty "missing EPIPE transition performs no mutation" "$mutation_log"
+
+  task3_prepare_lock_fixture
+  printf 'hold_lock_execution\n' \
+    > "$apfs_state/transition_lock_before_change_passphrase"
+  EPIPE_WRITER_WAIT_ATTEMPTS=5 \
+    run_with_stdout_epipe progress_time-machine lock -v --yes --no-hooks \
+      '2099-01-02 03:04'
+  check "held EPIPE writer exits through bounded timeout" 124 "$EPIPE_STATUS"
+  check "held EPIPE writer clears active PID" '' \
+    "$EPIPE_ACTIVE_WRITER_PID"
+  check "held EPIPE writer removes FIFO" false \
+    "$([[ -e "$test_root/epipe-stdout.fifo" ]] \
+      && printf true || printf false)"
+  check "held EPIPE writer releases operation lock" false \
     "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
       && printf true || printf false)"
 
@@ -3685,6 +3971,39 @@ for diagnostic_case in \
     false "$diagnostic_tty" '' xterm-256color 1 \
     "$diagnostic_expected" __diagnostic "$diagnostic_colour" "$diagnostic_kind"
 done
+
+: > "$test_root/colour-stdout"
+: > "$test_root/colour-stderr"
+if run_vaultlock __presentation_failure always \
+    > "$test_root/colour-stdout" 2> "$test_root/colour-stderr"; then
+  presentation_failure_status=0
+else
+  presentation_failure_status=$?
+fi
+check "surviving stdout presentation failure exits stable" \
+  74 "$presentation_failure_status"
+check "surviving stdout presentation failure keeps red prefix" \
+  "$red_prefix presentation output failed" \
+  "$(< "$test_root/colour-stdout")"
+check_empty "surviving stdout presentation failure suppresses stderr" \
+  "$test_root/colour-stderr"
+
+yellow_prefix="${esc}[33mRetained stale operation lock quarantine:${esc}[0m"
+: > "$test_root/colour-stdout"
+: > "$test_root/colour-stderr"
+if run_vaultlock __diagnostic always stale \
+    > "$test_root/colour-stdout" 2> "$test_root/colour-stderr"; then
+  stale_diagnostic_status=0
+else
+  stale_diagnostic_status=$?
+fi
+check "stale quarantine diagnostic exits expected status" \
+  1 "$stale_diagnostic_status"
+check "stale quarantine diagnostic colours only legacy label" \
+  "$yellow_prefix $operation_lock_dir.quarantine.fixture" \
+  "$(< "$test_root/colour-stdout")"
+check_empty "stale quarantine diagnostic preserves legacy stdout stream" \
+  "$test_root/colour-stderr"
 
 if help_output=$(run_vaultlock help 2>&1); then
   help_status=0

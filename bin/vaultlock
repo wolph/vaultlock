@@ -77,6 +77,7 @@ PRESENTATION_MUTABLE=false
 PRESENTATION_CAPTURE=false
 PRESENTATION_STDOUT_FAILED=false
 PRESENTATION_STDERR_FAILED=false
+PRESENTATION_FDS_PINNED=false
 
 PLAN_OPERATION_IDS=()
 PLAN_OPERATION_TEXT=()
@@ -312,12 +313,20 @@ presentation_write() { # stream transition text
     run_named_transition "presentation_${stream}_$transition" "$STATE_DIR"
   fi
   if [[ "$stream" == stdout ]]; then
-    if /usr/bin/printf '%s' "$text"; then
+    if [[ "$PRESENTATION_FDS_PINNED" == true ]]; then
+      if /usr/bin/printf '%s' "$text" >&7; then
+        return 0
+      fi
+    elif /usr/bin/printf '%s' "$text"; then
       return 0
     fi
     PRESENTATION_STDOUT_FAILED=true
   else
-    if /usr/bin/printf '%s' "$text" >&2; then
+    if [[ "$PRESENTATION_FDS_PINNED" == true ]]; then
+      if /usr/bin/printf '%s' "$text" >&8; then
+        return 0
+      fi
+    elif /usr/bin/printf '%s' "$text" >&2; then
       return 0
     fi
     PRESENTATION_STDERR_FAILED=true
@@ -360,6 +369,14 @@ print_warning() { # message
   presentation_stderr warning "$text"
 }
 
+print_stale_quarantine_warning() { # path
+  local path=$1 text label='Retained stale operation lock quarantine:'
+  [[ "$COLOR_STDOUT" != true ]] \
+    || printf -v label '%s%s%s' "$COLOR_YELLOW" "$label" "$COLOR_RESET"
+  printf -v text '%s %s\n' "$label" "$path"
+  presentation_stdout warning "$text"
+}
+
 print_error() { # message
   local text prefix=vaultlock:
   [[ "$COLOR_STDERR" != true ]] \
@@ -379,6 +396,13 @@ report_hook_failure() { # phase scope status hook
 die() { print_error "$*" || true; exit 1; }
 die_usage() { print_error "$*" || true; exit 64; }
 note() { local text; printf -v text '%s\n' "$*"; presentation_stdout note "$text"; }
+
+begin_mutable_execution() {
+  exec 7>&1 8>&2
+  exec 1>/dev/null 2>/dev/null
+  PRESENTATION_FDS_PINNED=true
+  PRESENTATION_MUTABLE=true
+}
 
 validate_command_options() { # command operands
   local command=$1
@@ -1629,7 +1653,7 @@ quarantine_inspected_stale_operation_lock() {
     die "stale operation lock quarantine changed after move"
   fi
   OPERATION_LOCK_DIR=$original_lock_dir
-  print_warning "Retained stale operation lock quarantine: $quarantine"
+  print_stale_quarantine_warning "$quarantine"
 }
 
 acquire_operation_lock() { # command
@@ -2496,7 +2520,7 @@ run_hook_file() { # mode phase scope hook uuid device deadline epoch round locke
     pre|post|deferred-pre|deferred-post) ;;
     *) die "unknown hook execution mode: $mode" ;;
   esac
-  if "$hook" "${HOOK_ARGV[@]}"; then
+  if execute_hook_child "$hook" "${HOOK_ARGV[@]}"; then
     return 0
   else
     status=$?
@@ -2504,6 +2528,14 @@ run_hook_file() { # mode phase scope hook uuid device deadline epoch round locke
   report_hook_failure "$phase" "$scope" "$status" "$hook" || true
   [[ "$mode" == *post ]] && return 1
   return "$status"
+}
+
+execute_hook_child() { # hook argv...
+  if [[ "$PRESENTATION_FDS_PINNED" == true ]]; then
+    "$@" >&7 2>&8 7>&- 8>&-
+  else
+    "$@"
+  fi
 }
 
 discover_hooks_reset() {
@@ -6294,6 +6326,7 @@ execute_data_snapshot_cleanup() {
 }
 
 execute_unmount() {
+  local offenders
   inspect_runtime_state
   [[ "$SNAPSHOT_VALID" == true \
     && "$SNAPSHOT_ACTUAL_UUID" == "$PLAN_CONTEXT_UUID" \
@@ -6305,7 +6338,8 @@ execute_unmount() {
       || die "mounted vault identity changed before unmount"
     if ! diskutil unmount "$MOUNT_POINT"; then
       note "vault is busy, offending processes:"
-      lsof +f -- "$MOUNT_POINT" || true
+      offenders=$(lsof +f -- "$MOUNT_POINT" 2>&1) || true
+      [[ -z "$offenders" ]] || note "$offenders"
       die "close them and rerun vaultlock lock (no crypto state was changed)"
     fi
   fi
@@ -7126,6 +7160,7 @@ print_result_line() { # transition detail
 }
 
 finish_presentation_status() {
+  local text prefix=vaultlock:
   if [[ "$PRESENTATION_STDOUT_FAILED" == false \
       && "$PRESENTATION_STDERR_FAILED" == false ]]; then
     return 0
@@ -7133,8 +7168,10 @@ finish_presentation_status() {
   if [[ "$PRESENTATION_STDERR_FAILED" == false ]]; then
     print_error "presentation output failed" || true
   elif [[ "$PRESENTATION_STDOUT_FAILED" == false ]]; then
-    presentation_stdout presentation-failure \
-      $'vaultlock: presentation output failed\n' || true
+    [[ "$COLOR_STDOUT" != true ]] \
+      || printf -v prefix '%s%s%s' "$COLOR_RED" "$prefix" "$COLOR_RESET"
+    printf -v text '%s presentation output failed\n' "$prefix"
+    presentation_stdout presentation-failure "$text" || true
   fi
   return 74
 }
@@ -7174,8 +7211,8 @@ run_planned_command() { # command
       ;;
     *) die "no planned command runner for: $command" ;;
   esac
-  run_named_transition progress_plan_before_validation "$state_file"
   prevalidate_progress_plan "$command"
+  run_named_transition progress_plan_before_validation "$state_file"
   freeze_planned_command_snapshot "$command"
   render_selected_plan "$command"
   if [[ "$OPTION_DRY_RUN" == "true" ]]; then
@@ -7183,7 +7220,7 @@ run_planned_command() { # command
     return 0
   fi
   [[ "$command" == unlock ]] || confirm_plan
-  PRESENTATION_MUTABLE=true
+  begin_mutable_execution
   acquire_operation_lock "$command"
   revalidate_plan_under_operation_lock "$command"
   if [[ "$command" == unlock ]]; then
@@ -7331,7 +7368,7 @@ case "${1:-}" in
     [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
       || die_usage "unknown command: __diagnostic"
     [[ $# -eq 3 ]] \
-      || die_usage "usage: vaultlock __diagnostic <auto|always|never> <release|hook>"
+      || die_usage "usage: vaultlock __diagnostic <auto|always|never> <release|hook|stale>"
     OPTION_COLOR=$2
     resolve_colour "$OPTION_COLOR"
     case "$3" in
@@ -7339,9 +7376,24 @@ case "${1:-}" in
       hook)
         report_hook_failure post-unlock global 73 '/tmp/failing hook' || true
         ;;
+      stale)
+        print_stale_quarantine_warning \
+          "$OPERATION_LOCK_DIR.quarantine.fixture" || true
+        ;;
       *) die_usage "unknown diagnostic fixture: $3" ;;
     esac
     exit 1
+    ;;
+  __presentation_failure)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __presentation_failure"
+    [[ $# -eq 2 ]] \
+      || die_usage "usage: vaultlock __presentation_failure <auto|always|never>"
+    OPTION_COLOR=$2
+    resolve_colour "$OPTION_COLOR"
+    PRESENTATION_MUTABLE=true
+    PRESENTATION_STDERR_FAILED=true
+    finish_presentation_status
     ;;
   __colour)
     [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
