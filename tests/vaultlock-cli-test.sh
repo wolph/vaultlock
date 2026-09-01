@@ -1257,6 +1257,18 @@ $fixture_ditto_destination_parent/$fixture_ditto_destination_leaf
       [[ -f "$fixture_transition_marker" ]] || exit 0
       fixture_transition_action=$(< "$fixture_transition_marker")
       case "$fixture_transition_action" in
+        clear_effect_logs)
+          : > "$VAULTLOCK_TEST_ACTION_LOG"
+          : > "$VAULTLOCK_TEST_MUTATION_LOG"
+          : > "$VAULTLOCK_TEST_HOOK_LOG"
+          ;;
+        wait_for_presentation_reader_close)
+          : > "$VAULTLOCK_TEST_APFS_STATE/${fixture_transition}_entered"
+          while [[ ! -f \
+              "$VAULTLOCK_TEST_APFS_STATE/${fixture_transition}_release" ]]; do
+            /bin/sleep 0.001
+          done
+          ;;
       signal_HUP|signal_INT|signal_TERM|signal_KILL)
         fixture_transition_signal=${fixture_transition_action#signal_}
         if [[ "$fixture_transition_signal" == KILL ]]; then
@@ -1757,6 +1769,14 @@ $VAULTLOCK_STATE_DIR/hooks/pre-lock.d/10-planned-link
           && "$fixture_command" \
             == "$(fixture_read fail_hook_name)" ]]; then
         exit 73
+      fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/verify_hook_pipe_default" ]]; then
+        if [[ -z "$(trap -p PIPE)" ]]; then
+          : > "$VAULTLOCK_TEST_APFS_STATE/hook_pipe_was_default"
+        else
+          trap -p PIPE \
+            > "$VAULTLOCK_TEST_APFS_STATE/hook_pipe_disposition"
+        fi
       fi
       ;;
   esac
@@ -2732,10 +2752,12 @@ test_task3_secure_and_repair_progress() {
 test_task3_progress_mapper_prevalidation() {
   local output status
 
-  reset_task2_deferred_fixture
+  task3_prepare_lock_fixture
+  printf 'confirmation sentinel\n' > "$confirm_device"
+  printf 'clear_effect_logs\n' \
+    > "$apfs_state/transition_progress_plan_before_validation"
   if output=$(VAULTLOCK_TEST_PROGRESS_MAPPING_FAIL_OPERATION=tm_exclude \
-      run_vaultlock __progress_prevalidation lock \
-      tm_exclude_state tm_exclude 2>&1); then
+      run_vaultlock lock -v --yes --no-hooks '2099-01-02 03:04' 2>&1); then
     status=0
   else
     status=$?
@@ -2745,8 +2767,14 @@ test_task3_progress_mapper_prevalidation() {
     'progress mapping failure for operation ID: tm_exclude' "$output"
   check_not_contains "progress mapper failure emits no success arrow" \
     '->' "$output"
+  check "progress mapper failure never opens confirmation device" \
+    'confirmation sentinel' "$(< "$confirm_device")"
+  check "progress mapper failure leaves operation lock absent" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
   check_empty "progress mapper failure performs no action" "$action_log"
   check_empty "progress mapper failure performs no mutation" "$mutation_log"
+  check_empty "progress mapper failure runs no hook" "$hook_log"
 }
 
 task3_reset_init_fixture() {
@@ -2830,6 +2858,327 @@ test_task3_adopt_progress() {
     '-> Replace the source with its vault symlink'
 }
 
+start_epipe_vaultlock() { # stdout stderr command arguments...
+  local stdout_path=$1 stderr_path=$2
+  shift 2
+  /usr/bin/perl -e '
+    $SIG{INT} = "DEFAULT";
+    $SIG{PIPE} = "DEFAULT";
+    exec @ARGV or die "exec failed: $!\n";
+  ' /usr/bin/env \
+    "HOME=$test_home" \
+    "PATH=$fake_bin" \
+    "VAULTLOCK_STATE_DIR=$state_dir" \
+    "VAULTLOCK_MOUNT_POINT=$mount_point" \
+    "VAULTLOCK_MOUNT_COMMAND=$fake_bin/mount-fixture" \
+    "VAULTLOCK_CONFIRM_DEVICE=$confirm_device" \
+    "VAULTLOCK_TEST_FAKE_SYSTEM=1" \
+    "VAULTLOCK_TEST_FAKE_BIN=$fake_bin" \
+    "VAULTLOCK_TEST_DITTO=$fake_bin/ditto" \
+    "VAULTLOCK_TEST_BSD_FIND=$fake_bin/find" \
+    "VAULTLOCK_TEST_BSD_LS=$fake_bin/ls" \
+    "VAULTLOCK_TEST_BSD_STAT=$fake_bin/stat" \
+    "VAULTLOCK_TEST_PS=$fake_bin/ps" \
+    "VAULTLOCK_TEST_OPENSSL=$fake_bin/openssl" \
+    "VAULTLOCK_TEST_MKDIR=$fake_bin/mkdir" \
+    "VAULTLOCK_TEST_MKTEMP=$fake_bin/mktemp" \
+    "VAULTLOCK_TEST_LN=$fake_bin/ln" \
+    "VAULTLOCK_TEST_MV=$fake_bin/mv" \
+    "VAULTLOCK_TEST_RM=$fake_bin/rm" \
+    "VAULTLOCK_TEST_RMDIR=$fake_bin/rmdir" \
+    "VAULTLOCK_TEST_CHMOD=$fake_bin/chmod" \
+    "VAULTLOCK_TEST_TRANSITION=$fake_bin/transition-fixture" \
+    "VAULTLOCK_TEST_LOCK_CRYPTO_MARKER_LOG=$apfs_state/lock-crypto-markers" \
+    "VAULTLOCK_TEST_ACTION_LOG=$action_log" \
+    "VAULTLOCK_TEST_MUTATION_LOG=$mutation_log" \
+    "VAULTLOCK_TEST_HOOK_LOG=$hook_log" \
+    "VAULTLOCK_TEST_APFS_STATE=$apfs_state" \
+    /bin/bash "$VL" "$@" > "$stdout_path" 2> "$stderr_path" &
+  EPIPE_WRITER_PID=$!
+}
+
+run_with_stdout_epipe() { # transition command arguments...
+  local transition=$1 fifo=$test_root/epipe-stdout.fifo writer_pid
+  shift
+  /bin/rm -f "$fifo"
+  /usr/bin/mkfifo "$fifo"
+  /bin/cat "$fifo" > "$test_root/epipe-stdout" &
+  EPIPE_READER_PID=$!
+  /bin/rm -f "$apfs_state/presentation_stdout_${transition}_entered" \
+    "$apfs_state/presentation_stdout_${transition}_release"
+  printf 'wait_for_presentation_reader_close\n' \
+    > "$apfs_state/transition_presentation_stdout_$transition"
+  start_epipe_vaultlock "$fifo" "$test_root/epipe-stderr" "$@"
+  writer_pid=$EPIPE_WRITER_PID
+  while [[ ! -f \
+      "$apfs_state/presentation_stdout_${transition}_entered" ]]; do
+    /bin/sleep 0.001
+  done
+  /bin/cp "$mutation_log" "$test_root/epipe-mutations-at-failure"
+  if [[ -f "$apfs_state/lock-crypto-markers" ]]; then
+    /bin/cp "$apfs_state/lock-crypto-markers" \
+      "$test_root/epipe-crypto-at-failure"
+  else
+    : > "$test_root/epipe-crypto-at-failure"
+  fi
+  /bin/kill -TERM "$EPIPE_READER_PID"
+  wait "$EPIPE_READER_PID" 2>/dev/null || true
+  : > "$apfs_state/presentation_stdout_${transition}_release"
+  if wait "$writer_pid"; then EPIPE_STATUS=0; else EPIPE_STATUS=$?; fi
+  /bin/rm -f "$fifo"
+}
+
+run_with_stderr_epipe() { # transition command arguments...
+  local transition=$1 fifo=$test_root/epipe-stderr.fifo writer_pid
+  shift
+  /bin/rm -f "$fifo"
+  /usr/bin/mkfifo "$fifo"
+  /bin/cat "$fifo" > "$test_root/epipe-stderr" &
+  EPIPE_READER_PID=$!
+  /bin/rm -f "$apfs_state/presentation_stderr_${transition}_entered" \
+    "$apfs_state/presentation_stderr_${transition}_release"
+  printf 'wait_for_presentation_reader_close\n' \
+    > "$apfs_state/transition_presentation_stderr_$transition"
+  start_epipe_vaultlock "$test_root/epipe-stdout" "$fifo" "$@"
+  writer_pid=$EPIPE_WRITER_PID
+  while [[ ! -f \
+      "$apfs_state/presentation_stderr_${transition}_entered" ]]; do
+    /bin/sleep 0.001
+  done
+  /bin/kill -TERM "$EPIPE_READER_PID"
+  wait "$EPIPE_READER_PID" 2>/dev/null || true
+  : > "$apfs_state/presentation_stderr_${transition}_release"
+  if wait "$writer_pid"; then EPIPE_STATUS=0; else EPIPE_STATUS=$?; fi
+  /bin/rm -f "$fifo"
+}
+
+run_with_both_epipe() { # stdout_transition stderr_transition command arguments...
+  local stdout_transition=$1 stderr_transition=$2
+  local stdout_fifo=$test_root/epipe-both-stdout.fifo
+  local stderr_fifo=$test_root/epipe-both-stderr.fifo writer_pid
+  local stdout_reader_pid stderr_reader_pid
+  shift 2
+  /bin/rm -f "$stdout_fifo" "$stderr_fifo"
+  /usr/bin/mkfifo "$stdout_fifo" "$stderr_fifo"
+  /bin/cat "$stdout_fifo" > "$test_root/epipe-stdout" &
+  stdout_reader_pid=$!
+  /bin/cat "$stderr_fifo" > "$test_root/epipe-stderr" &
+  stderr_reader_pid=$!
+  /bin/rm -f \
+    "$apfs_state/presentation_stdout_${stdout_transition}_entered" \
+    "$apfs_state/presentation_stdout_${stdout_transition}_release" \
+    "$apfs_state/presentation_stderr_${stderr_transition}_entered" \
+    "$apfs_state/presentation_stderr_${stderr_transition}_release"
+  printf 'wait_for_presentation_reader_close\n' \
+    > "$apfs_state/transition_presentation_stdout_$stdout_transition"
+  printf 'wait_for_presentation_reader_close\n' \
+    > "$apfs_state/transition_presentation_stderr_$stderr_transition"
+  start_epipe_vaultlock "$stdout_fifo" "$stderr_fifo" "$@"
+  writer_pid=$EPIPE_WRITER_PID
+  while [[ ! -f \
+      "$apfs_state/presentation_stdout_${stdout_transition}_entered" ]]; do
+    /bin/sleep 0.001
+  done
+  /bin/kill -TERM "$stdout_reader_pid"
+  wait "$stdout_reader_pid" 2>/dev/null || true
+  : > "$apfs_state/presentation_stdout_${stdout_transition}_release"
+  while [[ ! -f \
+      "$apfs_state/presentation_stderr_${stderr_transition}_entered" ]]; do
+    /bin/sleep 0.001
+  done
+  /bin/kill -TERM "$stderr_reader_pid"
+  wait "$stderr_reader_pid" 2>/dev/null || true
+  : > "$apfs_state/presentation_stderr_${stderr_transition}_release"
+  if wait "$writer_pid"; then EPIPE_STATUS=0; else EPIPE_STATUS=$?; fi
+  /bin/rm -f "$stdout_fifo" "$stderr_fifo"
+}
+
+check_task4_locked_convergence() { # description
+  local description=$1
+  check "$description records locked state" true \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check "$description leaves APFS locked" true \
+    "$(< "$apfs_state/locked")"
+  check "$description removes plaintext" false \
+    "$([[ -e "$state_dir/passphrase.txt" ]] && printf true || printf false)"
+  check "$description removes keychain recovery" false \
+    "$([[ -e "$apfs_state/keychain_marker" ]] && printf true || printf false)"
+  check "$description releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+}
+
+test_task4_epipe_presentation() {
+  local epipe_group signal_case signal_name signal_status
+  local expected_crypto_markers
+
+  expected_crypto_markers=$'generate-new-plaintext\nwrite-staged-plaintext\nchange-apfs-passphrase\ninstall-rotated-plaintext\nupdate-keychain\ncreate-tle-ciphertext\nverify-ciphertext-nonempty\nverify-ciphertext-not-early\nverify-expected-early-error\nwrite-plaintext-hash\nwrite-locked-json\ninstall-locked-json\nremove-plaintext\nremove-keychain-plaintext\nlock-apfs\nverify-filevault\nverify-mount-resistance'
+
+  task3_prepare_lock_fixture
+  run_with_stdout_epipe summary lock -v --yes --no-hooks \
+    '2099-01-02 03:04'
+  check "summary EPIPE exits nonzero" 74 "$EPIPE_STATUS"
+  check_empty "summary EPIPE stops before mutation" "$mutation_log"
+  check "summary EPIPE acquires no operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  for epipe_group in \
+      progress_time-machine progress_time-lock progress_apfs-lock; do
+    task3_prepare_lock_fixture
+    /bin/rm -f "$apfs_state/lock-crypto-markers"
+    run_with_stdout_epipe "$epipe_group" lock -v --yes --no-hooks \
+      '2099-01-02 03:04'
+    check "$epipe_group EPIPE exits with presentation status" \
+      74 "$EPIPE_STATUS"
+    check_task4_locked_convergence "$epipe_group EPIPE"
+    check "$epipe_group EPIPE preserves exact crypto marker order" \
+      "$expected_crypto_markers" "$(< "$apfs_state/lock-crypto-markers")"
+    check_contains "$epipe_group EPIPE reports through surviving stderr" \
+      'vaultlock: presentation output failed' "$(< "$test_root/epipe-stderr")"
+    case "$epipe_group" in
+      progress_time-machine)
+        check_empty "Time Machine EPIPE occurs before domain mutation" \
+          "$test_root/epipe-mutations-at-failure"
+        check_empty "Time Machine EPIPE occurs before crypto" \
+          "$test_root/epipe-crypto-at-failure"
+        ;;
+      progress_time-lock)
+        check "time-lock EPIPE occurs after rotation and before encryption" \
+          $'generate-new-plaintext\nwrite-staged-plaintext\nchange-apfs-passphrase\ninstall-rotated-plaintext\nupdate-keychain' \
+          "$(< "$test_root/epipe-crypto-at-failure")"
+        ;;
+      progress_apfs-lock)
+        check "APFS lock EPIPE occurs after both recovery removals" \
+          $'generate-new-plaintext\nwrite-staged-plaintext\nchange-apfs-passphrase\ninstall-rotated-plaintext\nupdate-keychain\ncreate-tle-ciphertext\nverify-ciphertext-nonempty\nverify-ciphertext-not-early\nverify-expected-early-error\nwrite-plaintext-hash\nwrite-locked-json\ninstall-locked-json\nremove-plaintext\nremove-keychain-plaintext' \
+          "$(< "$test_root/epipe-crypto-at-failure")"
+        ;;
+    esac
+  done
+
+  task3_prepare_unlock_fixture
+  /bin/rm -f "$apfs_state/unlock_leaves_unmounted"
+  run_with_stdout_epipe progress_mount unlock -v --no-hooks
+  check "unlock progress EPIPE exits with presentation status" \
+    74 "$EPIPE_STATUS"
+  check "unlock progress EPIPE records usable state" false \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check "unlock progress EPIPE leaves APFS mounted" true \
+    "$(< "$apfs_state/mounted")"
+  check "unlock progress EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  task3_prepare_unlock_fixture
+  /bin/mkdir -p "$state_dir/hooks/post-unlock.d"
+  /bin/cp "$TEST_SELF" "$state_dir/hooks/post-unlock.d/20-epipe-post"
+  /bin/chmod 700 "$state_dir/hooks/post-unlock.d/20-epipe-post"
+  : > "$apfs_state/verify_hook_pipe_default"
+  run_with_stdout_epipe hook-progress unlock -v
+  check "post-hook progress EPIPE preserves presentation status" 74 "$EPIPE_STATUS"
+  check "post-hook progress EPIPE records usable state" false \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check_contains "post-hook progress EPIPE still runs hook" \
+    '20-epipe-post --phase post-unlock' "$(< "$hook_log")"
+  check "post-hook child retains default PIPE disposition" true \
+    "$([[ -f "$apfs_state/hook_pipe_was_default" ]] \
+      && printf true || printf false)"
+  check "post-hook progress EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  task3_reset_init_fixture
+  run_with_stdout_epipe progress_init-volume init -v --yes
+  check "init progress EPIPE exits with presentation status" 74 "$EPIPE_STATUS"
+  check "init progress EPIPE converges" false \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check "init progress EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  reset_task2_deferred_fixture
+  write_json_state false null null null UUID-INIT
+  write_apfs_state false true UUID-INIT disk8s1
+  printf '%s' "$task2_unlock_passphrase" > "$state_dir/passphrase.txt"
+  EPIPE_ADOPT_SOURCE="$test_root/epipe adopt source"
+  /bin/mkdir -p "$EPIPE_ADOPT_SOURCE"
+  printf 'payload\n' > "$EPIPE_ADOPT_SOURCE/file"
+  run_with_stdout_epipe progress_adopt-verify adopt -v --yes \
+    "$EPIPE_ADOPT_SOURCE"
+  check "adopt progress EPIPE exits with presentation status" 74 "$EPIPE_STATUS"
+  check "adopt progress EPIPE converges" true \
+    "$([[ -L "$EPIPE_ADOPT_SOURCE" ]] && printf true || printf false)"
+  check "adopt progress EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  reset_task2_deferred_fixture
+  write_json_state true 2099-01-02T03:04:00+0100 4070999040 \
+    792731235 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  printf 'fixture ciphertext\n' > "$state_dir/passphrase.tle"
+  printf '%s\n' "$task2_lock_hash" > "$state_dir/passphrase.sha256"
+  run_with_stdout_epipe result lock -v --yes --no-hooks 20h
+  check "final Result EPIPE exits with presentation status" 74 "$EPIPE_STATUS"
+  check "final Result EPIPE keeps verified target" true \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check "final Result EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  reset_task2_deferred_fixture
+  write_json_state true 2099-01-02T03:04:00+0100 4070999040 \
+    792731235 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  printf 'fixture ciphertext\n' > "$state_dir/passphrase.tle"
+  printf '%s\n' "$task2_lock_hash" > "$state_dir/passphrase.sha256"
+  : > "$apfs_state/fail_operation_lock_release"
+  run_with_stderr_epipe error lock -v --yes --no-hooks 20h
+  check "stderr EPIPE keeps release failure status" 1 "$EPIPE_STATUS"
+  check_contains "stderr EPIPE leaves stdout progress available" \
+    '-> Verify the secure locked target' "$(< "$test_root/epipe-stdout")"
+  check "stderr EPIPE retains unreleased operation lock" true \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  reset_task2_deferred_fixture
+  write_json_state true 2099-01-02T03:04:00+0100 4070999040 \
+    792731235 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  printf 'fixture ciphertext\n' > "$state_dir/passphrase.tle"
+  printf '%s\n' "$task2_lock_hash" > "$state_dir/passphrase.sha256"
+  run_with_both_epipe progress_secure-target error \
+    lock -v --yes --no-hooks 20h
+  check "both stream EPIPE exits with presentation status" 74 "$EPIPE_STATUS"
+  check "both stream EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  task3_prepare_lock_fixture
+  : > "$apfs_state/fail_tle_encrypt"
+  run_with_stdout_epipe progress_time-machine lock -v --yes --no-hooks \
+    '2099-01-02 03:04'
+  check "domain failure takes precedence over stdout EPIPE" 1 "$EPIPE_STATUS"
+  check "domain failure after stdout EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  for signal_case in HUP:129 INT:130 TERM:143; do
+    signal_name=${signal_case%%:*}
+    signal_status=${signal_case##*:}
+    task3_prepare_lock_fixture
+    printf 'signal_%s\n' "$signal_name" \
+      > "$apfs_state/transition_lock_before_change_passphrase"
+    run_with_stdout_epipe progress_time-machine lock -v --yes --no-hooks \
+      '2099-01-02 03:04'
+    check "$signal_name takes precedence over stdout EPIPE" \
+      "$signal_status" "$EPIPE_STATUS"
+    check "$signal_name after stdout EPIPE releases operation lock" false \
+      "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+        && printf true || printf false)"
+  done
+}
+
 run_task3_progress_tests() {
   test_task3_lock_progress
   test_task3_unlock_progress
@@ -2841,6 +3190,11 @@ run_task3_progress_tests() {
 
 if [[ "${VAULTLOCK_TEST_TASK3_PROGRESS_ONLY:-0}" == 1 ]]; then
   run_task3_progress_tests
+  exit "$fail"
+fi
+
+if [[ "${VAULTLOCK_TEST_PRESENTATION_EPIPE_ONLY:-0}" == 1 ]]; then
+  test_task4_epipe_presentation
   exit "$fail"
 fi
 
@@ -3312,6 +3666,26 @@ assert_fake_error "last always colours validation error" \
   false false set dumb 64 \
   "$red_prefix $unlock_usage" unlock --color=never --color=always extra
 
+diagnostic_release="operation lock retained: $operation_lock_dir"
+diagnostic_hook='post-unlock global hook failed with exit 73: /tmp/failing hook'
+for diagnostic_case in \
+    "release:auto:true:$red_prefix $diagnostic_release" \
+    "release:always:false:$red_prefix $diagnostic_release" \
+    "release:never:true:$plain_prefix $diagnostic_release" \
+    "hook:auto:true:$red_prefix $diagnostic_hook" \
+    "hook:always:false:$red_prefix $diagnostic_hook" \
+    "hook:never:true:$plain_prefix $diagnostic_hook"; do
+  diagnostic_kind=${diagnostic_case%%:*}
+  diagnostic_rest=${diagnostic_case#*:}
+  diagnostic_colour=${diagnostic_rest%%:*}
+  diagnostic_rest=${diagnostic_rest#*:}
+  diagnostic_tty=${diagnostic_rest%%:*}
+  diagnostic_expected=${diagnostic_rest#*:}
+  assert_fake_error "$diagnostic_kind $diagnostic_colour diagnostic colour" \
+    false "$diagnostic_tty" '' xterm-256color 1 \
+    "$diagnostic_expected" __diagnostic "$diagnostic_colour" "$diagnostic_kind"
+done
+
 if help_output=$(run_vaultlock help 2>&1); then
   help_status=0
 else
@@ -3327,7 +3701,7 @@ check_line "help lists adopt safety options" \
 check_line "help lists long verbose options" \
   '  -v, --verbose              show grouped progress' "$help_output"
 check_line "help lists long very verbose options" \
-  '  -vv, --very-verbose        show every planned and completed action' \
+  '  -vv, --very-verbose        grouped progress plus the complete numbered operation plan and exact planned hook argv' \
   "$help_output"
 check_line "help limits status to colour options" \
   '  status [--color=MODE]      show lock state and remaining time' \
@@ -8366,6 +8740,16 @@ else
   printf '%s\n' "$task2_deferred_output"
   record_failure \
     "Task 2 deferred presentation child exited $task2_deferred_status"
+fi
+
+if presentation_epipe_output=$(VAULTLOCK_TEST_PRESENTATION_EPIPE_ONLY=1 \
+    /bin/bash "$TEST_SELF" "$VL" 2>&1); then
+  printf '%s\n' "$presentation_epipe_output"
+else
+  presentation_epipe_status=$?
+  printf '%s\n' "$presentation_epipe_output"
+  record_failure \
+    "presentation EPIPE child exited $presentation_epipe_status"
 fi
 
 for deferred_lock_hook_shape in symlink hardlink foreign-owner; do

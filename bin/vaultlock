@@ -73,6 +73,10 @@ COLOR_DIM=$'\033[2m'
 COLOR_YELLOW=$'\033[33m'
 COLOR_GREEN=$'\033[32m'
 COLOR_RED=$'\033[31m'
+PRESENTATION_MUTABLE=false
+PRESENTATION_CAPTURE=false
+PRESENTATION_STDOUT_FAILED=false
+PRESENTATION_STDERR_FAILED=false
 
 PLAN_OPERATION_IDS=()
 PLAN_OPERATION_TEXT=()
@@ -81,6 +85,19 @@ PLAN_HOOK_PHASES=()
 PLAN_HOOK_SCOPES=()
 PLAN_HOOK_DIRECTORIES=()
 PROGRESS_EMITTED_GROUP_IDS=()
+KNOWN_OPERATION_IDS=(
+  operation_lock_acquire operation_lock_quarantine operation_lock_release
+  repair_verify_plaintext repair_unlock_apfs repair_mount
+  verify_mount_identity hooks_disabled hook deferred_hook_discovery
+  tm_exclude_state tm_exclude tm_delete_vault_snapshots
+  tm_delete_data_snapshots unmount_vault stage_recovery
+  rotate_apfs_recovery keychain_update tle_encrypt tle_verify_future
+  persist_locked_recovery remove_plaintext apfs_lock
+  verify_locked_postconditions tle_decrypt verify_decrypted_hash apfs_unlock
+  persist_plaintext persist_unlocked_state verify_secure_target
+  verify_unlocked_target init_prepare_state init_create_volume init_write_state
+  adopt_copy adopt_verify adopt_replace_source
+)
 PLAN_CONTEXT_UUID=""
 PLAN_CONTEXT_DEVICE=""
 PLAN_CONTEXT_DEADLINE=""
@@ -275,35 +292,93 @@ resolve_colour() { # mode
   esac
 }
 
-print_stdout_style() { # escape text
-  if [[ "$COLOR_STDOUT" == "true" ]]; then
-    printf '%s%s%s' "$1" "$2" "$COLOR_RESET"
-  else
-    printf '%s' "$2"
+presentation_write() { # stream transition text
+  local stream=$1 transition=$2 text=$3 transition_marker
+  if [[ "$PRESENTATION_CAPTURE" == true ]]; then
+    printf '%s' "$text"
+    return 0
   fi
+  if [[ "$stream" == stdout ]]; then
+    [[ "$PRESENTATION_STDOUT_FAILED" == false ]] \
+      || { [[ "$PRESENTATION_MUTABLE" == true ]] && return 0; return 74; }
+  else
+    [[ "$PRESENTATION_STDERR_FAILED" == false ]] \
+      || { [[ "$PRESENTATION_MUTABLE" == true ]] && return 0; return 74; }
+  fi
+  transition_marker=${VAULTLOCK_TEST_APFS_STATE:-}/transition_presentation_${stream}_$transition
+  if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == 1 \
+      && -n "${VAULTLOCK_TEST_APFS_STATE:-}" \
+      && -f "$transition_marker" ]]; then
+    run_named_transition "presentation_${stream}_$transition" "$STATE_DIR"
+  fi
+  if [[ "$stream" == stdout ]]; then
+    if /usr/bin/printf '%s' "$text"; then
+      return 0
+    fi
+    PRESENTATION_STDOUT_FAILED=true
+  else
+    if /usr/bin/printf '%s' "$text" >&2; then
+      return 0
+    fi
+    PRESENTATION_STDERR_FAILED=true
+  fi
+  [[ "$PRESENTATION_MUTABLE" == true ]] && return 0
+  return 74
+}
+
+presentation_stdout() { presentation_write stdout "$1" "$2"; }
+presentation_stderr() { presentation_write stderr "$1" "$2"; }
+
+print_stdout_style() { # escape text
+  local text
+  if [[ "$COLOR_STDOUT" == "true" ]]; then
+    printf -v text '%s%s%s' "$1" "$2" "$COLOR_RESET"
+  else
+    text=$2
+  fi
+  presentation_stdout styled "$text"
 }
 
 print_stderr_style() { # escape text
+  local text
   if [[ "$COLOR_STDERR" == "true" ]]; then
-    printf '%s%s%s' "$1" "$2" "$COLOR_RESET" >&2
+    printf -v text '%s%s%s' "$1" "$2" "$COLOR_RESET"
   else
-    printf '%s' "$2" >&2
+    text=$2
   fi
+  presentation_stderr styled "$text"
 }
 
 print_heading() { print_stdout_style "$COLOR_CYAN" "$1"; }
 print_label() { print_stdout_style "$COLOR_DIM" "$1"; }
 print_success() { print_stdout_style "$COLOR_GREEN" "$1"; }
-print_warning() { print_stderr_style "$COLOR_YELLOW" "$1"; }
-
-print_error() { # message
-  print_stderr_style "$COLOR_RED" "vaultlock:"
-  printf ' %s\n' "$1" >&2
+print_warning() { # message
+  local text prefix=vaultlock:
+  [[ "$COLOR_STDERR" != true ]] \
+    || printf -v prefix '%s%s%s' "$COLOR_YELLOW" "$prefix" "$COLOR_RESET"
+  printf -v text '%s %s\n' "$prefix" "$1"
+  presentation_stderr warning "$text"
 }
 
-die() { print_error "$*"; exit 1; }
-die_usage() { print_error "$*"; exit 64; }
-note() { printf '%s\n' "$*"; }
+print_error() { # message
+  local text prefix=vaultlock:
+  [[ "$COLOR_STDERR" != true ]] \
+    || printf -v prefix '%s%s%s' "$COLOR_RED" "$prefix" "$COLOR_RESET"
+  printf -v text '%s %s\n' "$prefix" "$1"
+  presentation_stderr error "$text"
+}
+
+report_operation_lock_release_failure() {
+  print_error "operation lock retained: $OPERATION_LOCK_DIR"
+}
+
+report_hook_failure() { # phase scope status hook
+  print_error "$1 $2 hook failed with exit $3: $4"
+}
+
+die() { print_error "$*" || true; exit 1; }
+die_usage() { print_error "$*" || true; exit 64; }
+note() { local text; printf -v text '%s\n' "$*"; presentation_stdout note "$text"; }
 
 validate_command_options() { # command operands
   local command=$1
@@ -812,7 +887,7 @@ classify_runtime_state() {
   fi
 }
 
-render_runtime_summary() {
+render_runtime_summary_body() {
   local actual_mount=unknown plaintext=absent ciphertext=absent hash=absent
 
   if [[ "$SNAPSHOT_INIT_ABSENT" == "true" ]]; then
@@ -875,6 +950,13 @@ render_runtime_summary() {
     note "drand round: target $SNAPSHOT_ROUND, current $(current_round)"
     note "when the deadline passes: vaultlock unlock (needs internet)"
   fi
+}
+
+render_runtime_summary() {
+  local rendered
+  rendered=$(PRESENTATION_CAPTURE=true render_runtime_summary_body; printf '.')
+  rendered=${rendered%.}
+  presentation_stdout summary "$rendered"
 }
 
 run_named_transition() { # transition subject
@@ -1245,8 +1327,7 @@ cleanup_unlock_staging_file() {
     UNLOCK_STAGING_DESCRIPTION=""
     return 0
   fi
-  printf 'vaultlock: %s retained at %s\n' \
-    "$UNLOCK_STAGING_DESCRIPTION" "$UNLOCK_STAGING_PATH" >&2
+  print_warning "$UNLOCK_STAGING_DESCRIPTION retained at $UNLOCK_STAGING_PATH"
   return 1
 }
 
@@ -1338,8 +1419,8 @@ cleanup_lock_staging_files() {
       && -e "$STATE_DIR/passphrase-new.txt" ]]; then
     pair_handled=true
     if ! cleanup_disposable_lock_recovery_pair; then
-      printf 'vaultlock: disposable recovery staging pair retained for inspection\n' \
-        >&2
+      print_warning \
+        "disposable recovery staging pair retained for inspection"
       failed=true
     fi
   fi
@@ -1358,11 +1439,11 @@ cleanup_lock_staging_files() {
           || "$path" == "$STATE_DIR/passphrase-new.txt" ) ]]; then
       actual=$(lock_staging_signature "$path") || actual=""
       if [[ -n "$expected" && "$actual" == "$expected" ]]; then
-        printf 'vaultlock: verified %s retained at %s\n' \
-          "${LOCK_STAGE_DESCRIPTIONS[$index]}" "$path" >&2
+        print_warning \
+          "verified ${LOCK_STAGE_DESCRIPTIONS[$index]} retained at $path"
       else
-        printf 'vaultlock: unverified %s retained at %s\n' \
-          "${LOCK_STAGE_DESCRIPTIONS[$index]}" "$path" >&2
+        print_warning \
+          "unverified ${LOCK_STAGE_DESCRIPTIONS[$index]} retained at $path"
       fi
       failed=true
       continue
@@ -1373,8 +1454,7 @@ cleanup_lock_staging_files() {
         && [[ ! -e "$path" && ! -L "$path" ]]; then
       clear_lock_staging_file "$path"
     else
-      printf 'vaultlock: %s retained at %s\n' \
-        "${LOCK_STAGE_DESCRIPTIONS[$index]}" "$path" >&2
+      print_warning "${LOCK_STAGE_DESCRIPTIONS[$index]} retained at $path"
       failed=true
     fi
   done
@@ -1389,19 +1469,17 @@ operation_cleanup_dispatcher() { # signal
   if [[ "$signal" != EXIT && "$ADOPT_TRANSACTION_PHASE" != none ]]; then
     cleanup_adopt_transaction_after_signal "$signal"
   elif [[ "$signal" != EXIT ]]; then
-    printf 'vaultlock: operation interrupted by %s\n' "$signal" >&2
+    print_error "operation interrupted by $signal" || true
   fi
   if [[ "$OPERATION_LOCK_ACTIVE" == true ]]; then
     if ! release_owned_operation_lock; then
       release_failed=true
-      printf 'vaultlock: operation lock retained: %s\n' \
-        "$OPERATION_LOCK_DIR" >&2
+      print_warning "operation lock retained: $OPERATION_LOCK_DIR" || true
     fi
   elif [[ "$OPERATION_LOCK_PARTIAL" == true ]]; then
     if ! cleanup_partial_operation_lock; then
       release_failed=true
-      printf 'vaultlock: operation lock retained: %s\n' \
-        "$OPERATION_LOCK_DIR" >&2
+      print_warning "operation lock retained: $OPERATION_LOCK_DIR" || true
     fi
   fi
   case "$signal" in
@@ -1551,7 +1629,7 @@ quarantine_inspected_stale_operation_lock() {
     die "stale operation lock quarantine changed after move"
   fi
   OPERATION_LOCK_DIR=$original_lock_dir
-  note "Retained stale operation lock quarantine: $quarantine"
+  print_warning "Retained stale operation lock quarantine: $quarantine"
 }
 
 acquire_operation_lock() { # command
@@ -1615,8 +1693,7 @@ finish_operation_lock() {
   begin_operation_signal_deferral
   release_owned_operation_lock || release_failed=true
   if [[ "$release_failed" == true ]]; then
-    printf 'vaultlock: operation lock retained: %s\n' \
-      "$OPERATION_LOCK_DIR" >&2
+    report_operation_lock_release_failure || true
   fi
   end_operation_signal_deferral
   trap - EXIT HUP INT TERM
@@ -1928,6 +2005,14 @@ validate_plan_hook_coordinates() { # phase scope
   esac
 }
 
+known_operation_id() { # operation_id
+  local operation_id=$1 known_id
+  for known_id in "${KNOWN_OPERATION_IDS[@]}"; do
+    [[ "$known_id" != "$operation_id" ]] || return 0
+  done
+  return 1
+}
+
 plan_add() { # operation_id public_description
   local operation_id=$1 public_description=$2
 
@@ -1936,23 +2021,8 @@ plan_add() { # operation_id public_description
   [[ "$operation_id" != "deferred_hook_discovery" ]] \
     || die "deferred hook discovery requires plan_add_deferred_hook"
 
-  case "$operation_id" in
-    repair_verify_plaintext|repair_unlock_apfs|repair_mount|verify_mount_identity|\
-hooks_disabled|tm_exclude_state|tm_exclude|\
-tm_delete_vault_snapshots|unmount_vault|stage_recovery|rotate_apfs_recovery|\
-keychain_update|\
-tle_encrypt|tle_verify_future|persist_locked_recovery|remove_plaintext|\
-tm_delete_data_snapshots|apfs_lock|verify_locked_postconditions|tle_decrypt|\
-verify_decrypted_hash|apfs_unlock|persist_plaintext|persist_unlocked_state|\
-verify_secure_target|verify_unlocked_target|\
-    init_prepare_state|init_create_volume|init_write_state|\
-    adopt_copy|adopt_verify|adopt_replace_source|\
-    operation_lock_acquire|operation_lock_quarantine|operation_lock_release)
-      ;;
-    *)
-      die "unknown plan operation ID: $operation_id"
-      ;;
-  esac
+  known_operation_id "$operation_id" \
+    || die "unknown plan operation ID: $operation_id"
 
   plan_append_internal "$operation_id" "$public_description" "" "" "" ""
 }
@@ -2196,24 +2266,6 @@ render_plan_actions() {
   done
 }
 
-progress_operation_is_allowlisted() { # operation_id
-  case "$1" in
-    repair_verify_plaintext|repair_unlock_apfs|repair_mount|verify_mount_identity|\
-hooks_disabled|hook|deferred_hook_discovery|tm_exclude_state|tm_exclude|\
-tm_delete_vault_snapshots|tm_delete_data_snapshots|unmount_vault|\
-stage_recovery|rotate_apfs_recovery|keychain_update|tle_encrypt|\
-tle_verify_future|persist_locked_recovery|remove_plaintext|apfs_lock|\
-verify_locked_postconditions|tle_decrypt|verify_decrypted_hash|apfs_unlock|\
-persist_plaintext|persist_unlocked_state|verify_secure_target|\
-verify_unlocked_target|init_prepare_state|init_create_volume|init_write_state|\
-adopt_copy|adopt_verify|adopt_replace_source|operation_lock_acquire|\
-operation_lock_quarantine|operation_lock_release)
-      return 0
-      ;;
-    *) return 1 ;;
-  esac
-}
-
 progress_group_for_operation() { # command operation_id
   local command=$1 operation_id=$2
   if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == 1 \
@@ -2324,14 +2376,18 @@ emit_hook_progress() { # prefix index
 }
 
 emit_hook_progress_values() { # prefix phase scope path
-  local prefix=$1 phase=$2 scope=$3 path=$4
-  print_progress_prefix "$prefix"
-  printf ' Run %s [%s] %q\n' "$phase" "$scope" "$path"
+  local prefix=$1 phase=$2 scope=$3 path=$4 text styled_prefix=$1
+  [[ "$COLOR_STDOUT" != true ]] \
+    || printf -v styled_prefix '%s%s%s' \
+      "$COLOR_CYAN" "$prefix" "$COLOR_RESET"
+  printf -v text '%s Run %s [%s] %q\n' \
+    "$styled_prefix" "$phase" "$scope" "$path"
+  presentation_stdout hook-progress "$text"
 }
 
 emit_operation_progress() { # command operation_id prefix
   local command=$1 operation_id=$2 prefix=$3 mapping group_id label
-  progress_operation_is_allowlisted "$operation_id" \
+  known_operation_id "$operation_id" \
     || die "no progress group for operation ID: $operation_id"
   mapping=$(progress_group_for_operation "$command" "$operation_id") \
     || return $?
@@ -2339,15 +2395,19 @@ emit_operation_progress() { # command operation_id prefix
   IFS=$'\t' read -r group_id label <<< "$mapping"
   progress_group_was_emitted "$group_id" && return 0
   PROGRESS_EMITTED_GROUP_IDS+=("$group_id")
-  print_progress_prefix "$prefix"
-  printf ' %s\n' "$label"
+  local text styled_prefix=$prefix
+  [[ "$COLOR_STDOUT" != true ]] \
+    || printf -v styled_prefix '%s%s%s' \
+      "$COLOR_CYAN" "$prefix" "$COLOR_RESET"
+  printf -v text '%s %s\n' "$styled_prefix" "$label"
+  presentation_stdout "progress_$group_id" "$text"
 }
 
 prevalidate_progress_plan() { # command
   local command=$1 index operation_id mapping
   for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
     operation_id=${PLAN_OPERATION_IDS[$index]}
-    progress_operation_is_allowlisted "$operation_id" \
+    known_operation_id "$operation_id" \
       || die "no progress group for operation ID: $operation_id"
     mapping=$(progress_group_for_operation "$command" "$operation_id") \
       || return $?
@@ -2370,7 +2430,7 @@ render_dry_run_progress() { # command
   done
 }
 
-render_selected_plan() { # command
+render_selected_plan_body() { # command
   local command=$1
 
   render_plan_summary "$command"
@@ -2382,6 +2442,14 @@ render_selected_plan() { # command
   if [[ "$OPTION_DRY_RUN" == true ]] && (( OPTION_VERBOSITY >= 1 )); then
     render_dry_run_progress "$command"
   fi
+}
+
+render_selected_plan() { # command
+  local command=$1 rendered
+  rendered=$(PRESENTATION_CAPTURE=true render_selected_plan_body "$command"; \
+    printf '.')
+  rendered=${rendered%.}
+  presentation_stdout summary "$rendered"
 }
 
 # Resolve the volume's current device node (diskXsY) from its stable UUID.
@@ -2410,9 +2478,8 @@ verify_mount_identity() { # expected_uuid expected_device
         return 0
     fi
 
-    printf 'vaultlock: mount identity mismatch at %s: expected UUID %s device %s, got UUID %s device %s\n' \
-        "$MOUNT_POINT" "$expected_uuid" "$expected_device" \
-        "$actual_uuid" "$actual_device" >&2
+    print_error "mount identity mismatch at $MOUNT_POINT: expected UUID $expected_uuid device $expected_device, got UUID $actual_uuid device $actual_device" \
+      || true
     return 1
 }
 
@@ -2434,8 +2501,7 @@ run_hook_file() { # mode phase scope hook uuid device deadline epoch round locke
   else
     status=$?
   fi
-  printf 'vaultlock: %s %s hook failed with exit %s: %s\n' \
-    "$phase" "$scope" "$status" "$hook" >&2
+  report_hook_failure "$phase" "$scope" "$status" "$hook" || true
   [[ "$mode" == *post ]] && return 1
   return "$status"
 }
@@ -3748,7 +3814,7 @@ remove_verified_hardlink_metadata() { # workspace identity links path file_ident
     && private_directory_is_valid "$workspace" "$workspace_identity" 700 \
       "$links_after" \
     && return 0
-  printf 'vaultlock: hard-link metadata retained at %s\n' "$path" >&2
+  print_warning "hard-link metadata retained at $path"
   return 1
 }
 
@@ -3804,8 +3870,7 @@ remove_verified_hardlink_workspace() { # workspace identity links
     && "$RMDIR_COMMAND" -- "$workspace" \
     && [[ ! -e "$workspace" && ! -L "$workspace" ]] \
     && return 0
-  printf 'vaultlock: hard-link metadata workspace retained at %s\n' \
-    "$workspace" >&2
+  print_warning "hard-link metadata workspace retained at $workspace"
   return 1
 }
 
@@ -4101,14 +4166,13 @@ cleanup_staged_link() {
     return 0
   fi
   if ! adopt_staged_link_owned_at "$ADOPT_STAGED_LINK"; then
-    printf 'vaultlock: staged link ownership changed, retained at %s\n' \
-      "$ADOPT_STAGED_LINK" >&2
+    print_warning \
+      "staged link ownership changed, retained at $ADOPT_STAGED_LINK"
     return 1
   fi
   if ! rm -f -- "$ADOPT_STAGED_LINK" \
       || [[ -e "$ADOPT_STAGED_LINK" || -L "$ADOPT_STAGED_LINK" ]]; then
-    printf 'vaultlock: cannot remove staged link, retained at %s\n' \
-      "$ADOPT_STAGED_LINK" >&2
+    print_warning "cannot remove staged link, retained at $ADOPT_STAGED_LINK"
     return 1
   fi
 }
@@ -4317,7 +4381,7 @@ cleanup_adopt_transaction_after_signal() { # signal
       ;;
   esac
   ADOPT_TRANSACTION_PHASE=none
-  printf 'vaultlock: adopt interrupted by %s: %s\n' "$signal" "$detail" >&2
+  print_error "adopt interrupted by $signal: $detail" || true
 }
 
 abort_adopt_replacement_with_rollback() { # reason
@@ -6004,7 +6068,7 @@ execute_planned_unlock_hook() { # index
 
 execute_deferred_unlock_hooks() { # index
   local index=$1 phase scope directory hook hook_scope status hook_index locked
-  local hook_argument hook_signature current_signature
+  local hook_argument hook_signature current_signature discovery_text
   phase=${PLAN_HOOK_PHASES[$index]}
   scope=${PLAN_HOOK_SCOPES[$index]}
   directory=${PLAN_HOOK_DIRECTORIES[$index]}
@@ -6021,17 +6085,20 @@ execute_deferred_unlock_hooks() { # index
     hook_scope=${DISCOVERED_HOOK_SCOPES[$hook_index]}
     hook_signature=$(hook_file_signature "$hook") \
       || die "discovered unlock hook is no longer executable and regular"
-    printf 'Discovered hook: %s [%s] %q\n' \
+    printf -v discovery_text 'Discovered hook: %s [%s] %q\n' \
       "$phase" "$hook_scope" "$hook"
+    presentation_stdout hook-discovery "$discovery_text"
     if (( OPTION_VERBOSITY >= 2 )); then
-      printf 'Discovered hook %q' "$hook"
+      printf -v discovery_text 'Discovered hook %q' "$hook"
       build_hook_argv "$phase" "$hook_scope" "$PLAN_CONTEXT_UUID" \
         "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
         "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
       for hook_argument in "${HOOK_ARGV[@]}"; do
-        printf ' %q' "$hook_argument"
+        printf -v discovery_text '%s %q' \
+          "$discovery_text" "$hook_argument"
       done
-      printf '\n'
+      discovery_text=$discovery_text$'\n'
+      presentation_stdout hook-discovery-audit "$discovery_text"
     fi
     current_signature=$(hook_file_signature "$hook") \
       || die "discovered unlock hook changed before execution"
@@ -6060,7 +6127,9 @@ lock_crypto_marker() { # public marker
   fi
   if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == 1 \
       && "${VAULTLOCK_TEST_PRINT_LOCK_CRYPTO_MARKERS:-0}" == 1 ]]; then
-    printf 'CRYPTO: %s\n' "$marker"
+    local marker_text
+    printf -v marker_text 'CRYPTO: %s\n' "$marker"
+    presentation_stdout crypto-marker "$marker_text"
   fi
   run_named_transition "lock_crypto_$marker" "$STATE_DIR"
 }
@@ -6871,7 +6940,7 @@ execute_planned_lock_hook() { # index
 
 execute_deferred_lock_hooks() { # index
   local index=$1 phase scope directory hook hook_scope hook_index locked status
-  local hook_argument hook_signature current_signature
+  local hook_argument hook_signature current_signature discovery_text
   phase=${PLAN_HOOK_PHASES[$index]}
   scope=${PLAN_HOOK_SCOPES[$index]}
   directory=${PLAN_HOOK_DIRECTORIES[$index]}
@@ -6890,17 +6959,20 @@ execute_deferred_lock_hooks() { # index
     hook_scope=${DISCOVERED_HOOK_SCOPES[$hook_index]}
     hook_signature=$(hook_file_signature "$hook") \
       || die "discovered pre-lock hook is no longer executable and regular"
-    printf 'Discovered hook: %s [%s] %q\n' \
+    printf -v discovery_text 'Discovered hook: %s [%s] %q\n' \
       "$phase" "$hook_scope" "$hook"
+    presentation_stdout hook-discovery "$discovery_text"
     if (( OPTION_VERBOSITY >= 2 )); then
-      printf 'Discovered hook %q' "$hook"
+      printf -v discovery_text 'Discovered hook %q' "$hook"
       build_hook_argv "$phase" "$hook_scope" "$PLAN_CONTEXT_UUID" \
         "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
         "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
       for hook_argument in "${HOOK_ARGV[@]}"; do
-        printf ' %q' "$hook_argument"
+        printf -v discovery_text '%s %q' \
+          "$discovery_text" "$hook_argument"
       done
-      printf '\n'
+      discovery_text=$discovery_text$'\n'
+      presentation_stdout hook-discovery-audit "$discovery_text"
     fi
     run_named_transition lock_before_deferred_hook "$hook"
     current_signature=$(hook_file_signature "$hook") \
@@ -7045,6 +7117,28 @@ operation_lock_release) continue ;;
   done
 }
 
+print_result_line() { # transition detail
+  local transition=$1 detail=$2 prefix=Result: text
+  [[ "$COLOR_STDOUT" != true ]] \
+    || printf -v prefix '%s%s%s' "$COLOR_GREEN" "$prefix" "$COLOR_RESET"
+  printf -v text '%s %s\n' "$prefix" "$detail"
+  presentation_stdout "$transition" "$text"
+}
+
+finish_presentation_status() {
+  if [[ "$PRESENTATION_STDOUT_FAILED" == false \
+      && "$PRESENTATION_STDERR_FAILED" == false ]]; then
+    return 0
+  fi
+  if [[ "$PRESENTATION_STDERR_FAILED" == false ]]; then
+    print_error "presentation output failed" || true
+  elif [[ "$PRESENTATION_STDOUT_FAILED" == false ]]; then
+    presentation_stdout presentation-failure \
+      $'vaultlock: presentation output failed\n' || true
+  fi
+  return 74
+}
+
 run_planned_command() { # command
   local command=$1
   case "$command" in
@@ -7080,14 +7174,16 @@ run_planned_command() { # command
       ;;
     *) die "no planned command runner for: $command" ;;
   esac
+  run_named_transition progress_plan_before_validation "$state_file"
+  prevalidate_progress_plan "$command"
   freeze_planned_command_snapshot "$command"
   render_selected_plan "$command"
   if [[ "$OPTION_DRY_RUN" == "true" ]]; then
-    print_success "Result:"
-    printf ' no changes made\n'
+    print_result_line result "no changes made"
     return 0
   fi
   [[ "$command" == unlock ]] || confirm_plan
+  PRESENTATION_MUTABLE=true
   acquire_operation_lock "$command"
   revalidate_plan_under_operation_lock "$command"
   if [[ "$command" == unlock ]]; then
@@ -7119,25 +7215,22 @@ run_planned_command() { # command
   fi
   case "$command" in
     init)
-      print_success "Result:"
-      printf ' created encrypted volume %s (%s), state in %s\n' \
-        "$VOLUME" "$PLAN_CONTEXT_UUID" "$STATE_DIR"
+      print_result_line result \
+        "created encrypted volume $VOLUME ($PLAN_CONTEXT_UUID), state in $STATE_DIR"
       ;;
     adopt)
-      print_success "Result:"
-      printf ' adopted %s -> %s\n' "$ADOPT_SOURCE" "$ADOPT_DESTINATION"
+      print_result_line result "adopted $ADOPT_SOURCE -> $ADOPT_DESTINATION"
       ;;
     unlock)
-      print_success "Result:"
-      printf ' unlocked and mounted at %s\n' "$MOUNT_POINT"
+      print_result_line result "unlocked and mounted at $MOUNT_POINT"
       note "next: cd ~/your-project && ./run.sh"
       ;;
     lock)
-      print_success "Result:"
-      printf ' locked until %s (drand round %s)\n' \
-        "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_ROUND"
+      print_result_line result \
+        "locked until $PLAN_CONTEXT_DEADLINE (drand round $PLAN_CONTEXT_ROUND)"
       ;;
   esac
+  finish_presentation_status
 }
 
 dispatch_init() {
@@ -7204,7 +7297,7 @@ usage: vaultlock <command>
 
 presentation options for init, adopt, lock, and unlock:
   -v, --verbose              show grouped progress
-  -vv, --very-verbose        show every planned and completed action
+  -vv, --very-verbose        grouped progress plus the complete numbered operation plan and exact planned hook argv
 
 colour options for all commands:
   --color=auto|always|never  control terminal colour (default: auto)
@@ -7233,6 +7326,22 @@ case "${1:-}" in
     printf 'dry_run=%s\nyes=%s\nhooks=%s\nverbosity=%s\ncolor=%s\noperands=%s\n' \
       "$OPTION_DRY_RUN" "$OPTION_YES" "$OPTION_HOOKS" \
       "$OPTION_VERBOSITY" "$OPTION_COLOR" "$OPTION_OPERANDS"
+    ;;
+  __diagnostic)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __diagnostic"
+    [[ $# -eq 3 ]] \
+      || die_usage "usage: vaultlock __diagnostic <auto|always|never> <release|hook>"
+    OPTION_COLOR=$2
+    resolve_colour "$OPTION_COLOR"
+    case "$3" in
+      release) report_operation_lock_release_failure || true ;;
+      hook)
+        report_hook_failure post-unlock global 73 '/tmp/failing hook' || true
+        ;;
+      *) die_usage "unknown diagnostic fixture: $3" ;;
+    esac
+    exit 1
     ;;
   __colour)
     [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
@@ -7440,9 +7549,16 @@ inconsistent_missing_hash|inconsistent_retained_plaintext)
       || die_usage "unknown command: __progress_group"
     [[ $# -eq 3 ]] \
       || die_usage "usage: vaultlock __progress_group <command> <operation_id>"
-    progress_operation_is_allowlisted "$3" \
+    known_operation_id "$3" \
       || die "no progress group for operation ID: $3"
     progress_group_for_operation "$2" "$3"
+    ;;
+  __known_operations)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __known_operations"
+    [[ $# -eq 1 ]] \
+      || die_usage "usage: vaultlock __known_operations"
+    printf '%s\n' "${KNOWN_OPERATION_IDS[@]}"
     ;;
   __progress_prevalidation)
     [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
@@ -7487,7 +7603,7 @@ inconsistent_missing_hash|inconsistent_retained_plaintext)
     HOOK_ARGV_BUILD_COUNT=0
     VAULTLOCK_TEST_COUNT_HOOK_ARGV_BUILDS=1
     serialize_common_plan_fields lock
-    render_selected_plan lock >/dev/null
+    render_selected_plan_body lock >/dev/null
     printf '%s\n' "$HOOK_ARGV_BUILD_COUNT"
     ;;
   __confirm_response)
