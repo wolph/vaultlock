@@ -350,24 +350,28 @@ check_not_contains "verbose summary still hides actions" \
 check_not_contains "verbose summary still hides hook argv" \
   "--phase" "$verbose_summary"
 
-progress_inventory=$'operation_lock_acquire\tsilent\noperation_lock_quarantine\tsilent\noperation_lock_release\tsilent\nrepair_verify_plaintext\trepair\tRepair the prerequisite usable vault state\nrepair_unlock_apfs\trepair\tRepair the prerequisite usable vault state\nrepair_mount\tmount\tMount the expected APFS volume\nverify_mount_identity\tmount-identity\tVerify the mounted vault identity\nhooks_disabled\tsilent\nhook\tsilent\ndeferred_hook_discovery\tsilent\ntm_exclude_state\ttime-machine\tPrepare Time Machine exclusions and snapshots\ntm_exclude\ttime-machine\tPrepare Time Machine exclusions and snapshots\ntm_delete_vault_snapshots\ttime-machine\tPrepare Time Machine exclusions and snapshots\ntm_delete_data_snapshots\ttime-machine\tPrepare Time Machine exclusions and snapshots\nunmount_vault\tunmount\tUnmount the vault for locking\nstage_recovery\trecovery-rotation\tRotate recovery material\nrotate_apfs_recovery\trecovery-rotation\tRotate recovery material\nkeychain_update\trecovery-rotation\tRotate recovery material\ntle_encrypt\ttime-lock\tEncrypt and record time-locked recovery material\ntle_verify_future\ttime-lock\tEncrypt and record time-locked recovery material\npersist_locked_recovery\ttime-lock\tEncrypt and record time-locked recovery material\nremove_plaintext\trecovery-removal\tRemove plaintext and keychain recovery material\napfs_lock\tapfs-lock\tLock and verify the APFS volume\nverify_locked_postconditions\tapfs-lock\tLock and verify the APFS volume\ntle_decrypt\ttime-unlock\tDecrypt and verify time-locked recovery material\nverify_decrypted_hash\ttime-unlock\tDecrypt and verify time-locked recovery material\napfs_unlock\tapfs-unlock\tUnlock the expected APFS volume\npersist_plaintext\trecovery-restore\tRestore verified recovery material\npersist_unlocked_state\trecovery-restore\tRestore verified recovery material\nverify_secure_target\tsecure-target\tVerify the secure locked target\nverify_unlocked_target\tusable-target\tVerify the usable unlocked target\ninit_prepare_state\tinit-state\tPrepare protected vault state\ninit_create_volume\tinit-volume\tCreate the encrypted APFS volume\ninit_write_state\tinit-record\tRecord the usable vault state\nadopt_copy\tadopt-copy\tCopy the source into the vault\nadopt_verify\tadopt-verify\tVerify the copied source\nadopt_replace_source\tadopt-replace\tReplace the source with its vault symlink'
-while IFS=$'\t' read -r operation_id expected_group expected_label; do
-  progress_mapping=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
-    "$VL" __progress_group lock "$operation_id" 2>&1 || true)
-  if [[ "$expected_group" == silent ]]; then
-    check "progress inventory intentionally silences $operation_id" \
-      silent "$progress_mapping"
+progress_inventory=$'init\toperation_lock_acquire\t<silent>\ninit\toperation_lock_quarantine\t<silent>\ninit\toperation_lock_release\t<silent>\nadopt\toperation_lock_acquire\t<silent>\nadopt\toperation_lock_quarantine\t<silent>\nadopt\toperation_lock_release\t<silent>\nlock\toperation_lock_acquire\t<silent>\nlock\toperation_lock_quarantine\t<silent>\nlock\toperation_lock_release\t<silent>\nunlock\toperation_lock_acquire\t<silent>\nunlock\toperation_lock_quarantine\t<silent>\nunlock\toperation_lock_release\t<silent>\nlock\trepair_verify_plaintext\trepair\tRepair the prerequisite usable vault state\nunlock\trepair_verify_plaintext\trepair\tRepair the prerequisite usable vault state\nlock\trepair_unlock_apfs\trepair\tRepair the prerequisite usable vault state\nunlock\trepair_unlock_apfs\trepair\tRepair the prerequisite usable vault state\nlock\trepair_mount\tmount\tEnsure the expected APFS volume is mounted\nunlock\trepair_mount\tmount\tEnsure the expected APFS volume is mounted\nlock\tverify_mount_identity\tmount-identity\tVerify the mounted vault identity\nunlock\tverify_mount_identity\tmount-identity\tVerify the mounted vault identity\nlock\thooks_disabled\t<silent>\nunlock\thooks_disabled\t<silent>\nlock\thook\t<silent>\nunlock\thook\t<silent>\nlock\tdeferred_hook_discovery\t<silent>\nunlock\tdeferred_hook_discovery\t<silent>\nlock\ttm_exclude_state\ttime-machine\tPrepare Time Machine exclusions and snapshots\nlock\ttm_exclude\ttime-machine\tPrepare Time Machine exclusions and snapshots\nlock\ttm_delete_vault_snapshots\ttime-machine\tPrepare Time Machine exclusions and snapshots\nlock\ttm_delete_data_snapshots\ttime-machine\tPrepare Time Machine exclusions and snapshots\nlock\tunmount_vault\tunmount\tUnmount the vault for locking\nlock\tstage_recovery\trecovery-rotation\tRotate recovery material\nlock\trotate_apfs_recovery\trecovery-rotation\tRotate recovery material\nlock\tkeychain_update\trecovery-rotation\tRotate recovery material\nunlock\tkeychain_update\trecovery-restore\tRestore verified recovery material\nlock\ttle_encrypt\ttime-lock\tEncrypt and record time-locked recovery material\nlock\ttle_verify_future\ttime-lock\tEncrypt and record time-locked recovery material\nlock\tpersist_locked_recovery\ttime-lock\tEncrypt and record time-locked recovery material\nlock\tremove_plaintext\trecovery-removal\tEnsure plaintext and keychain recovery material are absent\nlock\tapfs_lock\tapfs-lock\tLock and verify the APFS volume\nlock\tverify_locked_postconditions\tapfs-lock\tLock and verify the APFS volume\nunlock\ttle_decrypt\ttime-unlock\tDecrypt and verify time-locked recovery material\nunlock\tverify_decrypted_hash\ttime-unlock\tDecrypt and verify time-locked recovery material\nunlock\tapfs_unlock\tapfs-unlock\tUnlock the expected APFS volume\nunlock\tpersist_plaintext\trecovery-restore\tRestore verified recovery material\nunlock\tpersist_unlocked_state\trecovery-restore\tRestore verified recovery material\nlock\tverify_secure_target\tsecure-target\tVerify the secure locked target\nunlock\tverify_unlocked_target\tusable-target\tVerify the usable unlocked target\ninit\tinit_prepare_state\tinit-state\tPrepare protected vault state\ninit\tinit_create_volume\tinit-volume\tCreate the encrypted APFS volume\ninit\tinit_write_state\tinit-record\tRecord the usable vault state\nadopt\tadopt_copy\tadopt-copy\tCopy the source into the vault\nadopt\tadopt_verify\tadopt-verify\tVerify the copied source\nadopt\tadopt_replace_source\tadopt-replace\tReplace the source with its vault symlink'
+inventory_id_count=$(/usr/bin/awk -F '\t' '!seen[$2]++ { count++ } END { print count }' \
+  <<< "$progress_inventory")
+check "progress inventory covers all operation IDs" 37 "$inventory_id_count"
+while IFS=$'\t' read -r command operation_id expected_group expected_label; do
+  progress_mapping_status=0
+  if progress_mapping=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+      "$VL" __progress_group "$command" "$operation_id" 2>&1); then
+    progress_mapping_status=0
   else
-    check "progress inventory maps $operation_id" \
+    progress_mapping_status=$?
+  fi
+  check "progress inventory accepts $command:$operation_id" \
+    0 "$progress_mapping_status"
+  if [[ "$expected_group" == '<silent>' ]]; then
+    check "progress inventory intentionally silences $command:$operation_id" \
+      '' "$progress_mapping"
+  else
+    check "progress inventory maps $command:$operation_id" \
       "$expected_group"$'\t'"$expected_label" "$progress_mapping"
   fi
 done <<< "$progress_inventory"
-
-unlock_keychain_mapping=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
-  "$VL" __progress_group unlock keychain_update 2>&1 || true)
-check "unlock keychain mapping restores recovery" \
-  $'recovery-restore\tRestore verified recovery material' \
-  "$unlock_keychain_mapping"
 
 unknown_progress_status=0
 if VAULTLOCK_TEST_FAKE_SYSTEM=1 \
@@ -377,6 +381,23 @@ else
   unknown_progress_status=$?
 fi
 check "unknown progress operation fails closed" 1 "$unknown_progress_status"
+
+for rejected_progress_pair in nonsense:repair_mount \
+    init:tm_exclude_state unlock:tm_exclude_state lock:tle_decrypt; do
+  rejected_progress_command=${rejected_progress_pair%%:*}
+  rejected_progress_operation=${rejected_progress_pair#*:}
+  if rejected_progress_output=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+      "$VL" __progress_group "$rejected_progress_command" \
+      "$rejected_progress_operation" 2>&1); then
+    rejected_progress_status=0
+  else
+    rejected_progress_status=$?
+  fi
+  check "progress mapping rejects $rejected_progress_pair" \
+    1 "$rejected_progress_status"
+  check_contains "progress mapping names rejected $rejected_progress_pair" \
+    "$rejected_progress_pair" "$rejected_progress_output"
+done
 
 for progress_fixture in full_lock full_unlock init adopt unlock_repair \
     secure_noop hooks repair_remove; do
@@ -391,7 +412,7 @@ done
 repair_remove_output=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 1 never repair_remove 2>&1 || true)
 check_contains "repair-only removal uses truthful group" \
-  "Would: Remove plaintext and keychain recovery material" \
+  "Would: Ensure plaintext and keychain recovery material are absent" \
   "$repair_remove_output"
 check_not_contains "repair-only removal avoids time-lock group" \
   "Encrypt and record time-locked recovery material" "$repair_remove_output"

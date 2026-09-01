@@ -2216,80 +2216,91 @@ operation_lock_quarantine|operation_lock_release)
 
 progress_group_for_operation() { # command operation_id
   local command=$1 operation_id=$2
-  case "$operation_id" in
-    operation_lock_acquire|operation_lock_quarantine|operation_lock_release|\
-hooks_disabled|hook|deferred_hook_discovery)
-      return 1
+  if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == 1 \
+      && "${VAULTLOCK_TEST_PROGRESS_MAPPING_FAIL_OPERATION:-}" \
+        == "$operation_id" ]]; then
+    die "progress mapping failure for operation ID: $operation_id"
+  fi
+  case "$command:$operation_id" in
+    init:operation_lock_acquire|init:operation_lock_quarantine|\
+init:operation_lock_release|adopt:operation_lock_acquire|\
+adopt:operation_lock_quarantine|adopt:operation_lock_release|\
+lock:operation_lock_acquire|lock:operation_lock_quarantine|\
+lock:operation_lock_release|unlock:operation_lock_acquire|\
+unlock:operation_lock_quarantine|unlock:operation_lock_release|\
+lock:hooks_disabled|lock:hook|lock:deferred_hook_discovery|\
+unlock:hooks_disabled|unlock:hook|unlock:deferred_hook_discovery)
+      :
       ;;
-    repair_verify_plaintext|repair_unlock_apfs)
+    lock:repair_verify_plaintext|unlock:repair_verify_plaintext|\
+lock:repair_unlock_apfs|unlock:repair_unlock_apfs)
       printf 'repair\tRepair the prerequisite usable vault state\n'
       ;;
-    repair_mount)
-      printf 'mount\tMount the expected APFS volume\n'
+    lock:repair_mount|unlock:repair_mount)
+      printf 'mount\tEnsure the expected APFS volume is mounted\n'
       ;;
-    verify_mount_identity)
+    lock:verify_mount_identity|unlock:verify_mount_identity)
       printf 'mount-identity\tVerify the mounted vault identity\n'
       ;;
-    tm_exclude_state|tm_exclude|tm_delete_vault_snapshots|\
-tm_delete_data_snapshots)
+    lock:tm_exclude_state|lock:tm_exclude|\
+lock:tm_delete_vault_snapshots|lock:tm_delete_data_snapshots)
       printf 'time-machine\tPrepare Time Machine exclusions and snapshots\n'
       ;;
-    unmount_vault)
+    lock:unmount_vault)
       printf 'unmount\tUnmount the vault for locking\n'
       ;;
-    stage_recovery|rotate_apfs_recovery)
+    lock:stage_recovery|lock:rotate_apfs_recovery)
       printf 'recovery-rotation\tRotate recovery material\n'
       ;;
-    keychain_update)
-      if [[ "$command" == lock ]]; then
-        printf 'recovery-rotation\tRotate recovery material\n'
-      else
-        printf 'recovery-restore\tRestore verified recovery material\n'
-      fi
+    lock:keychain_update)
+      printf 'recovery-rotation\tRotate recovery material\n'
       ;;
-    tle_encrypt|tle_verify_future|persist_locked_recovery)
-      printf 'time-lock\tEncrypt and record time-locked recovery material\n'
-      ;;
-    remove_plaintext)
-      printf 'recovery-removal\tRemove plaintext and keychain recovery material\n'
-      ;;
-    apfs_lock|verify_locked_postconditions)
-      printf 'apfs-lock\tLock and verify the APFS volume\n'
-      ;;
-    tle_decrypt|verify_decrypted_hash)
-      printf 'time-unlock\tDecrypt and verify time-locked recovery material\n'
-      ;;
-    apfs_unlock)
-      printf 'apfs-unlock\tUnlock the expected APFS volume\n'
-      ;;
-    persist_plaintext|persist_unlocked_state)
+    unlock:keychain_update)
       printf 'recovery-restore\tRestore verified recovery material\n'
       ;;
-    verify_secure_target)
+    lock:tle_encrypt|lock:tle_verify_future|lock:persist_locked_recovery)
+      printf 'time-lock\tEncrypt and record time-locked recovery material\n'
+      ;;
+    lock:remove_plaintext)
+      printf 'recovery-removal\tEnsure plaintext and keychain recovery material are absent\n'
+      ;;
+    lock:apfs_lock|lock:verify_locked_postconditions)
+      printf 'apfs-lock\tLock and verify the APFS volume\n'
+      ;;
+    unlock:tle_decrypt|unlock:verify_decrypted_hash)
+      printf 'time-unlock\tDecrypt and verify time-locked recovery material\n'
+      ;;
+    unlock:apfs_unlock)
+      printf 'apfs-unlock\tUnlock the expected APFS volume\n'
+      ;;
+    unlock:persist_plaintext|unlock:persist_unlocked_state)
+      printf 'recovery-restore\tRestore verified recovery material\n'
+      ;;
+    lock:verify_secure_target)
       printf 'secure-target\tVerify the secure locked target\n'
       ;;
-    verify_unlocked_target)
+    unlock:verify_unlocked_target)
       printf 'usable-target\tVerify the usable unlocked target\n'
       ;;
-    init_prepare_state)
+    init:init_prepare_state)
       printf 'init-state\tPrepare protected vault state\n'
       ;;
-    init_create_volume)
+    init:init_create_volume)
       printf 'init-volume\tCreate the encrypted APFS volume\n'
       ;;
-    init_write_state)
+    init:init_write_state)
       printf 'init-record\tRecord the usable vault state\n'
       ;;
-    adopt_copy)
+    adopt:adopt_copy)
       printf 'adopt-copy\tCopy the source into the vault\n'
       ;;
-    adopt_verify)
+    adopt:adopt_verify)
       printf 'adopt-verify\tVerify the copied source\n'
       ;;
-    adopt_replace_source)
+    adopt:adopt_replace_source)
       printf 'adopt-replace\tReplace the source with its vault symlink\n'
       ;;
-    *) die "no progress group for operation ID: $operation_id" ;;
+    *) die "no progress group for command/operation: $command:$operation_id" ;;
   esac
 }
 
@@ -2322,19 +2333,31 @@ emit_operation_progress() { # command operation_id prefix
   local command=$1 operation_id=$2 prefix=$3 mapping group_id label
   progress_operation_is_allowlisted "$operation_id" \
     || die "no progress group for operation ID: $operation_id"
-  if mapping=$(progress_group_for_operation "$command" "$operation_id"); then
-    IFS=$'\t' read -r group_id label <<< "$mapping"
-  else
-    return 0
-  fi
+  mapping=$(progress_group_for_operation "$command" "$operation_id") \
+    || return $?
+  [[ -n "$mapping" ]] || return 0
+  IFS=$'\t' read -r group_id label <<< "$mapping"
   progress_group_was_emitted "$group_id" && return 0
   PROGRESS_EMITTED_GROUP_IDS+=("$group_id")
   print_progress_prefix "$prefix"
   printf ' %s\n' "$label"
 }
 
+prevalidate_progress_plan() { # command
+  local command=$1 index operation_id mapping
+  for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
+    operation_id=${PLAN_OPERATION_IDS[$index]}
+    progress_operation_is_allowlisted "$operation_id" \
+      || die "no progress group for operation ID: $operation_id"
+    mapping=$(progress_group_for_operation "$command" "$operation_id") \
+      || return $?
+    : "$mapping"
+  done
+}
+
 render_dry_run_progress() { # command
   local command=$1 index operation_id
+  prevalidate_progress_plan "$command"
   PROGRESS_EMITTED_GROUP_IDS=()
   printf '\n'
   for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
@@ -6997,6 +7020,9 @@ persist_locked_recovery) ;;
 
 execute_plan() {
   local index operation_id
+  if (( OPTION_VERBOSITY >= 1 )); then
+    prevalidate_progress_plan "$OPERATION_LOCK_COMMAND"
+  fi
   PROGRESS_EMITTED_GROUP_IDS=()
   for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
     operation_id=${PLAN_OPERATION_IDS[$index]}
@@ -7416,11 +7442,23 @@ inconsistent_missing_hash|inconsistent_retained_plaintext)
       || die_usage "usage: vaultlock __progress_group <command> <operation_id>"
     progress_operation_is_allowlisted "$3" \
       || die "no progress group for operation ID: $3"
-    if progress_group_for_operation "$2" "$3"; then
-      :
-    else
-      printf 'silent\n'
-    fi
+    progress_group_for_operation "$2" "$3"
+    ;;
+  __progress_prevalidation)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __progress_prevalidation"
+    [[ $# -ge 3 ]] \
+      || die_usage "usage: vaultlock __progress_prevalidation <command> <operation_id>..."
+    [[ -n "${VAULTLOCK_TEST_PROGRESS_MAPPING_FAIL_OPERATION:-}" ]] \
+      || die "progress prevalidation fixture requires failure injection"
+    OPERATION_LOCK_COMMAND=$2
+    OPTION_VERBOSITY=1
+    plan_reset
+    shift 2
+    for progress_fixture_operation in "$@"; do
+      plan_add "$progress_fixture_operation" "Progress fixture operation"
+    done
+    execute_plan
     ;;
   __hook_argv_builds)
     [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
