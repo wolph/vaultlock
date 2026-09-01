@@ -2062,7 +2062,6 @@ runtime_inconsistency_text() {
     printf 'recorded unlocked state disagrees with APFS state\n'
   elif [[ "$SNAPSHOT_RECORDED_LOCKED" == false \
       && "$SNAPSHOT_APFS_LOCKED" == false \
-      && "$SNAPSHOT_APFS_MOUNTED" == true \
       && "$SNAPSHOT_PLAINTEXT_PRESENT" != true ]]; then
     printf 'plaintext recovery material is missing\n'
   elif [[ "$SNAPSHOT_RECORDED_LOCKED" == true \
@@ -7107,7 +7106,8 @@ case "${1:-}" in
         RUNTIME_ASSESSMENT=inconsistent
         PLAN_TARGET_TEXT="locked at the resolved deadline"
         ;;
-      inconsistent_missing_plaintext|inconsistent_missing_ciphertext|\
+      inconsistent_missing_plaintext|inconsistent_unmounted_missing_plaintext|\
+inconsistent_missing_ciphertext|\
 inconsistent_missing_hash|inconsistent_retained_plaintext)
         plan_add tm_exclude_state \
           "Persistently exclude the protected state directory from Time Machine and verify the exclusion"
@@ -7125,6 +7125,12 @@ inconsistent_missing_hash|inconsistent_retained_plaintext)
             SNAPSHOT_APFS_LOCKED=false
             SNAPSHOT_APFS_MOUNTED=true
             SNAPSHOT_ACTUAL_MOUNT_POINT=$MOUNT_POINT
+            SNAPSHOT_PLAINTEXT_PRESENT=false
+            ;;
+          inconsistent_unmounted_missing_plaintext)
+            SNAPSHOT_RECORDED_LOCKED=false
+            SNAPSHOT_APFS_LOCKED=false
+            SNAPSHOT_APFS_MOUNTED=false
             SNAPSHOT_PLAINTEXT_PRESENT=false
             ;;
           inconsistent_missing_ciphertext)

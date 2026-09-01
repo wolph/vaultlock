@@ -372,6 +372,13 @@ check_contains "inconsistent unlocked summary names missing plaintext" \
   "State: inconsistent: plaintext recovery material is missing" \
   "$missing_plaintext_summary"
 
+unmounted_missing_plaintext_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never inconsistent_unmounted_missing_plaintext)
+check_contains \
+  "inconsistent unmounted unlocked summary names missing plaintext" \
+  "State: inconsistent: plaintext recovery material is missing" \
+  "$unmounted_missing_plaintext_summary"
+
 missing_ciphertext_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never inconsistent_missing_ciphertext)
 check_contains "inconsistent locked summary names missing ciphertext" \
