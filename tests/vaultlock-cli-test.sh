@@ -1873,6 +1873,14 @@ check_count() { # description expected needle output
   check "$description" "$expected" "$actual"
 }
 
+check_line_prefix_count() { # description expected prefix output
+  local description=$1 expected=$2 prefix=$3 output=$4 actual
+  actual=$(/usr/bin/awk -v prefix="$prefix" \
+    'index($0, prefix) == 1 { count++ } END { print count + 0 }' \
+    <<< "$output")
+  check "$description" "$expected" "$actual"
+}
+
 expected_discovered_hook_argv_line() { # path phase scope deadline epoch round
   local hook_path=$1 phase=$2 scope=$3 deadline=$4 epoch=$5 round=$6
   local argument line
@@ -2259,6 +2267,7 @@ reset_task2_deferred_fixture() {
     "$apfs_state/tle_plaintext" "$apfs_state/lock_new_passphrase" \
     "$apfs_state/unlock_stdin_verified" \
     "$apfs_state/change_passphrase_stdin_verified" \
+    "$apfs_state/lock_ciphertext_created" \
     "$apfs_state/unlock_leaves_unmounted" \
     "$apfs_state/verify_post_hook_target" \
     "$apfs_state/post_hook_saw_usable_target" \
@@ -2329,6 +2338,14 @@ test_task2_deferred_unlock_presentation() {
         "$expected" "$output"
       check_count "$verbosity deferred unlock avoids duplicate hook note" \
         0 "running post-unlock vault hook: $path" "$output"
+      printf -v quoted '%q' "$path"
+      if [[ "$verbosity" == default ]]; then
+        check_count "default deferred unlock has no grouped hook arrow" \
+          0 "-> Run post-unlock [vault] $quoted" "$output"
+      else
+        check_line "$verbosity deferred unlock emits grouped hook arrow" \
+          "-> Run post-unlock [vault] $quoted" "$output"
+      fi
     done
     if [[ "$verbosity" == audit ]]; then
       check_contains "audit deferred unlock includes exact argv" \
@@ -2396,6 +2413,14 @@ test_task2_deferred_lock_presentation() {
         "$expected" "$output"
       check_count "$verbosity deferred lock avoids duplicate hook note" \
         0 "running pre-lock vault hook: $path" "$output"
+      printf -v quoted '%q' "$path"
+      if [[ "$verbosity" == default ]]; then
+        check_count "default deferred lock has no grouped hook arrow" \
+          0 "-> Run pre-lock [vault] $quoted" "$output"
+      else
+        check_line "$verbosity deferred lock emits grouped hook arrow" \
+          "-> Run pre-lock [vault] $quoted" "$output"
+      fi
     done
     if [[ "$verbosity" == audit ]]; then
       check_contains "audit deferred lock includes exact argv" \
@@ -2415,6 +2440,247 @@ run_task2_deferred_presentation_tests() {
   test_task2_deferred_unlock_presentation
   test_task2_deferred_lock_presentation
 }
+
+task3_check_output_order() { # description output expected lines...
+  local description=$1 output=$2 expected line_number previous=0
+  shift 2
+  for expected in "$@"; do
+    line_number=$(grep -Fn -- "$expected" <<< "$output" \
+      | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1 || true)
+    if [[ -z "$line_number" || "$line_number" -le "$previous" ]]; then
+      record_failure "$description: [$expected] is missing or out of order"
+      return
+    fi
+    previous=$line_number
+  done
+  printf 'ok   %s\n' "$description"
+}
+
+task3_prepare_lock_fixture() {
+  reset_task2_deferred_fixture
+  write_json_state false null null null UUID-123
+  write_apfs_state false true UUID-123 disk9s1
+  printf '%s' "$task2_lock_passphrase" > "$state_dir/passphrase.txt"
+  printf '%s\n' "$task2_lock_hash" > "$state_dir/passphrase.sha256"
+  printf '%s' "$task2_lock_passphrase" \
+    > "$apfs_state/expected_lock_old_passphrase"
+  printf '%s' "$task2_lock_passphrase" \
+    > "$apfs_state/current_apfs_passphrase"
+  printf '%s' "$task2_lock_passphrase" > "$apfs_state/keychain_value"
+  : > "$apfs_state/keychain_marker"
+}
+
+task3_prepare_unlock_fixture() {
+  reset_task2_deferred_fixture
+  write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  printf 'fixture ciphertext\n' > "$state_dir/passphrase.tle"
+  printf '%s\n' "$task2_unlock_hash" > "$state_dir/passphrase.sha256"
+  printf '%s' "$task2_unlock_passphrase" > "$apfs_state/tle_plaintext"
+  printf '%s' "$task2_unlock_passphrase" \
+    > "$apfs_state/expected_unlock_passphrase"
+  : > "$apfs_state/unlock_leaves_unmounted"
+}
+
+test_task3_lock_progress() {
+  local output status hook_path crypto_trace
+
+  task3_prepare_lock_fixture
+  output=$(run_vaultlock lock -v --dry-run --no-hooks \
+    '2099-01-02 03:04' 2>&1)
+  check_not_contains "verbose lock dry-run hides Actions" 'Actions:' "$output"
+  check_line_prefix_count "verbose lock dry-run has exact group count" 6 \
+    'Would:' "$output"
+  task3_check_output_order "verbose lock dry-run group order" "$output" \
+    'Would: Prepare Time Machine exclusions and snapshots' \
+    'Would: Unmount the vault for locking' \
+    'Would: Rotate recovery material' \
+    'Would: Encrypt and record time-locked recovery material' \
+    'Would: Remove plaintext and keychain recovery material' \
+    'Would: Lock and verify the APFS volume'
+  check_count "late data snapshot cleanup does not repeat dry-run group" 1 \
+    'Would: Prepare Time Machine exclusions and snapshots' "$output"
+
+  task3_prepare_lock_fixture
+  output=$(run_vaultlock lock -vv --dry-run --no-hooks \
+    '2099-01-02 03:04' 2>&1)
+  check_contains "audit lock dry-run keeps Actions" 'Actions:' "$output"
+  check_line_prefix_count "audit lock dry-run has exact group count" 6 \
+    'Would:' "$output"
+  check_count "audit lock dry-run deduplicates Time Machine group" 1 \
+    'Would: Prepare Time Machine exclusions and snapshots' "$output"
+
+  task3_prepare_lock_fixture
+  hook_path=$state_dir/hooks/pre-lock.d/10-progress\ hook
+  /bin/mkdir -p "${hook_path%/*}"
+  /bin/cp "$TEST_SELF" "$hook_path"
+  /bin/chmod +x "$hook_path"
+  if output=$(VAULTLOCK_TEST_PRINT_LOCK_CRYPTO_MARKERS=1 \
+      run_vaultlock lock -v --yes '2099-01-02 03:04' 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  check "verbose lock execution exits successfully" 0 "$status"
+  check_line_prefix_count "verbose lock execution has exact arrow count" 7 \
+    '->' "$output"
+  task3_check_output_order "verbose lock execution group order" "$output" \
+    '-> Run pre-lock [global]' \
+    '-> Prepare Time Machine exclusions and snapshots' \
+    '-> Unmount the vault for locking' \
+    '-> Rotate recovery material' \
+    '-> Encrypt and record time-locked recovery material' \
+    '-> Remove plaintext and keychain recovery material' \
+    '-> Lock and verify the APFS volume'
+  check_count "known hook prints one execution arrow" 1 \
+    '-> Run pre-lock [global]' "$output"
+  check_contains "known hook arrow keeps safely quoted path" \
+    "$(printf '%q' "$hook_path")" "$output"
+  check_not_contains "verbose hook progress hides argv" '--phase' "$output"
+  check_count "known hook has no legacy running note" 0 \
+    "running pre-lock global hook: $hook_path" "$output"
+  check_count "late data snapshot cleanup does not repeat execution group" 1 \
+    '-> Prepare Time Machine exclusions and snapshots' "$output"
+  task3_check_output_order \
+    "recovery rotation precedes APFS passphrase change" "$output" \
+    '-> Rotate recovery material' 'CRYPTO: change-apfs-passphrase'
+  task3_check_output_order \
+    "time-lock progress starts before TLE encryption" "$output" \
+    '-> Encrypt and record time-locked recovery material' \
+    'CRYPTO: create-tle-ciphertext'
+  check_count "later typed operations do not repeat time-lock progress" 1 \
+    '-> Encrypt and record time-locked recovery material' "$output"
+  crypto_trace=$(grep '^CRYPTO: ' <<< "$output" \
+    | /usr/bin/sed 's/^CRYPTO: //' || true)
+  check "progress integration preserves canonical crypto marker order" \
+    $'generate-new-plaintext\nwrite-staged-plaintext\nchange-apfs-passphrase\ninstall-rotated-plaintext\nupdate-keychain\ncreate-tle-ciphertext\nverify-ciphertext-nonempty\nverify-ciphertext-not-early\nverify-expected-early-error\nwrite-plaintext-hash\nwrite-locked-json\ninstall-locked-json\nremove-plaintext\nremove-keychain-plaintext\nlock-apfs\nverify-filevault\nverify-mount-resistance' \
+    "$crypto_trace"
+  check_not_contains "verbose lock output omits fixture secret" \
+    "$task2_lock_passphrase" "$output"
+}
+
+test_task3_unlock_progress() {
+  local output status
+
+  task3_prepare_unlock_fixture
+  output=$(run_vaultlock unlock -v --dry-run --no-hooks 2>&1)
+  check_not_contains "verbose unlock dry-run hides Actions" 'Actions:' "$output"
+  check_line_prefix_count "verbose unlock dry-run has exact group count" 6 \
+    'Would:' "$output"
+  task3_check_output_order "verbose unlock dry-run group order" "$output" \
+    'Would: Decrypt and verify time-locked recovery material' \
+    'Would: Unlock the expected APFS volume' \
+    'Would: Mount the expected APFS volume' \
+    'Would: Verify the mounted vault identity' \
+    'Would: Restore verified recovery material' \
+    'Would: Verify the usable unlocked target'
+
+  task3_prepare_unlock_fixture
+  if output=$(run_vaultlock unlock -v --no-hooks 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  check "verbose unlock execution exits successfully" 0 "$status"
+  if [[ "$status" -ne 0 ]]; then
+    printf 'unlock execution output: %s\n' "${output//$'\n'/ | }"
+  fi
+  check_line_prefix_count "verbose unlock execution has exact arrow count" 6 \
+    '->' "$output"
+  task3_check_output_order "verbose unlock execution group order" "$output" \
+    '-> Decrypt and verify time-locked recovery material' \
+    '-> Unlock the expected APFS volume' \
+    '-> Mount the expected APFS volume' \
+    '-> Verify the mounted vault identity' \
+    '-> Restore verified recovery material' \
+    '-> Verify the usable unlocked target'
+  check_not_contains "verbose unlock output omits fixture secret" \
+    "$task2_unlock_passphrase" "$output"
+
+  reset_task2_deferred_fixture
+  write_json_state false null null null UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  printf '%s' "$task2_unlock_passphrase" > "$state_dir/passphrase.txt"
+  printf '%s\n' "$task2_unlock_hash" > "$state_dir/passphrase.sha256"
+  output=$(run_vaultlock unlock -v --dry-run --no-hooks 2>&1)
+  check_line_prefix_count "verbose unlocked-state repair dry-run has exact group count" \
+    5 'Would:' "$output"
+  task3_check_output_order "verbose unlocked-state repair dry-run order" \
+    "$output" \
+    'Would: Repair the prerequisite usable vault state' \
+    'Would: Mount the expected APFS volume' \
+    'Would: Verify the mounted vault identity' \
+    'Would: Restore verified recovery material' \
+    'Would: Verify the usable unlocked target'
+
+  reset_task2_deferred_fixture
+  write_json_state false null null null UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  printf '%s' "$task2_unlock_passphrase" > "$state_dir/passphrase.txt"
+  printf '%s\n' "$task2_unlock_hash" > "$state_dir/passphrase.sha256"
+  if output=$(run_vaultlock unlock -v --no-hooks 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  check "verbose unlocked-state repair execution exits successfully" 0 "$status"
+  check_line_prefix_count "verbose unlocked-state repair execution has exact arrow count" \
+    5 '->' "$output"
+  task3_check_output_order "verbose unlocked-state repair execution order" \
+    "$output" \
+    '-> Repair the prerequisite usable vault state' \
+    '-> Mount the expected APFS volume' \
+    '-> Verify the mounted vault identity' \
+    '-> Restore verified recovery material' \
+    '-> Verify the usable unlocked target'
+}
+
+test_task3_secure_and_repair_progress() {
+  local output status
+
+  reset_task2_deferred_fixture
+  write_json_state true 2099-01-02T03:04:00+0100 4070999040 \
+    792731235 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  printf 'fixture ciphertext\n' > "$state_dir/passphrase.tle"
+  printf '%s\n' "$task2_lock_hash" > "$state_dir/passphrase.sha256"
+  output=$(run_vaultlock lock -v --yes --no-hooks 20h 2>&1)
+  check_line_prefix_count "secure no-op has exact progress count" \
+    1 '->' "$output"
+  check_line "secure no-op reports one verification group" \
+    '-> Verify the secure locked target' "$output"
+
+  reset_task2_deferred_fixture
+  write_json_state true 2099-01-02T03:04:00+0100 4070999040 \
+    792731235 UUID-123
+  write_apfs_state true false UUID-123 disk9s1
+  printf '%s' "$task2_lock_passphrase" > "$state_dir/passphrase.txt"
+  printf 'fixture ciphertext\n' > "$state_dir/passphrase.tle"
+  printf '%s\n' "$task2_lock_hash" > "$state_dir/passphrase.sha256"
+  if output=$(run_vaultlock lock -v --yes --no-hooks 20h 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  check "repair-only removal exits successfully" 0 "$status"
+  check_line_prefix_count "repair-only removal has exact progress count" \
+    2 '->' "$output"
+  check_line "repair-only removal reports truthful execution group" \
+    '-> Remove plaintext and keychain recovery material' "$output"
+  check_not_contains "repair-only removal avoids time-lock progress" \
+    'Encrypt and record time-locked recovery material' "$output"
+}
+
+run_task3_progress_tests() {
+  test_task3_lock_progress
+  test_task3_unlock_progress
+  test_task3_secure_and_repair_progress
+}
+
+if [[ "${VAULTLOCK_TEST_TASK3_PROGRESS_ONLY:-0}" == 1 ]]; then
+  run_task3_progress_tests
+  exit "$fail"
+fi
 
 if [[ "${VAULTLOCK_TEST_TASK2_DEFERRED_ONLY:-0}" == 1 ]]; then
   run_task2_deferred_presentation_tests
@@ -3391,6 +3657,7 @@ repair_unlock_no_hooks=$(run_vaultlock unlock -vv --dry-run --no-hooks)
 check_count "recorded-unlocked repair disables hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$repair_unlock_no_hooks"
 repair_no_hooks_order=$(printf '%s\n' "$repair_unlock_no_hooks" \
+  | sed -n '/^Actions:$/,/^Confirmation:/p' \
   | grep -E 'Verify the existing plaintext|Unlock the expected APFS|Mount the expected APFS|Verify the mounted UUID|Verify the unlocked and mounted|Hooks disabled' \
   | normalize_domain_plan_actions \
   || true)
@@ -3558,6 +3825,16 @@ check_empty "init dry-run mutation log" "$mutation_log"
 [[ ! -e "$state_dir/state.json" && ! -e "$state_dir/passphrase.txt" ]] \
   || record_failure "init dry-run leaves state absent"
 
+init_progress=$(run_vaultlock init -v --dry-run)
+check_not_contains "verbose init progress hides Actions" 'Actions:' \
+  "$init_progress"
+task3_check_output_order "verbose init dry-run group order" "$init_progress" \
+  'Would: Prepare protected vault state' \
+  'Would: Create the encrypted APFS volume' \
+  'Would: Record the usable vault state'
+check_line_prefix_count "verbose init dry-run has exact group count" 3 \
+  'Would:' "$init_progress"
+
 printf 'dry-run confirmation sentinel\n' > "$confirm_device"
 init_summary=$(run_vaultlock init --dry-run --color=never)
 check_line "default init summary names state" \
@@ -3574,6 +3851,8 @@ check_not_contains "default init summary hides coordination" \
   'Acquire cooperative operation lock' "$init_summary"
 check_not_contains "default init summary hides standard actions" \
   'Prepare protected state and generate recovery material' "$init_summary"
+check_not_contains "default init summary hides grouped progress" \
+  'Would:' "$init_summary"
 check_not_contains "default init summary hides confirmation detail" \
   'Confirmation:' "$init_summary"
 check "init dry-run never opens confirmation device" \
@@ -3619,7 +3898,7 @@ check_contains "init decline renders full plan" \
   'Discover the new volume identity and write initial unlocked state' \
   "$init_declined"
 check "init decline plan matches dry-run" \
-  "$(printf '%s\n' "$init_plan" | sed '$d')" \
+  "$(printf '%s\n' "$init_plan" | sed '/^Would:/d; $d')" \
   "$(printf '%s\n' "$init_declined" | sed '$d')"
 check_empty "init decline mutation log" "$mutation_log"
 [[ ! -e "$state_dir/state.json" && ! -e "$state_dir/passphrase.txt" ]] \
@@ -3627,9 +3906,15 @@ check_empty "init decline mutation log" "$mutation_log"
 
 : > "$action_log"
 : > "$mutation_log"
-init_success=$(run_vaultlock init --yes 2>&1)
+init_success=$(run_vaultlock init -v --yes 2>&1)
 check_contains "init yes reports result" 'Result: created encrypted volume vault' \
   "$init_success"
+task3_check_output_order "verbose init execution group order" "$init_success" \
+  '-> Prepare protected vault state' \
+  '-> Create the encrypted APFS volume' \
+  '-> Record the usable vault state'
+check_line_prefix_count "verbose init execution has exact arrow count" 3 \
+  '->' "$init_success"
 check_not_contains "init yes prints no confirmation boilerplate" \
   'Confirmation' "$init_success"
 check "init yes writes unlocked UUID" UUID-INIT \
@@ -3702,6 +3987,16 @@ check_empty "adopt dry-run mutation log" "$mutation_log"
 [[ -d "$adopt_source" && ! -L "$adopt_source" ]] \
   || record_failure "adopt dry-run preserves source directory"
 
+adopt_progress=$(run_vaultlock adopt -v --dry-run "$adopt_source")
+check_not_contains "verbose adopt progress hides Actions" 'Actions:' \
+  "$adopt_progress"
+task3_check_output_order "verbose adopt dry-run group order" "$adopt_progress" \
+  'Would: Copy the source into the vault' \
+  'Would: Verify the copied source' \
+  'Would: Replace the source with its vault symlink'
+check_line_prefix_count "verbose adopt dry-run has exact group count" 3 \
+  'Would:' "$adopt_progress"
+
 : > "$mutation_log"
 if adopt_declined=$(run_vaultlock adopt -vv "$adopt_source" 2>&1); then
   record_failure "adopt decline exits nonzero"
@@ -3712,19 +4007,25 @@ fi
 check_contains "adopt decline renders staged replacement" \
   'with a verified symlink using a staged backup' "$adopt_declined"
 check "adopt decline plan matches dry-run" \
-  "$(printf '%s\n' "$adopt_plan" | sed '$d')" \
+  "$(printf '%s\n' "$adopt_plan" | sed '/^Would:/d; $d')" \
   "$(printf '%s\n' "$adopt_declined" | sed '$d')"
 check_empty "adopt decline mutation log" "$mutation_log"
 [[ -d "$adopt_source" && ! -L "$adopt_source" ]] \
   || record_failure "adopt decline preserves source directory"
 
 : > "$mutation_log"
-if adopt_success=$(run_vaultlock adopt --yes "$adopt_source" 2>&1); then
+if adopt_success=$(run_vaultlock adopt -v --yes "$adopt_source" 2>&1); then
   :
 else
   record_failure "adopt yes exits successfully: ${adopt_success//$'\n'/ | }"
 fi
 check_contains "adopt yes reports result" 'Result: adopted' "$adopt_success"
+task3_check_output_order "verbose adopt execution group order" "$adopt_success" \
+  '-> Copy the source into the vault' \
+  '-> Verify the copied source' \
+  '-> Replace the source with its vault symlink'
+check_line_prefix_count "verbose adopt execution has exact arrow count" 3 \
+  '->' "$adopt_success"
 [[ -L "$adopt_source_resolved" ]] \
   || record_failure "adopt yes replaces source with symlink"
 check "adopt yes symlink target" "$mount_point/source directory" \
@@ -3733,6 +4034,10 @@ check "adopt yes preserves copied payload" payload \
   "$(< "$mount_point/source directory/file with spaces")"
 check_count "adopt yes leaves no backup" 0 '.vaultlock-backup.' \
   "$(find "$(dirname "$adopt_source_resolved")" -maxdepth 1 -print)"
+
+if [[ "${VAULTLOCK_TEST_TASK3_INIT_ADOPT_ONLY:-0}" == 1 ]]; then
+  exit "$fail"
+fi
 
 reset_adopt_fixture() {
   : > "$mutation_log"
@@ -7836,6 +8141,8 @@ fi
 check "planned lock exits successfully" 0 "$lock_success_status"
 check_contains "planned lock reports verified success" 'Result: locked until' \
   "$lock_success_output"
+check_not_contains "default lock execution hides grouped progress" \
+  '->' "$lock_success_output"
 assert_lock_secure "planned lock"
 [[ -e "$apfs_state/change_passphrase_stdin_verified" ]] \
   || record_failure "lock rotates APFS with old and new stdin passphrases"

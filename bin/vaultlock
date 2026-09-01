@@ -80,6 +80,7 @@ PLAN_HOOK_PATHS=()
 PLAN_HOOK_PHASES=()
 PLAN_HOOK_SCOPES=()
 PLAN_HOOK_DIRECTORIES=()
+PROGRESS_EMITTED_GROUP_IDS=()
 PLAN_CONTEXT_UUID=""
 PLAN_CONTEXT_DEVICE=""
 PLAN_CONTEXT_DEADLINE=""
@@ -1902,6 +1903,7 @@ plan_reset() {
   PLAN_HOOK_PHASES=()
   PLAN_HOOK_SCOPES=()
   PLAN_HOOK_DIRECTORIES=()
+  PROGRESS_EMITTED_GROUP_IDS=()
   PLAN_TARGET_TEXT=""
   PLAN_REQUEST_TEXT=""
 }
@@ -2194,6 +2196,157 @@ render_plan_actions() {
   done
 }
 
+progress_operation_is_allowlisted() { # operation_id
+  case "$1" in
+    repair_verify_plaintext|repair_unlock_apfs|repair_mount|verify_mount_identity|\
+hooks_disabled|hook|deferred_hook_discovery|tm_exclude_state|tm_exclude|\
+tm_delete_vault_snapshots|tm_delete_data_snapshots|unmount_vault|\
+stage_recovery|rotate_apfs_recovery|keychain_update|tle_encrypt|\
+tle_verify_future|persist_locked_recovery|remove_plaintext|apfs_lock|\
+verify_locked_postconditions|tle_decrypt|verify_decrypted_hash|apfs_unlock|\
+persist_plaintext|persist_unlocked_state|verify_secure_target|\
+verify_unlocked_target|init_prepare_state|init_create_volume|init_write_state|\
+adopt_copy|adopt_verify|adopt_replace_source|operation_lock_acquire|\
+operation_lock_quarantine|operation_lock_release)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+progress_group_for_operation() { # command operation_id
+  local command=$1 operation_id=$2
+  case "$operation_id" in
+    operation_lock_acquire|operation_lock_quarantine|operation_lock_release|\
+hooks_disabled|hook|deferred_hook_discovery)
+      return 1
+      ;;
+    repair_verify_plaintext|repair_unlock_apfs)
+      printf 'repair\tRepair the prerequisite usable vault state\n'
+      ;;
+    repair_mount)
+      printf 'mount\tMount the expected APFS volume\n'
+      ;;
+    verify_mount_identity)
+      printf 'mount-identity\tVerify the mounted vault identity\n'
+      ;;
+    tm_exclude_state|tm_exclude|tm_delete_vault_snapshots|\
+tm_delete_data_snapshots)
+      printf 'time-machine\tPrepare Time Machine exclusions and snapshots\n'
+      ;;
+    unmount_vault)
+      printf 'unmount\tUnmount the vault for locking\n'
+      ;;
+    stage_recovery|rotate_apfs_recovery)
+      printf 'recovery-rotation\tRotate recovery material\n'
+      ;;
+    keychain_update)
+      if [[ "$command" == lock ]]; then
+        printf 'recovery-rotation\tRotate recovery material\n'
+      else
+        printf 'recovery-restore\tRestore verified recovery material\n'
+      fi
+      ;;
+    tle_encrypt|tle_verify_future|persist_locked_recovery)
+      printf 'time-lock\tEncrypt and record time-locked recovery material\n'
+      ;;
+    remove_plaintext)
+      printf 'recovery-removal\tRemove plaintext and keychain recovery material\n'
+      ;;
+    apfs_lock|verify_locked_postconditions)
+      printf 'apfs-lock\tLock and verify the APFS volume\n'
+      ;;
+    tle_decrypt|verify_decrypted_hash)
+      printf 'time-unlock\tDecrypt and verify time-locked recovery material\n'
+      ;;
+    apfs_unlock)
+      printf 'apfs-unlock\tUnlock the expected APFS volume\n'
+      ;;
+    persist_plaintext|persist_unlocked_state)
+      printf 'recovery-restore\tRestore verified recovery material\n'
+      ;;
+    verify_secure_target)
+      printf 'secure-target\tVerify the secure locked target\n'
+      ;;
+    verify_unlocked_target)
+      printf 'usable-target\tVerify the usable unlocked target\n'
+      ;;
+    init_prepare_state)
+      printf 'init-state\tPrepare protected vault state\n'
+      ;;
+    init_create_volume)
+      printf 'init-volume\tCreate the encrypted APFS volume\n'
+      ;;
+    init_write_state)
+      printf 'init-record\tRecord the usable vault state\n'
+      ;;
+    adopt_copy)
+      printf 'adopt-copy\tCopy the source into the vault\n'
+      ;;
+    adopt_verify)
+      printf 'adopt-verify\tVerify the copied source\n'
+      ;;
+    adopt_replace_source)
+      printf 'adopt-replace\tReplace the source with its vault symlink\n'
+      ;;
+    *) die "no progress group for operation ID: $operation_id" ;;
+  esac
+}
+
+progress_group_was_emitted() { # group_id
+  local group_id=$1 emitted_id
+  for emitted_id in \
+      ${PROGRESS_EMITTED_GROUP_IDS[@]+"${PROGRESS_EMITTED_GROUP_IDS[@]}"}; do
+    [[ "$emitted_id" != "$group_id" ]] || return 0
+  done
+  return 1
+}
+
+print_progress_prefix() { # prefix
+  print_stdout_style "$COLOR_CYAN" "$1"
+}
+
+emit_hook_progress() { # prefix index
+  local prefix=$1 index=$2
+  emit_hook_progress_values "$prefix" "${PLAN_HOOK_PHASES[$index]}" \
+    "${PLAN_HOOK_SCOPES[$index]}" "${PLAN_HOOK_PATHS[$index]}"
+}
+
+emit_hook_progress_values() { # prefix phase scope path
+  local prefix=$1 phase=$2 scope=$3 path=$4
+  print_progress_prefix "$prefix"
+  printf ' Run %s [%s] %q\n' "$phase" "$scope" "$path"
+}
+
+emit_operation_progress() { # command operation_id prefix
+  local command=$1 operation_id=$2 prefix=$3 mapping group_id label
+  progress_operation_is_allowlisted "$operation_id" \
+    || die "no progress group for operation ID: $operation_id"
+  if mapping=$(progress_group_for_operation "$command" "$operation_id"); then
+    IFS=$'\t' read -r group_id label <<< "$mapping"
+  else
+    return 0
+  fi
+  progress_group_was_emitted "$group_id" && return 0
+  PROGRESS_EMITTED_GROUP_IDS+=("$group_id")
+  print_progress_prefix "$prefix"
+  printf ' %s\n' "$label"
+}
+
+render_dry_run_progress() { # command
+  local command=$1 index operation_id
+  PROGRESS_EMITTED_GROUP_IDS=()
+  printf '\n'
+  for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
+    operation_id=${PLAN_OPERATION_IDS[$index]}
+    if [[ "$operation_id" == hook ]]; then
+      emit_hook_progress "Would:" "$index"
+    else
+      emit_operation_progress "$command" "$operation_id" "Would:"
+    fi
+  done
+}
+
 render_selected_plan() { # command
   local command=$1
 
@@ -2202,6 +2355,9 @@ render_selected_plan() { # command
   if (( OPTION_VERBOSITY >= 2 )); then
     render_plan_actions
     render_confirmation_detail "$command"
+  fi
+  if [[ "$OPTION_DRY_RUN" == true ]] && (( OPTION_VERBOSITY >= 1 )); then
+    render_dry_run_progress "$command"
   fi
 }
 
@@ -2247,8 +2403,7 @@ run_hook_file() { # mode phase scope hook uuid device deadline epoch round locke
     "$deadline_epoch" "$round" "$locked"
 
   case "$mode" in
-    pre|post) note "running $phase $scope hook: $hook" ;;
-    deferred-pre|deferred-post) ;;
+    pre|post|deferred-pre|deferred-post) ;;
     *) die "unknown hook execution mode: $mode" ;;
   esac
   if "$hook" "${HOOK_ARGV[@]}"; then
@@ -5794,6 +5949,9 @@ run_verified_planned_hook() { # index
   path=${PLAN_HOOK_PATHS[$index]}
   verify_planned_hook "$index"
   locked=$(hook_locked_value "$phase")
+  if (( OPTION_VERBOSITY >= 1 )); then
+    emit_hook_progress "->" "$index"
+  fi
   run_hook_file "${phase%%-*}" "$phase" "$scope" "$path" \
     "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
     "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
@@ -5857,6 +6015,9 @@ execute_deferred_unlock_hooks() { # index
       || die "discovered unlock hook changed before execution"
     [[ "$current_signature" == "$hook_signature" ]] \
       || die "discovered unlock hook changed before execution"
+    if (( OPTION_VERBOSITY >= 1 )); then
+      emit_hook_progress_values "->" "$phase" "$hook_scope" "$hook"
+    fi
     if run_hook_file deferred-post "$phase" "$hook_scope" "$hook" \
         "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
         "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
@@ -5874,6 +6035,10 @@ lock_crypto_marker() { # public marker
   local marker=$1
   if [[ -n "$LOCK_CRYPTO_MARKER_LOG" ]]; then
     printf '%s\n' "$marker" >> "$LOCK_CRYPTO_MARKER_LOG"
+  fi
+  if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == 1 \
+      && "${VAULTLOCK_TEST_PRINT_LOCK_CRYPTO_MARKERS:-0}" == 1 ]]; then
+    printf 'CRYPTO: %s\n' "$marker"
   fi
   run_named_transition "lock_crypto_$marker" "$STATE_DIR"
 }
@@ -6433,6 +6598,9 @@ persist_locked_recovery_state() {
 execute_rotate_and_encrypt() {
   generate_and_stage_rotated_recovery
   rotate_and_install_recovery
+  if (( OPTION_VERBOSITY >= 1 )); then
+    emit_operation_progress lock tle_encrypt "->"
+  fi
   encrypt_and_verify_lock_ciphertext
   persist_locked_recovery_state
 }
@@ -6718,6 +6886,9 @@ execute_deferred_lock_hooks() { # index
       || die "discovered pre-lock hook changed before execution"
     [[ "$current_signature" == "$hook_signature" ]] \
       || die "discovered pre-lock hook changed before execution"
+    if (( OPTION_VERBOSITY >= 1 )); then
+      emit_hook_progress_values "->" "$phase" "$hook_scope" "$hook"
+    fi
     if run_hook_file deferred-pre "$phase" "$hook_scope" "$hook" \
         "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
         "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
@@ -6828,12 +6999,18 @@ persist_locked_recovery) ;;
 
 execute_plan() {
   local index operation_id
+  PROGRESS_EMITTED_GROUP_IDS=()
   for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
     operation_id=${PLAN_OPERATION_IDS[$index]}
     case "$operation_id" in
       hooks_disabled|operation_lock_acquire|operation_lock_quarantine|\
 operation_lock_release) continue ;;
     esac
+    if [[ "$operation_id" != hook \
+        && "$operation_id" != deferred_hook_discovery ]] \
+        && (( OPTION_VERBOSITY >= 1 )); then
+      emit_operation_progress "$OPERATION_LOCK_COMMAND" "$operation_id" "->"
+    fi
     case "$OPERATION_LOCK_COMMAND" in
       init) execute_init_plan_operation "$operation_id" ;;
       adopt) execute_adopt_plan_operation "$operation_id" ;;
@@ -7051,6 +7228,7 @@ case "${1:-}" in
     [[ $# -eq 4 ]] \
       || die_usage "usage: vaultlock __render_output <verbosity> <colour> <fixture>"
     OPTION_VERBOSITY=$2
+    OPTION_DRY_RUN=true
     case "$OPTION_VERBOSITY" in
       0|1|2) ;;
       *) die_usage "invalid test verbosity: $OPTION_VERBOSITY" ;;
@@ -7067,6 +7245,7 @@ case "${1:-}" in
     PLAN_CONTEXT_DEADLINE_EPOCH=1788220800
     PLAN_CONTEXT_ROUND=31805812
     plan_reset
+    render_output_command=lock
     case "$4" in
       mixed)
         PLAN_OPERATION_IDS=(operation_lock_acquire hook tm_exclude_state \
@@ -7095,6 +7274,79 @@ case "${1:-}" in
         plan_add tm_exclude_state \
           "Persistently exclude the protected state directory from Time Machine and verify the exclusion"
         PLAN_TARGET_TEXT="locked at the resolved deadline"
+        ;;
+      full_lock)
+        plan_add operation_lock_acquire "Acquire operation lock"
+        plan_add tm_exclude_state "Exclude protected state"
+        plan_add tm_exclude "Exclude vault"
+        plan_add tm_delete_vault_snapshots "Delete vault snapshots"
+        plan_add unmount_vault "Unmount vault"
+        plan_add stage_recovery "Stage recovery"
+        plan_add rotate_apfs_recovery "Rotate APFS recovery"
+        plan_add keychain_update "Update keychain"
+        plan_add tle_encrypt "Encrypt recovery"
+        plan_add tle_verify_future "Verify future ciphertext"
+        plan_add persist_locked_recovery "Persist locked recovery"
+        plan_add remove_plaintext "Remove plaintext"
+        plan_add tm_delete_data_snapshots "Delete data snapshots"
+        plan_add apfs_lock "Lock APFS"
+        plan_add verify_locked_postconditions "Verify locked target"
+        plan_add operation_lock_release "Release operation lock"
+        PLAN_TARGET_TEXT="locked at the resolved deadline"
+        ;;
+      full_unlock)
+        render_output_command=unlock
+        plan_add operation_lock_acquire "Acquire operation lock"
+        plan_add tle_decrypt "Decrypt recovery"
+        plan_add verify_decrypted_hash "Verify decrypted hash"
+        plan_add apfs_unlock "Unlock APFS"
+        plan_add repair_mount "Mount APFS"
+        plan_add verify_mount_identity "Verify mount identity"
+        plan_add persist_plaintext "Persist plaintext"
+        plan_add keychain_update "Update keychain"
+        plan_add persist_unlocked_state "Persist unlocked state"
+        plan_add verify_unlocked_target "Verify unlocked target"
+        plan_add operation_lock_release "Release operation lock"
+        PLAN_TARGET_TEXT="unlocked and mounted"
+        ;;
+      init)
+        render_output_command=init
+        SNAPSHOT_INIT_ABSENT=true
+        plan_add init_prepare_state "Prepare state"
+        plan_add init_create_volume "Create volume"
+        plan_add init_write_state "Write state"
+        PLAN_TARGET_TEXT="initialized and usable"
+        ;;
+      adopt)
+        render_output_command=adopt
+        plan_add adopt_copy "Copy source"
+        plan_add adopt_verify "Verify source"
+        plan_add adopt_replace_source "Replace source"
+        PLAN_TARGET_TEXT="adopted into the vault"
+        ;;
+      unlock_repair)
+        render_output_command=unlock
+        plan_add repair_verify_plaintext "Verify repair plaintext"
+        plan_add repair_unlock_apfs "Repair APFS unlock"
+        plan_add repair_mount "Mount APFS"
+        plan_add verify_mount_identity "Verify mount identity"
+        plan_add keychain_update "Restore keychain"
+        plan_add verify_unlocked_target "Verify unlocked target"
+        PLAN_TARGET_TEXT="unlocked and mounted"
+        ;;
+      secure_noop)
+        plan_add verify_secure_target "Verify secure target"
+        PLAN_TARGET_TEXT="securely locked without changes"
+        ;;
+      hooks)
+        plan_add_hook pre-lock global "/tmp/first hook"
+        plan_add_hook pre-lock global "/tmp/second hook"
+        plan_add_deferred_hook post-unlock vault "/tmp/deferred hooks"
+        PLAN_TARGET_TEXT="locked after hooks"
+        ;;
+      repair_remove)
+        plan_add remove_plaintext "Remove retained recovery material"
+        PLAN_TARGET_TEXT="securely locked after recovery removal"
         ;;
       inconsistent)
         plan_add tm_exclude_state \
@@ -7157,7 +7409,20 @@ inconsistent_missing_hash|inconsistent_retained_plaintext)
         ;;
       *) die_usage "unknown output fixture: $4" ;;
     esac
-    render_selected_plan lock
+    render_selected_plan "$render_output_command"
+    ;;
+  __progress_group)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __progress_group"
+    [[ $# -eq 3 ]] \
+      || die_usage "usage: vaultlock __progress_group <command> <operation_id>"
+    progress_operation_is_allowlisted "$3" \
+      || die "no progress group for operation ID: $3"
+    if progress_group_for_operation "$2" "$3"; then
+      :
+    else
+      printf 'silent\n'
+    fi
     ;;
   __hook_argv_builds)
     [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \

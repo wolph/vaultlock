@@ -85,6 +85,12 @@ check_not_contains() { # description needle haystack
   fi
 }
 
+check_count() { # description expected needle haystack
+  local description=$1 expected=$2 needle=$3 haystack=$4 actual
+  actual=$(grep -Foc -- "$needle" <<< "$haystack" || true)
+  check "$description" "$expected" "$actual"
+}
+
 options() {
   "$VL" __options "$@"
 }
@@ -333,10 +339,67 @@ check_not_contains "summary hides coordination" \
 
 verbose_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 1 never mixed)
+check_contains "verbose dry-run uses Would prefix" \
+  "Would: Prepare Time Machine exclusions and snapshots" "$verbose_summary"
+check_contains "verbose groups APFS locking" \
+  "Would: Lock and verify the APFS volume" "$verbose_summary"
+check_count "Time Machine progress prints once" 1 \
+  "Prepare Time Machine exclusions and snapshots" "$verbose_summary"
 check_not_contains "verbose summary still hides actions" \
   "Actions:" "$verbose_summary"
 check_not_contains "verbose summary still hides hook argv" \
   "--phase" "$verbose_summary"
+
+progress_inventory=$'operation_lock_acquire\tsilent\noperation_lock_quarantine\tsilent\noperation_lock_release\tsilent\nrepair_verify_plaintext\trepair\tRepair the prerequisite usable vault state\nrepair_unlock_apfs\trepair\tRepair the prerequisite usable vault state\nrepair_mount\tmount\tMount the expected APFS volume\nverify_mount_identity\tmount-identity\tVerify the mounted vault identity\nhooks_disabled\tsilent\nhook\tsilent\ndeferred_hook_discovery\tsilent\ntm_exclude_state\ttime-machine\tPrepare Time Machine exclusions and snapshots\ntm_exclude\ttime-machine\tPrepare Time Machine exclusions and snapshots\ntm_delete_vault_snapshots\ttime-machine\tPrepare Time Machine exclusions and snapshots\ntm_delete_data_snapshots\ttime-machine\tPrepare Time Machine exclusions and snapshots\nunmount_vault\tunmount\tUnmount the vault for locking\nstage_recovery\trecovery-rotation\tRotate recovery material\nrotate_apfs_recovery\trecovery-rotation\tRotate recovery material\nkeychain_update\trecovery-rotation\tRotate recovery material\ntle_encrypt\ttime-lock\tEncrypt and record time-locked recovery material\ntle_verify_future\ttime-lock\tEncrypt and record time-locked recovery material\npersist_locked_recovery\ttime-lock\tEncrypt and record time-locked recovery material\nremove_plaintext\trecovery-removal\tRemove plaintext and keychain recovery material\napfs_lock\tapfs-lock\tLock and verify the APFS volume\nverify_locked_postconditions\tapfs-lock\tLock and verify the APFS volume\ntle_decrypt\ttime-unlock\tDecrypt and verify time-locked recovery material\nverify_decrypted_hash\ttime-unlock\tDecrypt and verify time-locked recovery material\napfs_unlock\tapfs-unlock\tUnlock the expected APFS volume\npersist_plaintext\trecovery-restore\tRestore verified recovery material\npersist_unlocked_state\trecovery-restore\tRestore verified recovery material\nverify_secure_target\tsecure-target\tVerify the secure locked target\nverify_unlocked_target\tusable-target\tVerify the usable unlocked target\ninit_prepare_state\tinit-state\tPrepare protected vault state\ninit_create_volume\tinit-volume\tCreate the encrypted APFS volume\ninit_write_state\tinit-record\tRecord the usable vault state\nadopt_copy\tadopt-copy\tCopy the source into the vault\nadopt_verify\tadopt-verify\tVerify the copied source\nadopt_replace_source\tadopt-replace\tReplace the source with its vault symlink'
+while IFS=$'\t' read -r operation_id expected_group expected_label; do
+  progress_mapping=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+    "$VL" __progress_group lock "$operation_id" 2>&1 || true)
+  if [[ "$expected_group" == silent ]]; then
+    check "progress inventory intentionally silences $operation_id" \
+      silent "$progress_mapping"
+  else
+    check "progress inventory maps $operation_id" \
+      "$expected_group"$'\t'"$expected_label" "$progress_mapping"
+  fi
+done <<< "$progress_inventory"
+
+unlock_keychain_mapping=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __progress_group unlock keychain_update 2>&1 || true)
+check "unlock keychain mapping restores recovery" \
+  $'recovery-restore\tRestore verified recovery material' \
+  "$unlock_keychain_mapping"
+
+unknown_progress_status=0
+if VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+    "$VL" __progress_group lock unknown_operation >/dev/null 2>&1; then
+  unknown_progress_status=0
+else
+  unknown_progress_status=$?
+fi
+check "unknown progress operation fails closed" 1 "$unknown_progress_status"
+
+for progress_fixture in full_lock full_unlock init adopt unlock_repair \
+    secure_noop hooks repair_remove; do
+  progress_output=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+    "$VL" __render_output 1 never "$progress_fixture" 2>&1 || true)
+  check_contains "$progress_fixture renders grouped dry-run progress" \
+    "Would:" "$progress_output"
+  check_not_contains "$progress_fixture verbose output hides actions" \
+    "Actions:" "$progress_output"
+done
+
+repair_remove_output=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 1 never repair_remove 2>&1 || true)
+check_contains "repair-only removal uses truthful group" \
+  "Would: Remove plaintext and keychain recovery material" \
+  "$repair_remove_output"
+check_not_contains "repair-only removal avoids time-lock group" \
+  "Encrypt and record time-locked recovery material" "$repair_remove_output"
+
+hooks_progress=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 1 never hooks 2>&1 || true)
+check_count "multiple hook operations are not generic-deduped" 2 \
+  "Would: Run pre-lock [global]" "$hooks_progress"
 
 audit_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 2 never mixed)
@@ -359,6 +422,13 @@ check_contains "summary colours usable state label green" \
   "${esc}[32mState:${esc}[0m unlocked and mounted" "$coloured_summary"
 check_contains "summary dims only request label" \
   "${esc}[2mRequested deadline:${esc}[0m 2026-09-01" "$coloured_summary"
+
+coloured_progress=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 1 always mixed)
+check_contains "progress colours only Would prefix cyan" \
+  "${esc}[36mWould:${esc}[0m Prepare Time Machine" "$coloured_progress"
+check_not_contains "progress keeps label plain" \
+  "${esc}[36mWould: Prepare Time Machine" "$coloured_progress"
 
 inconsistent_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never inconsistent)
@@ -460,7 +530,7 @@ check "hook receives exact named argv" "$expected_first" "$first_hook"
 last_hook=$(tail -n 1 "$hook_log")
 check_contains "vault hook receives vault scope" \
   '|<--scope>|<vault>|' "$last_hook"
-check_contains "runner announces hook path" \
+check_not_contains "default hook execution avoids a duplicate progress note" \
   "running pre-lock global hook: $hook_state/pre-lock.sh" "$hook_output"
 
 : > "$hook_log"
