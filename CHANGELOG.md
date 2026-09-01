@@ -15,6 +15,9 @@
 
 ### Changed
 
+- Made lifecycle output concise by default, added grouped `-v` progress and
+  complete `-vv` audit plans, kept hook paths visible, and added automatic
+  terminal colour with explicit overrides.
 - Migrated the standalone command and helper suite into a complete local Git
   project.
 - Lock and unlock now converge repairable observations to verified target

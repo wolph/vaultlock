@@ -101,7 +101,8 @@ vaultlock adopt --yes "$HOME/path/to/data"
 Preview and perform a lock:
 
 ```console
-vaultlock lock --dry-run 20h
+vaultlock lock -v --dry-run 20h
+vaultlock lock -vv --color=always --dry-run 2:00 +2d
 vaultlock lock --yes 20h
 ```
 
@@ -116,28 +117,91 @@ vaultlock unlock
 The complete command forms are:
 
 ```text
-vaultlock init [--dry-run] [--yes]
-vaultlock adopt [--dry-run] [--yes] <directory>
-vaultlock lock [--dry-run] [--yes] [--no-hooks] <deadline>
-vaultlock unlock [--dry-run] [--no-hooks]
-vaultlock status
+vaultlock init [-v | -vv] [--color=auto|always|never] [--dry-run] [--yes]
+vaultlock adopt [-v | -vv] [--color=auto|always|never] [--dry-run] [--yes] <directory>
+vaultlock lock [-v | -vv] [--color=auto|always|never] [--dry-run] [--yes] [--no-hooks] <deadline>
+vaultlock unlock [-v | -vv] [--color=auto|always|never] [--dry-run] [--no-hooks]
+vaultlock status [--color=auto|always|never]
 ```
 
 Options must appear immediately after the subcommand and before the first
 operand. `lock` joins its remaining words into one deadline expression, so
 both quoted and unquoted `2:00 +2d` forms work.
 
-| Option | `init` | `adopt` | `lock` | `unlock` | Effect |
-|---|---:|---:|---:|---:|---|
-| `--dry-run` | yes | yes | yes | yes | Build and print a read-only plan |
-| `--yes` | yes | yes | yes | no | Bypass confirmation only |
-| `--no-hooks` | no | no | yes | yes | Disable all lifecycle hooks |
+| Option | `init` | `adopt` | `lock` | `unlock` | `status` | Effect |
+|---|---:|---:|---:|---:|---:|---|
+| `-v`, `--verbose` | yes | yes | yes | yes | no | Add grouped progress |
+| `-vv`, `--very-verbose` | yes | yes | yes | yes | no | Add grouped progress and the complete numbered plan |
+| `--color=auto|always|never` | yes | yes | yes | yes | yes | Select terminal colour handling |
+| `--dry-run` | yes | yes | yes | yes | no | Inspect the planned outcome without making changes |
+| `--yes` | yes | yes | yes | no | no | Bypass confirmation only |
+| `--no-hooks` | no | no | yes | yes | no | Disable all lifecycle hooks |
+
+Repeated verbosity options select the highest requested level regardless of
+order. Repeated colour options use the last value. `status` accepts colour
+selection, but rejects `-v`, `-vv`, and their long forms because it has no
+operation plan or progress stream. The colour value must use the inline form,
+such as `--color=never`.
 
 Unknown options, options after an operand, missing required operands, and extra
 fixed-arity operands are usage errors. `lock` instead joins every remaining
 word. Extra words usually make its deadline invalid during preflight rather
 than producing a usage error. `--yes --dry-run` is accepted and still changes
 nothing.
+
+## Output modes and colour
+
+| Mode | Output |
+| --- | --- |
+| default | Current state, target, request details, hooks, confirmation, warnings, and result |
+| `-v`, `--verbose` | Default output plus grouped execution progress, or `Would:` groups in a dry-run |
+| `-vv`, `--very-verbose` | Verbose output plus the complete numbered operation plan and exact planned hook argv |
+
+Default lifecycle output is concise. It identifies the command, current state,
+target, resolved request details, known hook scripts, deferred hook
+directories, confirmation when required, warnings, and the final result. It
+does not print an `Actions:` section or hook argv. A dry-run lock can resemble:
+
+```text
+Lock vault
+  State: unlocked and mounted at /Volumes/vault
+  Target: locked at the resolved deadline
+  Requested deadline: 2026-09-02T02:00:00+0200
+  Resolved drand round: target 31805812
+
+Hooks:
+  pre-lock [global] /Users/example/Vault\ Hooks/pre-lock.sh
+
+Result: no changes made
+```
+
+Hook paths and deferred directories use shell-safe quoting. `after mount`
+marks a vault-local directory whose entries cannot be inspected until the
+expected volume is mounted and its identity is verified. A hook found then is
+also reported by phase, scope, and path. A summary containing both forms can
+include:
+
+```text
+Hooks:
+  pre-lock [global] /Users/example/Vault\ Hooks/pre-lock.sh
+  pre-lock [vault, after mount] /Volumes/vault/.vaultlock/hooks/pre-lock.d
+```
+
+`Hooks: disabled` records `--no-hooks`. `Hooks: none` records that no known or
+deferred hooks apply. Exact hook argv appears only in very verbose output.
+
+Verbose mode prints each meaningful progress group once across the command.
+Execution uses `->` prefixes. Dry-run uses `Would:` prefixes and never claims
+that an operation ran. Hook runs remain individual progress entries rather
+than being combined into one group.
+
+Colour mode defaults to `--color=auto`. Automatic mode decides separately for
+stdout and stderr. A stream receives colour only when it is a TTY, `TERM` is
+not `dumb`, and `NO_COLOR` is unset or empty. `--color=always` and
+`--color=never` explicitly override terminal and environment detection. Colour
+styles labels and prefixes only. Paths, UUIDs, devices, deadlines, rounds,
+operation descriptions, and hook argv remain plain, so colour never carries
+meaning by itself.
 
 ## Deadlines
 
@@ -170,32 +234,70 @@ round. It does not extend the lock with the newly supplied expression.
 
 ## Plans, confirmation, and dry-run
 
-`init`, `adopt`, and `lock` print a complete ordered plan before prompting on
-the controlling terminal with `Proceed? [y/N]`. Only `y` or `yes`, ignoring
-case, proceeds. Non-interactive use must pass `--yes`. That option bypasses
-only the prompt. It does not bypass preflight, identity, recovery, or
-postcondition checks.
+Every lifecycle command builds a complete typed plan from the recorded and
+actual APFS observations, requested target, resolved deadline, hooks, and
+ordered mutations. Default output renders the concise state, target, request,
+and hook summary. Very verbose output renders the complete numbered `Actions:`
+list and exact planned hook argv.
+
+`init`, `adopt`, and `lock` prompt on the controlling terminal with
+`Confirmation required. Continue? [y/N] `. Only `y` or `yes`, ignoring case,
+proceeds. Non-interactive execution without `--dry-run` must pass `--yes`.
+That option suppresses the confirmation boilerplate only. It does not bypass
+preflight, identity, recovery, or postcondition checks.
 
 `unlock` never prompts because its target is a usable mounted vault.
 
-`--dry-run` performs read-only preflight and prints the same typed plan without
-running hooks or changing APFS, files, Keychain, Time Machine configuration,
-or the cooperative operation lock. A successful preview ends with:
+`--dry-run` performs read-only preflight without running hooks or changing
+APFS, files, Keychain, Time Machine configuration, or the cooperative operation
+lock. It never prompts. Its output follows the selected output mode, and a
+successful preview ends with:
 
 ```text
 Result: no changes made
 ```
 
-The plan includes recorded and actual APFS observations, the requested target,
-resolved deadlines, ordered mutations, discoverable hook paths, each hook's
-named argv, hook bypass state, and coordination steps. If the verified vault
-is not mounted, vault-local hook discovery is shown as deferred. Dry-run never
-mounts the volume just to discover hooks.
+The complete typed plan includes discoverable hook paths, hook bypass state,
+and coordination steps. At `-vv`, known hooks also include each hook's named
+argv. If the verified vault is not mounted, vault-local hook discovery is
+shown as deferred. Dry-run never mounts the volume just to discover hooks.
 
 A preview is a snapshot, not a promise that later execution will succeed.
 Normal execution acquires the cooperative lock, repeats inspection, rebuilds
 the plan, and aborts without domain mutation if a typed field or identity has
 changed.
+
+### Very verbose lock plan
+
+`-vv` expands the exact numbered plan for the current command and inspected
+state. The conceptual order for a normal transition is:
+
+Typical standard full-lock sequence:
+
+1. Acquire the cooperative operation lock
+2. Conditionally quarantine a verified stale operation lock
+3. Run each planned pre-lock hook with its exact argv
+4. Persistently exclude the protected state directory from Time Machine and verify the exclusion
+5. Add the vault volume root to Time Machine exclusions
+6. Delete local Time Machine snapshots for the vault
+7. Unmount the vault
+8. Generate and durably stage a new random recovery passphrase
+9. Rotate the APFS volume passphrase, then commit the staged plaintext recovery file
+10. Update Keychain with the rotated recovery material
+11. Encrypt the rotated recovery material for the resolved drand round
+12. Verify the time-lock ciphertext is nonempty and not yet decryptable
+13. Write the recovery hash and durably record the locked deadline and round
+14. Remove plaintext recovery material and its Keychain entry
+15. Delete local Time Machine snapshots for the data volume
+16. Lock the APFS volume
+17. Verify APFS encryption, locked state, and failed unauthenticated mounting
+18. Release the cooperative operation lock
+
+This is a typical sequence, not fixed output. Actual `-vv` items vary with the
+inspected state. Known hooks, multiple hooks, post-hooks, repairs, no-ops,
+disabled hooks, and deferred hook discovery add, remove, or replace applicable
+items. Hooks found through deferred discovery report exact argv at `-vv` when
+they run.
 
 ## Status and convergence
 
@@ -271,6 +373,12 @@ that resolve to regular files. Ordering uses C-locale filename order. Missing
 directories and non-executable entries are ignored. A hook's path, type,
 identity, and executable state are rechecked before execution.
 
+Default output lists every known hook by phase, scope, and safely quoted path.
+It lists an unavailable vault-local hook directory with `after mount`. `-v`
+keeps those summaries and reports each hook run as an individual progress
+entry. It does not print argv. `-vv` adds exact argv for hooks known while
+planning and for hooks found through deferred discovery during execution.
+
 Each hook receives exactly these 24 argv words, in this order:
 
 ```text
@@ -303,8 +411,10 @@ The first pre-hook process that exits nonzero stops the transition. If a
 post-hook process exits nonzero, remaining post-hook processes run before
 Vaultlock returns nonzero for the otherwise reached target. Hook path, type,
 identity, permission, or mount drift aborts immediately instead of continuing
-the phase. `--no-hooks` skips the legacy, global, and vault-local hooks and adds
-an explicit disabled-hooks item to the plan.
+the phase. `--no-hooks` skips the legacy, global, and vault-local hooks. Concise
+output reports `Hooks: disabled`, and `-vv` also adds an explicit disabled-hooks
+item to the numbered plan. When hooks are enabled but none are known or
+deferred, concise output reports `Hooks: none`.
 
 Pre-unlock hooks run only for recorded-locked recovery. A usable unlock no-op
 and an unlock that only mounts an already-unlocked volume do not run lifecycle
