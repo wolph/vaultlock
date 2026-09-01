@@ -295,9 +295,9 @@ Typical standard full-lock sequence:
 
 This is a typical sequence, not fixed output. Actual `-vv` items vary with the
 inspected state. Known hooks, multiple hooks, post-hooks, repairs, no-ops,
-disabled hooks, and deferred hook discovery add, remove, or replace applicable
-items. Hooks found through deferred discovery report exact argv at `-vv` when
-they run.
+disabled hooks, deferred hook discovery, and failure-boundary operations can
+add, remove, or replace applicable items. Hooks found through deferred
+discovery report exact argv at `-vv` when they run.
 
 ## Status and convergence
 
