@@ -347,6 +347,7 @@ parse_command_options() { # command argv
   OPTION_VERBOSITY=0
   OPTION_COLOR=auto
   OPTION_OPERANDS=""
+  resolve_colour "$OPTION_COLOR"
 
   while [[ $# -gt 0 ]]; do
     argument=$1
@@ -359,6 +360,7 @@ parse_command_options() { # command argv
       -vv|--very-verbose) OPTION_VERBOSITY=2 ;;
       --color=auto|--color=always|--color=never)
         OPTION_COLOR=${argument#--color=}
+        resolve_colour "$OPTION_COLOR"
         ;;
       --color=*) die_usage "invalid colour mode: ${argument#--color=}" ;;
       --dry-run) OPTION_DRY_RUN=true ;;
@@ -6764,25 +6766,21 @@ run_planned_command() { # command
 
 dispatch_init() {
   parse_command_options init "$@"
-  resolve_colour "$OPTION_COLOR"
   run_planned_command init
 }
 
 dispatch_adopt() {
   parse_command_options adopt "$@"
-  resolve_colour "$OPTION_COLOR"
   run_planned_command adopt
 }
 
 dispatch_lock() {
   parse_command_options lock "$@"
-  resolve_colour "$OPTION_COLOR"
   run_planned_command lock
 }
 
 dispatch_unlock() {
   parse_command_options unlock "$@"
-  resolve_colour "$OPTION_COLOR"
   [[ -f "$state_file" ]] || die "no state"
   run_planned_command unlock
 }
@@ -6796,12 +6794,14 @@ cmd_status() {
 dispatch_status() {
   local argument
   OPTION_COLOR=auto
+  resolve_colour "$OPTION_COLOR"
   while [[ $# -gt 0 ]]; do
     argument=$1
     shift
     case "$argument" in
       --color=auto|--color=always|--color=never)
         OPTION_COLOR=${argument#--color=}
+        resolve_colour "$OPTION_COLOR"
         ;;
       --color=*) die_usage "invalid colour mode: ${argument#--color=}" ;;
       -v|--verbose|-vv|--very-verbose)
@@ -6810,7 +6810,6 @@ dispatch_status() {
       *) die_usage "usage: vaultlock status [--color=auto|always|never]" ;;
     esac
   done
-  resolve_colour "$OPTION_COLOR"
   cmd_status
 }
 

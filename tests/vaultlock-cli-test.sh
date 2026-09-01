@@ -2091,6 +2091,38 @@ reject_options() { # description command argv
     "$(< "$test_root/options-error")"
 }
 
+assert_fake_error() { # description stdout_tty stderr_tty no_color term status stderr argv...
+  local description=$1 stdout_tty=$2 stderr_tty=$3 no_color=$4 term=$5
+  local expected_status=$6 expected_stderr=$7 actual_status
+  shift 7
+  : > "$test_root/colour-stdout"
+  : > "$test_root/colour-stderr"
+  : > "$action_log"
+  : > "$mutation_log"
+  if VAULTLOCK_TEST_STDOUT_TTY="$stdout_tty" \
+      VAULTLOCK_TEST_STDERR_TTY="$stderr_tty" \
+      NO_COLOR="$no_color" TERM="$term" \
+      run_vaultlock "$@" \
+      > "$test_root/colour-stdout" 2> "$test_root/colour-stderr"; then
+    actual_status=0
+  else
+    actual_status=$?
+  fi
+  check "$description exits with expected status" \
+    "$expected_status" "$actual_status"
+  printf '%s\n' "$expected_stderr" > "$test_root/expected-colour-stderr"
+  if /usr/bin/cmp -s \
+      "$test_root/expected-colour-stderr" "$test_root/colour-stderr"; then
+    printf 'ok   %s has exact stderr bytes\n' "$description"
+  else
+    printf 'FAIL %s has exact stderr bytes\n' "$description"
+    fail=1
+  fi
+  check_empty "$description has empty stdout" "$test_root/colour-stdout"
+  check_empty "$description performs no inspection" "$action_log"
+  check_empty "$description performs no mutation" "$mutation_log"
+}
+
 write_json_state() { # locked deadline deadline_epoch round uuid
   local locked=$1 deadline=$2 deadline_epoch=$3 round=$4 uuid=$5
   jq -n \
@@ -2564,6 +2596,52 @@ check_contains "lock invalid colour reports parser error" \
   'invalid colour mode' "$invalid_lifecycle_colour_output"
 check_empty "lock invalid colour performs no inspection" "$action_log"
 check_empty "lock invalid colour performs no mutation" "$mutation_log"
+
+esc=$'\033'
+red_prefix="${esc}[31mvaultlock:${esc}[0m"
+plain_prefix='vaultlock:'
+unlock_usage='usage: vaultlock unlock [--dry-run] [--no-hooks] [-v|--verbose|-vv|--very-verbose] [--color=auto|always|never]'
+lock_usage='usage: vaultlock lock [--dry-run] [--yes] [--no-hooks] [-v|--verbose|-vv|--very-verbose] [--color=auto|always|never] <deadline>'
+status_usage='usage: vaultlock status [--color=auto|always|never]'
+
+mv "$state_dir/state.json" "$test_root/state.json.saved"
+assert_fake_error "auto lifecycle error uses stderr TTY" \
+  false true '' xterm-256color 1 \
+  "$red_prefix no state" unlock
+assert_fake_error "auto lifecycle error ignores stdout TTY" \
+  true false '' xterm-256color 1 \
+  "$plain_prefix no state" unlock
+assert_fake_error "always lifecycle error overrides environment" \
+  false false set dumb 1 \
+  "$red_prefix no state" unlock --color=always
+assert_fake_error "never lifecycle error remains plain" \
+  true true '' xterm-256color 1 \
+  "$plain_prefix no state" unlock --color=never
+mv "$test_root/state.json.saved" "$state_dir/state.json"
+
+assert_fake_error "auto parser error uses stderr TTY" \
+  false true '' xterm-256color 64 \
+  "$red_prefix unknown lock option: --bogus" lock --bogus 20h
+assert_fake_error "always colours a later unknown option" \
+  false false set dumb 64 \
+  "$red_prefix unknown lock option: --bogus" \
+  lock --color=always --bogus 20h
+assert_fake_error "always colours missing lifecycle operand" \
+  false false set dumb 64 \
+  "$red_prefix $lock_usage" lock --color=always
+assert_fake_error "always colours extra status operand" \
+  false false set dumb 64 \
+  "$red_prefix $status_usage" status --color=always extra
+assert_fake_error "prior always safely colours invalid colour" \
+  false false set dumb 64 \
+  "$red_prefix invalid colour mode: sometimes" \
+  lock --color=always --color=sometimes 20h
+assert_fake_error "last never keeps validation error plain" \
+  true true '' xterm-256color 64 \
+  "$plain_prefix $lock_usage" lock --color=always --color=never
+assert_fake_error "last always colours validation error" \
+  false false set dumb 64 \
+  "$red_prefix $unlock_usage" unlock --color=never --color=always extra
 
 if help_output=$(run_vaultlock help 2>&1); then
   help_status=0
