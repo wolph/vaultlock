@@ -1810,7 +1810,7 @@ fail=0
 test_root=$(mktemp -d "/tmp/vaultlock cli.XXXXXX")
 # shellcheck disable=SC2329  # EXIT trap fallback before helper definition.
 cleanup_epipe_processes() { :; }
-trap 'cleanup_epipe_processes; rm -rf "$test_root"' EXIT
+trap 'cleanup_epipe_processes && rm -rf "$test_root"' EXIT
 
 fake_bin="$test_root/bin"
 gnu_bin="$test_root/gnu-bin"
@@ -2943,26 +2943,36 @@ wait_for_child_bounded() { # pid attempts
   return 1
 }
 
+valid_epipe_pid() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+
+signal_epipe_writer() { # signal pid
+  local signal=$1 pid=$2
+  /bin/kill -"$signal" -- "-$pid" 2>/dev/null \
+    || /bin/kill -"$signal" "$pid" 2>/dev/null
+}
+
 terminate_epipe_child() { # pid
   local pid=$1
   [[ -n "$pid" ]] || return 0
+  valid_epipe_pid "$pid" || return 64
   /bin/kill -TERM "$pid" 2>/dev/null || true
   if ! wait_for_child_bounded "$pid" 200; then
     /bin/kill -KILL "$pid" 2>/dev/null || true
-    wait_for_child_bounded "$pid" 200 || true
+    wait_for_child_bounded "$pid" 200 || return 1
   fi
-  wait "$pid" 2>/dev/null || true
+  wait "$pid" >/dev/null 2>&1 || true
 }
 
 terminate_epipe_writer() { # pid
   local pid=$1
   [[ -n "$pid" ]] || return 0
-  /bin/kill -TERM -- "-$pid" 2>/dev/null || true
+  valid_epipe_pid "$pid" || return 64
+  signal_epipe_writer TERM "$pid" || true
   if ! wait_for_child_bounded "$pid" 200; then
-    /bin/kill -KILL -- "-$pid" 2>/dev/null || true
-    wait_for_child_bounded "$pid" 200 || true
+    signal_epipe_writer KILL "$pid" || true
+    wait_for_child_bounded "$pid" 200 || return 1
   fi
-  wait "$pid" 2>/dev/null || true
+  wait "$pid" >/dev/null 2>&1 || true
 }
 
 EPIPE_ACTIVE_WRITER_PID=""
@@ -2971,19 +2981,24 @@ EPIPE_ACTIVE_RELEASE_PATHS=()
 EPIPE_ACTIVE_FIFO_PATHS=()
 
 cleanup_epipe_processes() {
-  local path pid
+  local path pid cleanup_failed=false
   for path in \
       ${EPIPE_ACTIVE_RELEASE_PATHS[@]+"${EPIPE_ACTIVE_RELEASE_PATHS[@]}"}; do
     : > "$path"
   done
-  [[ -z "$EPIPE_ACTIVE_WRITER_PID" ]] \
-    || terminate_epipe_writer "$EPIPE_ACTIVE_WRITER_PID"
-  EPIPE_ACTIVE_WRITER_PID=""
+  if [[ -n "$EPIPE_ACTIVE_WRITER_PID" ]]; then
+    if terminate_epipe_writer "$EPIPE_ACTIVE_WRITER_PID"; then
+      EPIPE_ACTIVE_WRITER_PID=""
+    else
+      cleanup_failed=true
+    fi
+  fi
   for pid in \
       ${EPIPE_ACTIVE_READER_PIDS[@]+"${EPIPE_ACTIVE_READER_PIDS[@]}"}; do
-    terminate_epipe_child "$pid"
+    terminate_epipe_child "$pid" || cleanup_failed=true
   done
-  EPIPE_ACTIVE_READER_PIDS=()
+  [[ "$cleanup_failed" == true ]] || EPIPE_ACTIVE_READER_PIDS=()
+  [[ "$cleanup_failed" == false ]] || return 1
   for path in \
       ${EPIPE_ACTIVE_FIFO_PATHS[@]+"${EPIPE_ACTIVE_FIFO_PATHS[@]}"}; do
     /bin/rm -f "$path"
@@ -3000,12 +3015,16 @@ wait_for_epipe_entry() { # path
 wait_for_epipe_writer() { # pid
   local pid=$1 attempts=${EPIPE_WRITER_WAIT_ATTEMPTS:-12000}
   if ! wait_for_child_bounded "$pid" "$attempts"; then
-    terminate_epipe_writer "$pid"
-    EPIPE_ACTIVE_WRITER_PID=""
+    if terminate_epipe_writer "$pid"; then
+      EPIPE_ACTIVE_WRITER_PID=""
+    else
+      EPIPE_STATUS=125
+      return 0
+    fi
     EPIPE_STATUS=124
     return 0
   fi
-  if wait "$pid"; then EPIPE_STATUS=0; else EPIPE_STATUS=$?; fi
+  if wait "$pid" 2>/dev/null; then EPIPE_STATUS=0; else EPIPE_STATUS=$?; fi
   EPIPE_ACTIVE_WRITER_PID=""
 }
 
@@ -3438,7 +3457,8 @@ test_task4_epipe_presentation() {
     > "$apfs_state/transition_lock_before_change_passphrase"
   EPIPE_WRITER_WAIT_ATTEMPTS=5 \
     run_with_stdout_epipe progress_time-machine lock -v --yes --no-hooks \
-      '2099-01-02 03:04'
+      '2099-01-02 03:04' \
+      2> "$test_root/expected-termination-diagnostic"
   check "held EPIPE writer exits through bounded timeout" 124 "$EPIPE_STATUS"
   check "held EPIPE writer clears active PID" '' \
     "$EPIPE_ACTIVE_WRITER_PID"
@@ -3447,6 +3467,27 @@ test_task4_epipe_presentation() {
       && printf true || printf false)"
   check "held EPIPE writer releases operation lock" false \
     "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+  unexpected_termination_diagnostic=$(/usr/bin/grep -Fv \
+    'Terminated: 15' "$test_root/expected-termination-diagnostic" || true)
+  check "held EPIPE writer emits no unexpected cleanup diagnostic" '' \
+    "$unexpected_termination_diagnostic"
+
+  epipe_pid_fallback_ready=$apfs_state/epipe_pid_fallback_ready
+  epipe_pid_fallback_marker=$apfs_state/epipe_pid_fallback_marker
+  /bin/rm -f "$epipe_pid_fallback_ready" "$epipe_pid_fallback_marker"
+  EPIPE_PID_FALLBACK_READY=$epipe_pid_fallback_ready \
+    EPIPE_PID_FALLBACK_MARKER=$epipe_pid_fallback_marker \
+    /bin/bash -c '
+      trap '\''printf x > "$EPIPE_PID_FALLBACK_MARKER"; exit 0'\'' TERM
+      printf x > "$EPIPE_PID_FALLBACK_READY"
+      /bin/sleep 1
+    ' &
+  epipe_pid_fallback_pid=$!
+  wait_for_fixture "$epipe_pid_fallback_ready"
+  terminate_epipe_writer "$epipe_pid_fallback_pid"
+  check "EPIPE cleanup falls back from process group to exact PID" true \
+    "$([[ -f "$epipe_pid_fallback_marker" ]] \
       && printf true || printf false)"
 
   for signal_case in HUP:129 INT:130 TERM:143; do
