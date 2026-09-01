@@ -5998,6 +5998,8 @@ execute_deferred_unlock_hooks() { # index
     hook_scope=${DISCOVERED_HOOK_SCOPES[$hook_index]}
     hook_signature=$(hook_file_signature "$hook") \
       || die "discovered unlock hook is no longer executable and regular"
+    printf 'Discovered hook: %s [%s] %q\n' \
+      "$phase" "$hook_scope" "$hook"
     if (( OPTION_VERBOSITY >= 2 )); then
       printf 'Discovered hook %q' "$hook"
       build_hook_argv "$phase" "$hook_scope" "$PLAN_CONTEXT_UUID" \
@@ -6007,9 +6009,6 @@ execute_deferred_unlock_hooks() { # index
         printf ' %q' "$hook_argument"
       done
       printf '\n'
-    else
-      printf 'Discovered hook: %s [%s] %q\n' \
-        "$phase" "$hook_scope" "$hook"
     fi
     current_signature=$(hook_file_signature "$hook") \
       || die "discovered unlock hook changed before execution"
@@ -6868,6 +6867,8 @@ execute_deferred_lock_hooks() { # index
     hook_scope=${DISCOVERED_HOOK_SCOPES[$hook_index]}
     hook_signature=$(hook_file_signature "$hook") \
       || die "discovered pre-lock hook is no longer executable and regular"
+    printf 'Discovered hook: %s [%s] %q\n' \
+      "$phase" "$hook_scope" "$hook"
     if (( OPTION_VERBOSITY >= 2 )); then
       printf 'Discovered hook %q' "$hook"
       build_hook_argv "$phase" "$hook_scope" "$PLAN_CONTEXT_UUID" \
@@ -6877,9 +6878,6 @@ execute_deferred_lock_hooks() { # index
         printf ' %q' "$hook_argument"
       done
       printf '\n'
-    else
-      printf 'Discovered hook: %s [%s] %q\n' \
-        "$phase" "$hook_scope" "$hook"
     fi
     run_named_transition lock_before_deferred_hook "$hook"
     current_signature=$(hook_file_signature "$hook") \

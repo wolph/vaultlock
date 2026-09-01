@@ -2293,7 +2293,7 @@ task2_check_action_order() { # description earlier later
 }
 
 test_task2_deferred_unlock_presentation() {
-  local verbosity status output path expected quoted
+  local verbosity status output path concise audit_line quoted arrow
   local directory first second
   local -a options
 
@@ -2327,24 +2327,36 @@ test_task2_deferred_unlock_presentation() {
     fi
     check "$verbosity deferred unlock exits successfully" 0 "$status"
     for path in "$first" "$second"; do
-      if [[ "$verbosity" == audit ]]; then
-        expected=$(expected_discovered_hook_argv_line "$path" \
-          post-unlock vault 2000-01-01T00:00:00+0000 1 1)
-      else
-        printf -v quoted '%q' "$path"
-        expected="Discovered hook: post-unlock [vault] $quoted"
-      fi
+      printf -v quoted '%q' "$path"
+      concise="Discovered hook: post-unlock [vault] $quoted"
       check_line "$verbosity deferred unlock presents $(basename "$path")" \
-        "$expected" "$output"
+        "$concise" "$output"
+      check_count "$verbosity deferred unlock presents concise discovery once" \
+        1 "$concise" "$output"
+      if [[ "$verbosity" == audit ]]; then
+        audit_line=$(expected_discovered_hook_argv_line "$path" \
+          post-unlock vault 2000-01-01T00:00:00+0000 1 1)
+        check_line "audit deferred unlock presents exact argv" \
+          "$audit_line" "$output"
+        check_count "audit deferred unlock presents exact argv once" \
+          1 "$audit_line" "$output"
+      fi
       check_count "$verbosity deferred unlock avoids duplicate hook note" \
         0 "running post-unlock vault hook: $path" "$output"
-      printf -v quoted '%q' "$path"
+      arrow="-> Run post-unlock [vault] $quoted"
       if [[ "$verbosity" == default ]]; then
         check_count "default deferred unlock has no grouped hook arrow" \
-          0 "-> Run post-unlock [vault] $quoted" "$output"
+          0 "$arrow" "$output"
       else
         check_line "$verbosity deferred unlock emits grouped hook arrow" \
-          "-> Run post-unlock [vault] $quoted" "$output"
+          "$arrow" "$output"
+        check_count "$verbosity deferred unlock emits grouped hook arrow once" \
+          1 "$arrow" "$output"
+      fi
+      if [[ "$verbosity" == audit ]]; then
+        task3_check_output_order \
+          "audit deferred unlock discovery precedes audit and execution" \
+          "$output" "$concise" "$audit_line" "$arrow"
       fi
     done
     if [[ "$verbosity" == audit ]]; then
@@ -2362,7 +2374,7 @@ test_task2_deferred_unlock_presentation() {
 }
 
 test_task2_deferred_lock_presentation() {
-  local verbosity status output path expected quoted
+  local verbosity status output path concise audit_line quoted arrow
   local directory first second deadline epoch round
   local -a options
 
@@ -2402,24 +2414,36 @@ test_task2_deferred_lock_presentation() {
     epoch=$(jq -r .deadline_epoch "$state_dir/state.json")
     round=$(jq -r .round "$state_dir/state.json")
     for path in "$first" "$second"; do
-      if [[ "$verbosity" == audit ]]; then
-        expected=$(expected_discovered_hook_argv_line "$path" pre-lock vault \
-          "$deadline" "$epoch" "$round")
-      else
-        printf -v quoted '%q' "$path"
-        expected="Discovered hook: pre-lock [vault] $quoted"
-      fi
+      printf -v quoted '%q' "$path"
+      concise="Discovered hook: pre-lock [vault] $quoted"
       check_line "$verbosity deferred lock presents $(basename "$path")" \
-        "$expected" "$output"
+        "$concise" "$output"
+      check_count "$verbosity deferred lock presents concise discovery once" \
+        1 "$concise" "$output"
+      if [[ "$verbosity" == audit ]]; then
+        audit_line=$(expected_discovered_hook_argv_line "$path" pre-lock vault \
+          "$deadline" "$epoch" "$round")
+        check_line "audit deferred lock presents exact argv" \
+          "$audit_line" "$output"
+        check_count "audit deferred lock presents exact argv once" \
+          1 "$audit_line" "$output"
+      fi
       check_count "$verbosity deferred lock avoids duplicate hook note" \
         0 "running pre-lock vault hook: $path" "$output"
-      printf -v quoted '%q' "$path"
+      arrow="-> Run pre-lock [vault] $quoted"
       if [[ "$verbosity" == default ]]; then
         check_count "default deferred lock has no grouped hook arrow" \
-          0 "-> Run pre-lock [vault] $quoted" "$output"
+          0 "$arrow" "$output"
       else
         check_line "$verbosity deferred lock emits grouped hook arrow" \
-          "-> Run pre-lock [vault] $quoted" "$output"
+          "$arrow" "$output"
+        check_count "$verbosity deferred lock emits grouped hook arrow once" \
+          1 "$arrow" "$output"
+      fi
+      if [[ "$verbosity" == audit ]]; then
+        task3_check_output_order \
+          "audit deferred lock discovery precedes audit and execution" \
+          "$output" "$concise" "$audit_line" "$arrow"
       fi
     done
     if [[ "$verbosity" == audit ]]; then
