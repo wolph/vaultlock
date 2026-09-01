@@ -313,6 +313,68 @@ empty_no_color=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
 check_contains "empty NO_COLOR permits automatic colour" \
   "${esc}[36mheading" "$empty_no_color"
 
+summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never mixed)
+check_contains "summary names command" "Lock vault" "$summary"
+check_contains "summary names state" \
+  "State: unlocked and mounted at /Volumes/vault" "$summary"
+check_contains "summary names target" \
+  "Target: locked at the resolved deadline" "$summary"
+check_contains "summary includes request metadata" \
+  "Requested deadline: 2026-09-01T02:00:00+0200" "$summary"
+check_contains "summary lists known hook" \
+  "pre-lock [global] /tmp/pre\\ lock" "$summary"
+check_contains "summary lists deferred directory" \
+  "post-unlock [vault, after mount]" "$summary"
+check_not_contains "summary hides actions" "Actions:" "$summary"
+check_not_contains "summary hides hook argv" "--phase" "$summary"
+check_not_contains "summary hides coordination" \
+  "Acquire cooperative operation lock" "$summary"
+
+verbose_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 1 never mixed)
+check_not_contains "verbose summary still hides actions" \
+  "Actions:" "$verbose_summary"
+check_not_contains "verbose summary still hides hook argv" \
+  "--phase" "$verbose_summary"
+
+audit_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 2 never mixed)
+check_contains "audit summary includes numbered actions" \
+  "Actions:" "$audit_summary"
+check_contains "audit summary includes coordination" \
+  "Acquire cooperative operation lock" "$audit_summary"
+check_contains "audit summary includes exact hook argv" \
+  "/tmp/pre\\ lock --phase pre-lock --scope global" "$audit_summary"
+check_contains "audit summary includes confirmation detail" \
+  "Confirmation:" "$audit_summary"
+check_count_text=$(grep -Foc -- 'State:' <<< "$audit_summary" || true)
+check "audit summary prints state once" 1 "$check_count_text"
+
+coloured_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 always mixed)
+check_contains "summary colours command heading cyan" \
+  "${esc}[36mLock vault${esc}[0m" "$coloured_summary"
+check_contains "summary colours usable state label green" \
+  "${esc}[32mState:${esc}[0m unlocked and mounted" "$coloured_summary"
+check_contains "summary dims only request label" \
+  "${esc}[2mRequested deadline:${esc}[0m 2026-09-01" "$coloured_summary"
+
+inconsistent_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never inconsistent)
+check_contains "inconsistent summary reports causal error" \
+  "State: inconsistent: recorded locked state disagrees with APFS state" \
+  "$inconsistent_summary"
+
+disabled_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never disabled)
+check_contains "disabled summary names disabled hooks" \
+  "Hooks: disabled" "$disabled_summary"
+
+empty_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never none)
+check_contains "empty summary names absent hooks" "Hooks: none" "$empty_summary"
+
 hook_test_root=$(mktemp -d "/tmp/vaultlock hooks.XXXXXX")
 trap 'rm -rf "$hook_test_root"' EXIT
 hook_state="$hook_test_root/global state"

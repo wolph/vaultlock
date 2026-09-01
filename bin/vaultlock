@@ -389,7 +389,7 @@ confirmation_accepts() { # response
 }
 
 confirm_plan() {
-  local response
+  local response colour_confirmation=false
   [[ "$OPTION_DRY_RUN" == "false" ]] || return 0
   [[ "$OPTION_YES" == "false" ]] || return 0
   [[ -r "$CONFIRM_DEVICE" && -w "$CONFIRM_DEVICE" ]] \
@@ -397,7 +397,20 @@ confirm_plan() {
   if ! { exec 9<>"$CONFIRM_DEVICE"; } 2>/dev/null; then
     die "confirmation requires a terminal, rerun with --yes"
   fi
-  printf 'Proceed? [y/N] ' >&9
+  case "$OPTION_COLOR" in
+    always) colour_confirmation=true ;;
+    auto)
+      if [[ -t 9 && "${TERM:-}" != dumb && -z "${NO_COLOR:-}" ]]; then
+        colour_confirmation=true
+      fi
+      ;;
+  esac
+  if [[ "$colour_confirmation" == true ]]; then
+    printf '%sConfirmation required.%s Continue? [y/N] ' \
+      "$COLOR_YELLOW" "$COLOR_RESET" >&9
+  else
+    printf 'Confirmation required. Continue? [y/N] ' >&9
+  fi
   IFS= read -r response <&9 || response=""
   exec 9>&-
   confirmation_accepts "$response" || die "cancelled, no changes made"
@@ -841,7 +854,18 @@ render_runtime_summary() {
   [[ "$SNAPSHOT_CIPHERTEXT_PRESENT" == "true" ]] && ciphertext=present
   [[ "$SNAPSHOT_HASH_PRESENT" == "true" ]] && hash=present
   note "Recovery: plaintext $plaintext, ciphertext $ciphertext, hash $hash"
-  note "Assessment: $RUNTIME_ASSESSMENT"
+  case "$RUNTIME_ASSESSMENT" in
+    usable)
+      print_stdout_style "$COLOR_GREEN" "Assessment:"
+      ;;
+    "securely locked"|repairable:*)
+      print_stdout_style "$COLOR_YELLOW" "Assessment:"
+      ;;
+    *)
+      print_stdout_style "$COLOR_RED" "Assessment:"
+      ;;
+  esac
+  printf ' %s\n' "$RUNTIME_ASSESSMENT"
 
   if [[ "$SNAPSHOT_STATE_VALID" == "true" \
       && "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
@@ -2018,7 +2042,7 @@ render_deferred_hook_plan_item() { # index
     "$phase" "$scope" "$directory"
 }
 
-render_confirmation_requirement() { # command
+render_confirmation_detail() { # command
   local command=$1
 
   printf 'Confirmation:\n'
@@ -2033,14 +2057,125 @@ render_confirmation_requirement() { # command
   fi
 }
 
-render_plan() { # command
-  local command=$1 index
+runtime_inconsistency_text() {
+  if [[ -n "$SNAPSHOT_ERROR" ]]; then
+    printf '%s\n' "$SNAPSHOT_ERROR"
+  elif [[ "$SNAPSHOT_APFS_LOCKED" == true \
+      && "$SNAPSHOT_APFS_MOUNTED" == true ]]; then
+    printf 'APFS volume reports locked while mounted\n'
+  elif [[ "$SNAPSHOT_APFS_MOUNTED" == true \
+      && "$SNAPSHOT_ACTUAL_MOUNT_POINT" != "$MOUNT_POINT" ]]; then
+    printf 'APFS volume is mounted at an unexpected path\n'
+  elif [[ "$SNAPSHOT_RECORDED_LOCKED" == true \
+      && "$SNAPSHOT_APFS_LOCKED" != true ]]; then
+    printf 'recorded locked state disagrees with APFS state\n'
+  elif [[ "$SNAPSHOT_RECORDED_LOCKED" == false \
+      && "$SNAPSHOT_APFS_LOCKED" != false ]]; then
+    printf 'recorded unlocked state disagrees with APFS state\n'
+  else
+    printf 'recorded and APFS state are not trustworthy\n'
+  fi
+}
 
-  printf 'Vaultlock plan: %s %s\n' "$command" "$VOLUME"
-  printf 'Current state:\n'
-  render_runtime_summary
-  printf 'Target: %s\n' "$PLAN_TARGET_TEXT"
-  [[ -z "$PLAN_REQUEST_TEXT" ]] || printf '%s\n' "$PLAN_REQUEST_TEXT"
+render_current_state() {
+  local state style
+
+  if [[ "$SNAPSHOT_INIT_ABSENT" == "true" ]]; then
+    state="absent and ready for initialization"
+    style=$COLOR_GREEN
+  elif [[ "$RUNTIME_ASSESSMENT" == "usable" ]]; then
+    state="unlocked and mounted at $MOUNT_POINT"
+    style=$COLOR_GREEN
+  elif [[ "$RUNTIME_ASSESSMENT" == "securely locked" ]]; then
+    state="securely locked until $SNAPSHOT_DEADLINE"
+    style=$COLOR_YELLOW
+  elif [[ "$RUNTIME_ASSESSMENT" == repairable:* ]]; then
+    state=$RUNTIME_ASSESSMENT
+    style=$COLOR_YELLOW
+  else
+    state="inconsistent: $(runtime_inconsistency_text)"
+    style=$COLOR_RED
+  fi
+
+  printf '  '
+  print_stdout_style "$style" "State:"
+  printf ' %s\n' "$state"
+}
+
+render_request_metadata() {
+  local line label value
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == *:* ]]; then
+      label=${line%%:*}:
+      value=${line#*:}
+      printf '  '
+      print_label "$label"
+      printf '%s\n' "$value"
+    else
+      printf '  '
+      print_label "$line"
+      printf '\n'
+    fi
+  done <<< "$PLAN_REQUEST_TEXT"
+}
+
+render_plan_summary() { # command
+  local command=$1 heading
+
+  case "$command" in
+    init) heading="Initialize" ;;
+    adopt) heading="Adopt into" ;;
+    lock) heading="Lock" ;;
+    unlock) heading="Unlock" ;;
+    *) die "unknown summary command: $command" ;;
+  esac
+  print_heading "$heading $VOLUME"
+  printf '\n'
+  render_current_state
+  printf '  Target: %s\n' "$PLAN_TARGET_TEXT"
+  [[ -z "$PLAN_REQUEST_TEXT" ]] || render_request_metadata
+}
+
+render_hook_summary() {
+  local index operation_id phase scope path directory has_hooks=false
+
+  for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
+    if [[ "${PLAN_OPERATION_IDS[$index]}" == hooks_disabled ]]; then
+      printf '\nHooks: disabled\n'
+      return 0
+    fi
+  done
+
+  for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
+    operation_id=${PLAN_OPERATION_IDS[$index]}
+    case "$operation_id" in
+      hook|deferred_hook_discovery)
+        if [[ "$has_hooks" == false ]]; then
+          printf '\nHooks:\n'
+          has_hooks=true
+        fi
+        phase=${PLAN_HOOK_PHASES[$index]}
+        scope=${PLAN_HOOK_SCOPES[$index]}
+        if [[ "$operation_id" == hook ]]; then
+          path=${PLAN_HOOK_PATHS[$index]}
+          printf '  %s [%s] %q\n' "$phase" "$scope" "$path"
+        else
+          directory=${PLAN_HOOK_DIRECTORIES[$index]}
+          printf '  %s [%s, after mount] %q\n' \
+            "$phase" "$scope" "$directory"
+        fi
+        ;;
+    esac
+  done
+  [[ "$has_hooks" == true ]] || printf '\nHooks: none\n'
+}
+
+render_plan_actions() {
+  local index
+
+  printf '\n'
   printf 'Actions:\n'
   for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
     printf '  %d. ' "$((index + 1))"
@@ -2050,7 +2185,17 @@ render_plan() { # command
       *) printf '%s\n' "${PLAN_OPERATION_TEXT[$index]}" ;;
     esac
   done
-  render_confirmation_requirement "$command"
+}
+
+render_selected_plan() { # command
+  local command=$1
+
+  render_plan_summary "$command"
+  render_hook_summary
+  if (( OPTION_VERBOSITY >= 2 )); then
+    render_plan_actions
+    render_confirmation_detail "$command"
+  fi
 }
 
 # Resolve the volume's current device node (diskXsY) from its stable UUID.
@@ -5684,14 +5829,19 @@ execute_deferred_unlock_hooks() { # index
     hook_scope=${DISCOVERED_HOOK_SCOPES[$hook_index]}
     hook_signature=$(hook_file_signature "$hook") \
       || die "discovered unlock hook is no longer executable and regular"
-    printf 'Discovered hook %q' "$hook"
-    build_hook_argv "$phase" "$hook_scope" "$PLAN_CONTEXT_UUID" \
-      "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
-      "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
-    for hook_argument in "${HOOK_ARGV[@]}"; do
-      printf ' %q' "$hook_argument"
-    done
-    printf '\n'
+    if (( OPTION_VERBOSITY >= 2 )); then
+      printf 'Discovered hook %q' "$hook"
+      build_hook_argv "$phase" "$hook_scope" "$PLAN_CONTEXT_UUID" \
+        "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
+        "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
+      for hook_argument in "${HOOK_ARGV[@]}"; do
+        printf ' %q' "$hook_argument"
+      done
+      printf '\n'
+    else
+      printf 'Discovered hook: %s [%s] %q\n' \
+        "$phase" "$hook_scope" "$hook"
+    fi
     current_signature=$(hook_file_signature "$hook") \
       || die "discovered unlock hook changed before execution"
     [[ "$current_signature" == "$hook_signature" ]] \
@@ -6520,7 +6670,7 @@ execute_planned_lock_hook() { # index
 
 execute_deferred_lock_hooks() { # index
   local index=$1 phase scope directory hook hook_scope hook_index locked status
-  local hook_signature current_signature
+  local hook_argument hook_signature current_signature
   phase=${PLAN_HOOK_PHASES[$index]}
   scope=${PLAN_HOOK_SCOPES[$index]}
   directory=${PLAN_HOOK_DIRECTORIES[$index]}
@@ -6539,12 +6689,19 @@ execute_deferred_lock_hooks() { # index
     hook_scope=${DISCOVERED_HOOK_SCOPES[$hook_index]}
     hook_signature=$(hook_file_signature "$hook") \
       || die "discovered pre-lock hook is no longer executable and regular"
-    printf 'Discovered hook %q' "$hook"
-    build_hook_argv "$phase" "$hook_scope" "$PLAN_CONTEXT_UUID" \
-      "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
-      "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
-    printf ' %q' "${HOOK_ARGV[@]}"
-    printf '\n'
+    if (( OPTION_VERBOSITY >= 2 )); then
+      printf 'Discovered hook %q' "$hook"
+      build_hook_argv "$phase" "$hook_scope" "$PLAN_CONTEXT_UUID" \
+        "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
+        "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
+      for hook_argument in "${HOOK_ARGV[@]}"; do
+        printf ' %q' "$hook_argument"
+      done
+      printf '\n'
+    else
+      printf 'Discovered hook: %s [%s] %q\n' \
+        "$phase" "$hook_scope" "$hook"
+    fi
     run_named_transition lock_before_deferred_hook "$hook"
     current_signature=$(hook_file_signature "$hook") \
       || die "discovered pre-lock hook changed before execution"
@@ -6712,9 +6869,10 @@ run_planned_command() { # command
     *) die "no planned command runner for: $command" ;;
   esac
   freeze_planned_command_snapshot "$command"
-  render_plan "$command"
+  render_selected_plan "$command"
   if [[ "$OPTION_DRY_RUN" == "true" ]]; then
-    printf 'Result: no changes made\n'
+    print_success "Result:"
+    printf ' no changes made\n'
     return 0
   fi
   [[ "$command" == unlock ]] || confirm_plan
@@ -6749,17 +6907,23 @@ run_planned_command() { # command
   fi
   case "$command" in
     init)
-      note "Result: created encrypted volume $VOLUME ($PLAN_CONTEXT_UUID), state in $STATE_DIR"
+      print_success "Result:"
+      printf ' created encrypted volume %s (%s), state in %s\n' \
+        "$VOLUME" "$PLAN_CONTEXT_UUID" "$STATE_DIR"
       ;;
     adopt)
-      note "Result: adopted $ADOPT_SOURCE -> $ADOPT_DESTINATION"
+      print_success "Result:"
+      printf ' adopted %s -> %s\n' "$ADOPT_SOURCE" "$ADOPT_DESTINATION"
       ;;
     unlock)
-      note "Result: unlocked and mounted at $MOUNT_POINT"
+      print_success "Result:"
+      printf ' unlocked and mounted at %s\n' "$MOUNT_POINT"
       note "next: cd ~/your-project && ./run.sh"
       ;;
     lock)
-      note "Result: locked until $PLAN_CONTEXT_DEADLINE (drand round $PLAN_CONTEXT_ROUND)"
+      print_success "Result:"
+      printf ' locked until %s (drand round %s)\n' \
+        "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_ROUND"
       ;;
   esac
 }
@@ -6869,6 +7033,71 @@ case "${1:-}" in
     print_success "success"
     printf '\n'
     print_error "error"
+    ;;
+  __render_output)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __render_output"
+    [[ $# -eq 4 ]] \
+      || die_usage "usage: vaultlock __render_output <verbosity> <colour> <fixture>"
+    OPTION_VERBOSITY=$2
+    case "$OPTION_VERBOSITY" in
+      0|1|2) ;;
+      *) die_usage "invalid test verbosity: $OPTION_VERBOSITY" ;;
+    esac
+    OPTION_COLOR=$3
+    resolve_colour "$OPTION_COLOR"
+    SNAPSHOT_INIT_ABSENT=false
+    SNAPSHOT_ERROR=""
+    SNAPSHOT_DEADLINE=null
+    RUNTIME_ASSESSMENT=usable
+    PLAN_CONTEXT_UUID=UUID-123
+    PLAN_CONTEXT_DEVICE=disk9s1
+    PLAN_CONTEXT_DEADLINE=2026-09-01T02:00:00+0200
+    PLAN_CONTEXT_DEADLINE_EPOCH=1788220800
+    PLAN_CONTEXT_ROUND=31805812
+    plan_reset
+    case "$4" in
+      mixed)
+        PLAN_OPERATION_IDS=(operation_lock_acquire hook tm_exclude_state \
+          deferred_hook_discovery apfs_lock operation_lock_release)
+        PLAN_OPERATION_TEXT=(
+          "Acquire cooperative operation lock at $OPERATION_LOCK_DIR"
+          "Run hook"
+          "Persistently exclude the protected state directory from Time Machine and verify the exclusion"
+          "Deferred hook discovery"
+          "Lock the APFS volume"
+          "Release cooperative operation lock"
+        )
+        PLAN_HOOK_PATHS=("" "/tmp/pre lock" "" "" "" "")
+        PLAN_HOOK_PHASES=("" pre-lock "" post-unlock "" "")
+        PLAN_HOOK_SCOPES=("" global "" vault "" "")
+        PLAN_HOOK_DIRECTORIES=("" "" "" \
+          "/Volumes/vault/.vaultlock/hooks/post-unlock.d" "" "")
+        PLAN_TARGET_TEXT="locked at the resolved deadline"
+        PLAN_REQUEST_TEXT=$'Requested deadline: 2026-09-01T02:00:00+0200\nResolved drand round: target 31805812'
+        ;;
+      disabled)
+        plan_add hooks_disabled "Hooks disabled by --no-hooks"
+        PLAN_TARGET_TEXT="locked at the resolved deadline"
+        ;;
+      none)
+        plan_add tm_exclude_state \
+          "Persistently exclude the protected state directory from Time Machine and verify the exclusion"
+        PLAN_TARGET_TEXT="locked at the resolved deadline"
+        ;;
+      inconsistent)
+        plan_add tm_exclude_state \
+          "Persistently exclude the protected state directory from Time Machine and verify the exclusion"
+        SNAPSHOT_RECORDED_LOCKED=true
+        SNAPSHOT_APFS_LOCKED=false
+        SNAPSHOT_APFS_MOUNTED=true
+        SNAPSHOT_ACTUAL_MOUNT_POINT=$MOUNT_POINT
+        RUNTIME_ASSESSMENT=inconsistent
+        PLAN_TARGET_TEXT="locked at the resolved deadline"
+        ;;
+      *) die_usage "unknown output fixture: $4" ;;
+    esac
+    render_selected_plan lock
     ;;
   __confirm_response)
     [[ $# -eq 2 ]] \

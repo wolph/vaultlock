@@ -1833,6 +1833,17 @@ check_contains() { # description needle haystack
   fi
 }
 
+check_not_contains() { # description needle haystack
+  local description=$1 needle=$2 haystack=$3
+  if [[ "$haystack" == *"$needle"* ]]; then
+    printf 'FAIL %s: unexpectedly found [%s] in [%s]\n' \
+      "$description" "$needle" "$haystack"
+    fail=1
+  else
+    printf 'ok   %s\n' "$description"
+  fi
+}
+
 # shellcheck disable=SC2329  # Used by later CLI scenarios.
 check_empty() { # description file
   local description=$1 file=$2
@@ -2275,6 +2286,11 @@ assert_status_snapshot "usable unlocked vault" \
   "expected $mount_point, actual $mount_point" \
   'plaintext present, ciphertext absent, hash absent' \
   usable
+status_esc=$'\033'
+usable_colour_output=$(run_vaultlock status --color=always)
+check_line "usable status colours only assessment label green" \
+  "${status_esc}[32mAssessment:${status_esc}[0m usable" \
+  "$usable_colour_output"
 
 write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
 write_apfs_state true false UUID-123 disk9s1
@@ -2293,6 +2309,10 @@ check_contains "locked status preserves target round" \
   'drand round: target 792731235, current ' "$locked_output"
 check_line "locked status preserves unlock instruction" \
   'when the deadline passes: vaultlock unlock (needs internet)' "$locked_output"
+locked_colour_output=$(run_vaultlock status --color=always)
+check_line "locked status colours only assessment label yellow" \
+  "${status_esc}[33mAssessment:${status_esc}[0m securely locked" \
+  "$locked_colour_output"
 
 write_json_state false null null null UUID-123
 write_apfs_state true false UUID-123 disk9s1
@@ -2303,6 +2323,10 @@ assert_status_snapshot "recorded unlock repair" \
   "expected $mount_point, actual not mounted" \
   'plaintext present, ciphertext absent, hash present' \
   'repairable: run vaultlock unlock'
+repair_colour_output=$(run_vaultlock status --color=always)
+check_line "repair status colours only assessment label yellow" \
+  "${status_esc}[33mAssessment:${status_esc}[0m repairable: run vaultlock unlock" \
+  "$repair_colour_output"
 
 write_json_state false null null null UUID-123
 write_apfs_state false false UUID-123 disk9s1
@@ -2323,6 +2347,10 @@ assert_status_snapshot "recorded locked but APFS unlocked" \
   "expected $mount_point, actual $mount_point" \
   'plaintext absent, ciphertext present, hash present' \
   inconsistent
+inconsistent_colour_output=$(run_vaultlock status --color=always)
+check_line "inconsistent status colours only assessment label red" \
+  "${status_esc}[31mAssessment:${status_esc}[0m inconsistent" \
+  "$inconsistent_colour_output"
 
 write_apfs_state true true UUID-123 disk9s1
 assert_status_snapshot "APFS locked but mounted" \
@@ -2875,14 +2903,14 @@ lock_apfs_before=$(tree_manifest "$apfs_state")
 : > "$action_log"
 : > "$mutation_log"
 : > "$hook_log"
-if lock_plan=$(run_vaultlock lock --dry-run --no-hooks 2:00 +2d 2>&1); then
+if lock_plan=$(run_vaultlock lock -vv --dry-run --no-hooks 2:00 +2d 2>&1); then
   lock_status=0
 else
   lock_status=$?
 fi
 check "lock dry-run exits successfully" 0 "$lock_status"
 check_line "lock dry-run names target" \
-  'Target: locked at the resolved deadline' "$lock_plan"
+  '  Target: locked at the resolved deadline' "$lock_plan"
 check_contains "lock dry-run resolves deadline" \
   'Requested deadline: ' "$lock_plan"
 check_contains "lock dry-run resolves target round" \
@@ -2961,7 +2989,48 @@ check_tree_unchanged "lock dry-run leaves APFS fixture unchanged" \
 check_secret_absent "lock dry-run hides passphrase" "$lock_plan" "$fake_passphrase"
 check_secret_absent "lock dry-run hides hash" "$lock_plan" "$fake_hash"
 check_secret_absent "lock dry-run hides ciphertext" "$lock_plan" "$fake_ciphertext"
-lock_hook_plan=$(run_vaultlock lock --dry-run 2:00 +2d)
+
+lock_disabled_summary=$(run_vaultlock \
+  lock --dry-run --no-hooks --color=never 2:00 +2d)
+check_line "default lock summary names repairable state" \
+  '  State: repairable: run vaultlock unlock' "$lock_disabled_summary"
+check_line "default lock summary names target" \
+  '  Target: locked at the resolved deadline' "$lock_disabled_summary"
+check_contains "default lock summary includes request metadata" \
+  'Requested deadline: ' "$lock_disabled_summary"
+check_line "default lock summary names disabled hooks" \
+  'Hooks: disabled' "$lock_disabled_summary"
+check "default lock summary reports dry-run result" \
+  'Result: no changes made' "$(tail -n 1 <<< "$lock_disabled_summary")"
+check_not_contains "default lock summary hides actions" \
+  'Actions:' "$lock_disabled_summary"
+check_not_contains "default lock summary hides coordination" \
+  'Acquire cooperative operation lock' "$lock_disabled_summary"
+check_not_contains "default lock summary hides standard actions" \
+  'Lock the APFS volume' "$lock_disabled_summary"
+check_not_contains "default lock summary hides hook argv" \
+  '--phase' "$lock_disabled_summary"
+
+lock_deferred_summary=$(run_vaultlock \
+  lock --dry-run --color=never 2:00 +2d)
+check_contains "default lock summary names deferred hook directory" \
+  "pre-lock [vault, after mount] $(printf '%q' "$mount_point/.vaultlock/hooks/pre-lock.d")" \
+  "$lock_deferred_summary"
+check_not_contains "default deferred hook summary hides argv" \
+  '--phase' "$lock_deferred_summary"
+
+cp "$TEST_SELF" "$state_dir/pre-lock.sh"
+chmod +x "$state_dir/pre-lock.sh"
+lock_known_summary=$(run_vaultlock \
+  lock --dry-run --color=never 2:00 +2d)
+check_contains "default lock summary names known hook path" \
+  "pre-lock [global] $(printf '%q' "$state_dir/pre-lock.sh")" \
+  "$lock_known_summary"
+check_not_contains "default known hook summary hides argv" \
+  '--phase' "$lock_known_summary"
+rm -f "$state_dir/pre-lock.sh"
+
+lock_hook_plan=$(run_vaultlock lock -vv --dry-run 2:00 +2d)
 check_contains "lock dry-run types deferred pre-lock hook metadata" \
   "Defer pre-lock vault hook discovery in $(printf '%q' "$mount_point/.vaultlock/hooks/pre-lock.d") until the expected vault is mounted and verified" \
   "$lock_hook_plan"
@@ -2981,14 +3050,14 @@ unlock_apfs_before=$(tree_manifest "$apfs_state")
 : > "$action_log"
 : > "$mutation_log"
 : > "$hook_log"
-if unlock_plan=$(run_vaultlock unlock --dry-run 2>&1); then
+if unlock_plan=$(run_vaultlock unlock -vv --dry-run 2>&1); then
   unlock_status=0
 else
   unlock_status=$?
 fi
 check "unlock dry-run exits successfully" 0 "$unlock_status"
 check_line "unlock dry-run names target" \
-  "Target: unlocked and mounted at $mount_point" "$unlock_plan"
+  "  Target: unlocked and mounted at $mount_point" "$unlock_plan"
 check_contains "unlock dry-run lists pre-unlock hook" \
   "10-pre\\ hook --phase pre-unlock --scope global" "$unlock_plan"
 check_contains "unlock dry-run defers unavailable local hooks" \
@@ -2998,6 +3067,7 @@ check_contains "unlock dry-run lists global post hook after deferred item" \
   "20-post\\ hook --phase post-unlock --scope global" "$unlock_plan"
 check_plan_coordination "unlock dry-run" "$unlock_plan"
 unlock_order=$(printf '%s\n' "$unlock_plan" \
+  | sed -n '/^Actions:$/,/^Confirmation:/p' \
   | grep -E 'pre-unlock|Decrypt|Verify the decrypted|Unlock the expected|Verify the mounted|Write the verified|Update the keychain|record the unlocked|Defer discovery|post-unlock|cooperative operation lock' \
   | normalize_domain_plan_actions \
   || true)
@@ -3066,7 +3136,7 @@ write_apfs_state true false UUID-123 disk9s1
 rm -f "$apfs_state/mount_point" "$state_dir/passphrase.txt"
 printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
 printf '%s\n' "$fake_ciphertext" > "$state_dir/passphrase.tle"
-secure_lock_plan=$(run_vaultlock lock --dry-run --no-hooks 1h)
+secure_lock_plan=$(run_vaultlock lock -vv --dry-run --no-hooks 1h)
 check_count "secure lock dry-run disables hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$secure_lock_plan"
 check_contains "secure lock retains requested deadline" \
@@ -3084,8 +3154,9 @@ write_apfs_state true false UUID-123 disk9s1
 printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
 printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
 rm -f "$state_dir/passphrase.tle" "$apfs_state/mount_point"
-repair_unlock_plan=$(run_vaultlock unlock --dry-run)
+repair_unlock_plan=$(run_vaultlock unlock -vv --dry-run)
 repair_unlock_order=$(printf '%s\n' "$repair_unlock_plan" \
+  | sed -n '/^Actions:$/,/^Confirmation:/p' \
   | grep -E 'Verify the existing plaintext|Unlock the expected APFS|Mount the expected APFS|Verify the mounted UUID|Verify the unlocked and mounted|Defer post-unlock|post-unlock.d/20-post' \
   | normalize_domain_plan_actions \
   || true)
@@ -3103,7 +3174,7 @@ EOF
 check "recorded-unlocked repair plans target and post hooks in order" \
   "$expected_repair_unlock_order" "$repair_unlock_order"
 
-repair_unlock_no_hooks=$(run_vaultlock unlock --dry-run --no-hooks)
+repair_unlock_no_hooks=$(run_vaultlock unlock -vv --dry-run --no-hooks)
 check_count "recorded-unlocked repair disables hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$repair_unlock_no_hooks"
 repair_no_hooks_order=$(printf '%s\n' "$repair_unlock_no_hooks" \
@@ -3128,12 +3199,12 @@ printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
 printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
 printf '%s' "$fake_passphrase" > "$apfs_state/keychain_value"
 rm -f "$state_dir/passphrase.tle"
-usable_unlock_plan=$(run_vaultlock unlock --dry-run --no-hooks)
+usable_unlock_plan=$(run_vaultlock unlock -vv --dry-run --no-hooks)
 check_count "usable unlock no-hooks reports disabled hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$usable_unlock_plan"
 check_contains "usable unlock verifies target" \
   'Verify the unlocked and mounted target state' "$usable_unlock_plan"
-usable_unlock_hooks_plan=$(run_vaultlock unlock --dry-run)
+usable_unlock_hooks_plan=$(run_vaultlock unlock -vv --dry-run)
 check_count "usable unlock plans no hook execution" 0 \
   'Run hook ' "$usable_unlock_hooks_plan"
 check_count "usable unlock plans no deferred hook discovery" 0 \
@@ -3153,7 +3224,7 @@ for keychain_plan_mount_state in mounted unmounted; do
     if [[ "$keychain_plan_material" == stale ]]; then
       printf 'stale-keychain-value' > "$apfs_state/keychain_value"
     fi
-    keychain_repair_plan=$(run_vaultlock unlock --dry-run)
+    keychain_repair_plan=$(run_vaultlock unlock -vv --dry-run)
     check_contains \
       "$keychain_plan_mount_state $keychain_plan_material keychain repair is typed as an update" \
       'Update the keychain with the verified recovery material' \
@@ -3170,12 +3241,12 @@ printf '%s\n' "$fake_passphrase" > "$state_dir/passphrase.txt"
 printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
 printf '%s' "$fake_passphrase" > "$apfs_state/keychain_value"
 rm -f "$state_dir/passphrase.tle"
-unmounted_unlock_plan=$(run_vaultlock unlock --dry-run --no-hooks)
+unmounted_unlock_plan=$(run_vaultlock unlock -vv --dry-run --no-hooks)
 check_count "unmounted unlock no-hooks reports disabled hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$unmounted_unlock_plan"
 check_contains "unmounted unlock repair verifies target" \
   'Verify the unlocked and mounted target state' "$unmounted_unlock_plan"
-unmounted_unlock_hooks_plan=$(run_vaultlock unlock --dry-run)
+unmounted_unlock_hooks_plan=$(run_vaultlock unlock -vv --dry-run)
 check_count "unmounted unlock repair plans no hook execution" 0 \
   'Run hook ' "$unmounted_unlock_hooks_plan"
 check_count "unmounted unlock repair plans no deferred hook discovery" 0 \
@@ -3186,7 +3257,7 @@ write_apfs_state true false UUID-123 disk9s1
 rm -f "$apfs_state/mount_point" "$state_dir/passphrase.txt"
 printf '%s\n' "$fake_hash" > "$state_dir/passphrase.sha256"
 printf '%s\n' "$fake_ciphertext" > "$state_dir/passphrase.tle"
-locked_unlock_no_hooks=$(run_vaultlock unlock --dry-run --no-hooks)
+locked_unlock_no_hooks=$(run_vaultlock unlock -vv --dry-run --no-hooks)
 check_count "recorded-locked unlock disables hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$locked_unlock_no_hooks"
 
@@ -3209,7 +3280,7 @@ for init_preflight_command in security sudo head base64 mktemp; do
       "$init_preflight_command is required" "$init_preflight_output"
   fi
   check_count "init missing $init_preflight_command renders no plan" 0 \
-    'Vaultlock plan:' "$init_preflight_output"
+    'Initialize vault' "$init_preflight_output"
   check_empty "init missing $init_preflight_command performs no mutation" \
     "$mutation_log"
   mv "$fake_bin/$init_preflight_command.missing" \
@@ -3224,7 +3295,7 @@ else
     'USER is missing or unsafe' "$unsafe_user_output"
 fi
 check_count "init unsafe USER renders no plan" 0 \
-  'Vaultlock plan:' "$unsafe_user_output"
+  'Initialize vault' "$unsafe_user_output"
 check_empty "init unsafe USER performs no mutation" "$mutation_log"
 
 : > "$mutation_log"
@@ -3236,7 +3307,7 @@ else
     'keychain service is unsafe' "$unsafe_service_output"
 fi
 check_count "init unsafe service renders no plan" 0 \
-  'Vaultlock plan:' "$unsafe_service_output"
+  'Initialize vault' "$unsafe_service_output"
 check_empty "init unsafe service performs no mutation" "$mutation_log"
 
 rm -f "$apfs_state/keychain_marker"
@@ -3253,7 +3324,7 @@ check_count "generic keychain helper exposes no init identity error" 0 \
 rm -f "$apfs_state/keychain_marker"
 : > "$mutation_log"
 
-init_plan=$(run_vaultlock init --dry-run)
+init_plan=$(run_vaultlock init -vv --dry-run)
 check_plan_coordination "init dry-run" "$init_plan"
 init_actions=$(printf '%s\n' "$init_plan" | grep -E '^  [0-9]+\. ' \
   | normalize_domain_plan_actions || true)
@@ -3264,12 +3335,8 @@ expected_init_actions=$(cat <<'EOF' | normalize_domain_plan_actions
 EOF
 )
 check "init dry-run ordered actions" "$expected_init_actions" "$init_actions"
-check_line "init dry-run reports inspected absent state" \
-  'Recorded: absent (init preflight)' "$init_plan"
-check_line "init dry-run reports inspected absent APFS volume" \
-  'APFS: absent (no volume named vault)' "$init_plan"
-check_line "init dry-run reports absent mount" \
-  "Mount: expected $mount_point, actual not mounted" "$init_plan"
+check_line "init dry-run reports absent state" \
+  '  State: absent and ready for initialization' "$init_plan"
 check_line "init dry-run requires confirmation" \
   '  Required before normal execution changes the vault' "$init_plan"
 check "init dry-run final result" 'Result: no changes made' \
@@ -3278,8 +3345,58 @@ check_empty "init dry-run mutation log" "$mutation_log"
 [[ ! -e "$state_dir/state.json" && ! -e "$state_dir/passphrase.txt" ]] \
   || record_failure "init dry-run leaves state absent"
 
+printf 'dry-run confirmation sentinel\n' > "$confirm_device"
+init_summary=$(run_vaultlock init --dry-run --color=never)
+check_line "default init summary names state" \
+  '  State: absent and ready for initialization' "$init_summary"
+check_line "default init summary names target" \
+  "  Target: an initialized, unlocked, mounted vault at $mount_point" \
+  "$init_summary"
+check_line "default init summary names absent hooks" \
+  'Hooks: none' "$init_summary"
+check "default init summary reports dry-run result" \
+  'Result: no changes made' "$(tail -n 1 <<< "$init_summary")"
+check_not_contains "default init summary hides actions" 'Actions:' "$init_summary"
+check_not_contains "default init summary hides coordination" \
+  'Acquire cooperative operation lock' "$init_summary"
+check_not_contains "default init summary hides standard actions" \
+  'Prepare protected state and generate recovery material' "$init_summary"
+check_not_contains "default init summary hides confirmation detail" \
+  'Confirmation:' "$init_summary"
+check "init dry-run never opens confirmation device" \
+  'dry-run confirmation sentinel' "$(< "$confirm_device")"
+
+for confirmation_colour in always never auto; do
+  printf 'n\n' > "$confirm_device"
+  : > "$test_root/confirmation-stdout"
+  : > "$test_root/confirmation-stderr"
+  if VAULTLOCK_TEST_STDOUT_TTY=false VAULTLOCK_TEST_STDERR_TTY=false \
+      NO_COLOR='' TERM=xterm-256color \
+      run_vaultlock init "--color=$confirmation_colour" \
+      > "$test_root/confirmation-stdout" \
+      2> "$test_root/confirmation-stderr"; then
+    record_failure "$confirmation_colour confirmation declines execution"
+  fi
+  confirmation_output=$(< "$confirm_device")
+  if [[ "$confirmation_colour" == always ]]; then
+    check "$confirmation_colour confirmation has exact coloured prompt" \
+      "${esc}[33mConfirmation required.${esc}[0m Continue? [y/N] " \
+      "$confirmation_output"
+  else
+    check "$confirmation_colour confirmation has exact plain prompt" \
+      'Confirmation required. Continue? [y/N] ' "$confirmation_output"
+    check_not_contains "$confirmation_colour stdout has no escape bytes" \
+      "$esc" "$(< "$test_root/confirmation-stdout")"
+    check_not_contains "$confirmation_colour stderr has no escape bytes" \
+      "$esc" "$(< "$test_root/confirmation-stderr")"
+    check_not_contains \
+      "$confirmation_colour confirmation device has no escape bytes" \
+      "$esc" "$confirmation_output"
+  fi
+done
+
 : > "$mutation_log"
-if init_declined=$(run_vaultlock init 2>&1); then
+if init_declined=$(run_vaultlock init -vv 2>&1); then
   record_failure "init decline exits nonzero"
 else
   check_contains "init decline reports cancellation" \
@@ -3300,6 +3417,8 @@ check_empty "init decline mutation log" "$mutation_log"
 init_success=$(run_vaultlock init --yes 2>&1)
 check_contains "init yes reports result" 'Result: created encrypted volume vault' \
   "$init_success"
+check_not_contains "init yes prints no confirmation boilerplate" \
+  'Confirmation' "$init_success"
 check "init yes writes unlocked UUID" UUID-INIT \
   "$(jq -r '.volume_uuid' "$state_dir/state.json")"
 check "init yes writes unlocked state" false \
@@ -3342,7 +3461,7 @@ else
     'ditto is required' "$adopt_ditto_preflight_output"
 fi
 check_count "adopt missing ditto renders no plan" 0 \
-  'Vaultlock plan:' "$adopt_ditto_preflight_output"
+  'Adopt into vault' "$adopt_ditto_preflight_output"
 check_empty "adopt missing ditto performs no mutation" "$mutation_log"
 mv "$fake_bin/ditto.missing" "$fake_bin/ditto"
 
@@ -3357,7 +3476,7 @@ fi
   || record_failure "adopt bypasses incompatible PATH find and stat"
 
 : > "$mutation_log"
-adopt_plan=$(run_vaultlock adopt --dry-run "$adopt_source")
+adopt_plan=$(run_vaultlock adopt -vv --dry-run "$adopt_source")
 check_plan_coordination "adopt dry-run" "$adopt_plan"
 check_contains "adopt dry-run plans copy" \
   "Copy $adopt_source_resolved to $mount_point/source directory" "$adopt_plan"
@@ -3371,7 +3490,7 @@ check_empty "adopt dry-run mutation log" "$mutation_log"
   || record_failure "adopt dry-run preserves source directory"
 
 : > "$mutation_log"
-if adopt_declined=$(run_vaultlock adopt "$adopt_source" 2>&1); then
+if adopt_declined=$(run_vaultlock adopt -vv "$adopt_source" 2>&1); then
   record_failure "adopt decline exits nonzero"
 else
   check_contains "adopt decline reports cancellation" \
@@ -4041,7 +4160,7 @@ check "adopt link verification rollback preserves payload manifest" \
 reset_adopt_fixture
 noninteractive_adopt_source=$(new_adopt_source noninteractive-adopt)
 mv "$confirm_device" "$confirm_device.saved"
-if noninteractive_adopt_output=$(run_vaultlock adopt \
+if noninteractive_adopt_output=$(run_vaultlock adopt -vv \
     "$noninteractive_adopt_source" 2>&1); then
   record_failure "adopt noninteractive confirmation exits nonzero"
 else
@@ -4629,7 +4748,7 @@ fi
 
 reset_init_fixture
 mv "$confirm_device" "$confirm_device.saved"
-if missing_confirmation_output=$(run_vaultlock init 2>&1); then
+if missing_confirmation_output=$(run_vaultlock init -vv 2>&1); then
   record_failure "init missing confirmation device exits nonzero"
 else
   check_contains "init missing confirmation device reports yes hint" \
@@ -5108,7 +5227,7 @@ check "adopt backslash xattr oracle" backslash-value \
 reset_operation_lock_fixture
 reset_init_fixture
 /bin/rm -rf -- "${state_dir:?}"
-if absent_state_plan=$(run_vaultlock init --dry-run 2>&1); then
+if absent_state_plan=$(run_vaultlock init -vv --dry-run 2>&1); then
   check_contains "init absent state directory renders full plan" \
     'Prepare protected state and generate recovery material' "$absent_state_plan"
 else
@@ -6248,7 +6367,8 @@ write_json_state false null null null UUID-123
 write_apfs_state false true UUID-123 disk9s1
 write_unlock_plaintext
 write_matching_keychain
-if unlock_dry_coordination_output=$(run_vaultlock unlock --dry-run 2>&1); then
+if unlock_dry_coordination_output=$(run_vaultlock \
+    unlock -vv --dry-run 2>&1); then
   unlock_dry_coordination_status=0
 else
   unlock_dry_coordination_status=$?
@@ -6306,7 +6426,7 @@ write_json_state false null null null UUID-123
 write_apfs_state false true UUID-123 disk9s1
 write_unlock_plaintext
 write_matching_keychain
-if usable_noop_output=$(run_vaultlock unlock 2>&1); then
+if usable_noop_output=$(run_vaultlock unlock -vv 2>&1); then
   usable_noop_status=0
 else
   usable_noop_status=$?
@@ -6360,7 +6480,7 @@ for keychain_mount_state in mounted unmounted; do
       /bin/cp "$TEST_SELF" "$unused_unlock_hook"
       /bin/chmod +x "$unused_unlock_hook"
     done
-    if keychain_repair_output=$(run_vaultlock unlock 2>&1); then
+    if keychain_repair_output=$(run_vaultlock unlock -vv 2>&1); then
       keychain_repair_status=0
     else
       keychain_repair_status=$?
@@ -7746,7 +7866,7 @@ printf '%s\n' "$lock_old_hash" > "$state_dir/passphrase.sha256"
 printf '%s' "$lock_old_passphrase" > "$apfs_state/keychain_value"
 : > "$apfs_state/keychain_marker"
 if locked_keychain_repair_output=$(run_vaultlock \
-    lock --yes --no-hooks 20h 2>&1); then
+    lock -vv --yes --no-hooks 20h 2>&1); then
   locked_keychain_repair_status=0
 else
   locked_keychain_repair_status=$?
@@ -7819,7 +7939,8 @@ write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
 write_apfs_state false true UUID-123 disk9s1
 printf 'fixture ciphertext\n' > "$state_dir/passphrase.tle"
 printf '%s\n' "$lock_old_hash" > "$state_dir/passphrase.sha256"
-if locked_repair_output=$(run_vaultlock lock --yes --no-hooks 20h 2>&1); then
+if locked_repair_output=$(run_vaultlock \
+    lock -vv --yes --no-hooks 20h 2>&1); then
   locked_repair_status=0
 else
   locked_repair_status=$?
@@ -7845,11 +7966,12 @@ write_lock_plaintext
 /bin/cp "$TEST_SELF" "$state_dir/hooks/pre-lock.d/10-declined-repair-hook"
 /bin/chmod +x "$state_dir/hooks/pre-lock.d/10-declined-repair-hook"
 declined_repair_dry_plan=$(run_vaultlock \
-  lock --dry-run '2099-01-02 03:04' 2>&1)
+  lock -vv --dry-run '2099-01-02 03:04' 2>&1)
 declined_repair_dry_actions=$(printf '%s\n' "$declined_repair_dry_plan" \
   | /usr/bin/sed -n '/^Actions:$/,/^Confirmation:$/p')
 printf 'n\n' > "$confirm_device"
-if declined_lock_output=$(run_vaultlock lock '2099-01-02 03:04' 2>&1); then
+if declined_lock_output=$(run_vaultlock \
+    lock -vv '2099-01-02 03:04' 2>&1); then
   record_failure "declined lock exits nonzero"
 else
   check_contains "declined lock reports no changes" \
