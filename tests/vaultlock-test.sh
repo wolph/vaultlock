@@ -76,6 +76,30 @@ check_contains() { # desc needle haystack
   fi
 }
 
+check_not_contains() { # description needle haystack
+  if [[ "$3" == *"$2"* ]]; then
+    printf 'FAIL %s: unexpectedly found [%s] in [%s]\n' "$1" "$2" "$3"
+    fail=1
+  else
+    printf 'ok   %s\n' "$1"
+  fi
+}
+
+options() {
+  "$VL" __options "$@"
+}
+
+reject_options() { # description command arguments...
+  local description=$1 status output
+  shift
+  if output=$("$VL" __options "$@" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  check "$description exits with usage status" 64 "$status"
+}
+
 install_hook() {
   local hook_path=$1
   mkdir -p "$(dirname "$hook_path")"
@@ -201,6 +225,93 @@ reject_deadline "reject zero combined offset" "$now" 2:00 +0d
 reject_deadline "reject trailing text" "$now" 1h garbage
 reject_deadline "reject oversized duration" "$now" 1000000000d
 reject_deadline "reject past absolute deadline" "$now" '2026-08-28 10:15'
+
+check "default presentation options" \
+  $'dry_run=false\nyes=false\nhooks=true\nverbosity=0\ncolor=auto\noperands=20h' \
+  "$(options lock 20h)"
+check "short verbose option" \
+  $'dry_run=false\nyes=false\nhooks=true\nverbosity=1\ncolor=auto\noperands=20h' \
+  "$(options lock -v 20h)"
+check "long verbose option" \
+  $'dry_run=false\nyes=false\nhooks=true\nverbosity=1\ncolor=auto\noperands=' \
+  "$(options unlock --verbose)"
+check "highest verbosity wins" \
+  $'dry_run=false\nyes=false\nhooks=true\nverbosity=2\ncolor=auto\noperands=20h' \
+  "$(options lock -vv --verbose 20h)"
+check "long very verbose option" \
+  $'dry_run=false\nyes=false\nhooks=true\nverbosity=2\ncolor=auto\noperands=source' \
+  "$(options adopt --very-verbose source)"
+check "init accepts presentation options" \
+  $'dry_run=false\nyes=false\nhooks=true\nverbosity=2\ncolor=never\noperands=' \
+  "$(options init --color=never -vv)"
+check "last colour wins" \
+  $'dry_run=false\nyes=false\nhooks=true\nverbosity=2\ncolor=always\noperands=20h' \
+  "$(options lock --very-verbose --color=never --color=always 20h)"
+check "single-dash lock operand remains an operand" \
+  $'dry_run=false\nyes=false\nhooks=true\nverbosity=0\ncolor=auto\noperands=-1h' \
+  "$(options lock -1h)"
+check "single-dash adopt operand remains an operand" \
+  $'dry_run=false\nyes=false\nhooks=true\nverbosity=0\ncolor=auto\noperands=-source' \
+  "$(options adopt -source)"
+
+reject_options "empty colour" lock --color= 20h
+reject_options "unknown colour" lock --color=sometimes 20h
+reject_options "separate colour value" lock --color always 20h
+reject_options "option after operand" lock 20h -v
+reject_options "very verbose option after operand" lock 20h -vv
+
+esc=$'\033'
+plain=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  VAULTLOCK_TEST_STDOUT_TTY=false VAULTLOCK_TEST_STDERR_TTY=false \
+  NO_COLOR='' TERM=xterm-256color "$VL" __colour auto 2>&1)
+check "auto colour stays plain through pipes" \
+  $'heading\nsuccess\nvaultlock: error' "$plain"
+
+always=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  VAULTLOCK_TEST_STDOUT_TTY=false VAULTLOCK_TEST_STDERR_TTY=false \
+  NO_COLOR=1 TERM=dumb "$VL" __colour always 2>&1)
+check_contains "always colour overrides environment" "${esc}[" "$always"
+
+never=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  VAULTLOCK_TEST_STDOUT_TTY=true VAULTLOCK_TEST_STDERR_TTY=true \
+  TERM=xterm-256color "$VL" __colour never 2>&1)
+check "never colour stays plain" \
+  $'heading\nsuccess\nvaultlock: error' "$never"
+
+stdout_only=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  VAULTLOCK_TEST_STDOUT_TTY=true VAULTLOCK_TEST_STDERR_TTY=false \
+  NO_COLOR='' TERM=xterm-256color "$VL" __colour auto 2>&1)
+check_contains "stdout TTY colours heading" "${esc}[36mheading" "$stdout_only"
+check_not_contains "plain stderr has no red prefix" \
+  "${esc}[31mvaultlock:" "$stdout_only"
+
+stderr_only=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  VAULTLOCK_TEST_STDOUT_TTY=false VAULTLOCK_TEST_STDERR_TTY=true \
+  NO_COLOR='' TERM=xterm-256color "$VL" __colour auto 2>&1)
+check_not_contains "plain stdout has no cyan heading" \
+  "${esc}[36mheading" "$stderr_only"
+check_contains "stderr TTY colours error prefix" \
+  "${esc}[31mvaultlock:" "$stderr_only"
+
+for disabled_environment in term-dumb no-color; do
+  if [[ "$disabled_environment" == term-dumb ]]; then
+    disabled=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+      VAULTLOCK_TEST_STDOUT_TTY=true VAULTLOCK_TEST_STDERR_TTY=true \
+      NO_COLOR='' TERM=dumb "$VL" __colour auto 2>&1)
+  else
+    disabled=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+      VAULTLOCK_TEST_STDOUT_TTY=true VAULTLOCK_TEST_STDERR_TTY=true \
+      NO_COLOR=1 TERM=xterm-256color "$VL" __colour auto 2>&1)
+  fi
+  check "$disabled_environment disables auto colour" \
+    $'heading\nsuccess\nvaultlock: error' "$disabled"
+done
+
+empty_no_color=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  VAULTLOCK_TEST_STDOUT_TTY=true VAULTLOCK_TEST_STDERR_TTY=true \
+  NO_COLOR='' TERM=xterm-256color "$VL" __colour auto 2>&1)
+check_contains "empty NO_COLOR permits automatic colour" \
+  "${esc}[36mheading" "$empty_no_color"
 
 hook_test_root=$(mktemp -d "/tmp/vaultlock hooks.XXXXXX")
 trap 'rm -rf "$hook_test_root"' EXIT
@@ -475,7 +586,7 @@ fi
 if output=$(VAULTLOCK_STATE_DIR="$state_probe_dir" "$VL" unlock extra 2>&1); then
   printf 'FAIL unlock rejects extra argument: command succeeded\n'
   fail=1
-elif [[ "$output" == "vaultlock: usage: vaultlock unlock [--dry-run] [--no-hooks]" ]]; then
+elif [[ "$output" == "vaultlock: usage: vaultlock unlock [--dry-run] [--no-hooks] [-v|--verbose|-vv|--very-verbose] [--color=auto|always|never]" ]]; then
   printf 'ok   unlock rejects extra argument\n'
 else
   printf 'FAIL unlock rejects extra argument: got [%s]\n' "$output"

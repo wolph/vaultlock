@@ -2469,21 +2469,25 @@ check_line "mount point matching is literal" \
   'Assessment: inconsistent' "$output"
 
 check "lock option order" \
-  $'dry_run=true\nyes=true\nhooks=false\noperands=2:00 +2d' \
+  $'dry_run=true\nyes=true\nhooks=false\nverbosity=0\ncolor=auto\noperands=2:00 +2d' \
   "$(run_vaultlock __options lock --yes --no-hooks --dry-run 2:00 +2d)"
 
 check "init accepts yes and dry-run" \
-  $'dry_run=true\nyes=true\nhooks=true\noperands=' \
+  $'dry_run=true\nyes=true\nhooks=true\nverbosity=0\ncolor=auto\noperands=' \
   "$(run_vaultlock __options init --yes --dry-run)"
 check "lock accepts yes and dry-run" \
-  $'dry_run=true\nyes=true\nhooks=true\noperands=20h' \
+  $'dry_run=true\nyes=true\nhooks=true\nverbosity=0\ncolor=auto\noperands=20h' \
   "$(run_vaultlock __options lock --dry-run --yes 20h)"
 check "adopt accepts dry-run and yes" \
-  $'dry_run=true\nyes=true\nhooks=true\noperands=source directory' \
+  $'dry_run=true\nyes=true\nhooks=true\nverbosity=0\ncolor=auto\noperands=source directory' \
   "$(run_vaultlock __options adopt --dry-run --yes 'source directory')"
 check "unlock accepts dry-run and no-hooks" \
-  $'dry_run=true\nyes=false\nhooks=false\noperands=' \
+  $'dry_run=true\nyes=false\nhooks=false\nverbosity=0\ncolor=auto\noperands=' \
   "$(run_vaultlock __options unlock --no-hooks --dry-run)"
+check "lifecycle presentation options are order independent" \
+  $'dry_run=true\nyes=true\nhooks=true\nverbosity=2\ncolor=always\noperands=20h' \
+  "$(run_vaultlock __options lock --verbose --color=never -vv \
+    --color=always --dry-run --yes 20h)"
 
 reject_options "unlock rejects yes" unlock --yes
 reject_options "adopt rejects option after operand" adopt source --dry-run
@@ -2493,8 +2497,11 @@ reject_options "init rejects unknown options" init --unknown
 reject_options "adopt rejects extra operands" adopt source extra
 reject_options "init rejects no-hooks" init --no-hooks
 reject_options "adopt rejects no-hooks" adopt --no-hooks source
+reject_options "lock rejects invalid colour" lock --color=sometimes 20h
+reject_options "lock rejects empty colour" lock --color= 20h
+reject_options "lock rejects verbose after operand" lock 20h -v
 
-for status_operand in extra --dry-run; do
+for status_operand in extra --dry-run -v --verbose -vv --very-verbose; do
   : > "$action_log"
   if status_operand_output=$(run_vaultlock status "$status_operand" 2>&1); then
     status_operand_status=0
@@ -2510,6 +2517,54 @@ for status_operand in extra --dry-run; do
     "$action_log"
 done
 
+: > "$action_log"
+if status_colour_output=$(run_vaultlock status --color=never 2>&1); then
+  status_colour_status=0
+else
+  status_colour_status=$?
+fi
+check "status accepts colour mode" 0 "$status_colour_status"
+check_contains "status with colour inspects state" \
+  'diskutil info -plist UUID-123' "$(< "$action_log")"
+check_line "status never keeps output plain" \
+  'Assessment: inconsistent' "$status_colour_output"
+
+for invalid_status_colour in --color= --color=sometimes; do
+  : > "$action_log"
+  : > "$mutation_log"
+  if invalid_status_colour_output=$(run_vaultlock status \
+      "$invalid_status_colour" 2>&1); then
+    invalid_status_colour_status=0
+    record_failure "status rejects $invalid_status_colour"
+  else
+    invalid_status_colour_status=$?
+  fi
+  check "status $invalid_status_colour exits with usage status" \
+    64 "$invalid_status_colour_status"
+  check_contains "status $invalid_status_colour reports invalid colour" \
+    'invalid colour mode' "$invalid_status_colour_output"
+  check_empty "status $invalid_status_colour performs no inspection" \
+    "$action_log"
+  check_empty "status $invalid_status_colour performs no mutation" \
+    "$mutation_log"
+done
+
+: > "$action_log"
+: > "$mutation_log"
+if invalid_lifecycle_colour_output=$(run_vaultlock lock \
+    --color=sometimes --yes 20h 2>&1); then
+  invalid_lifecycle_colour_status=0
+  record_failure "lock rejects invalid colour before inspection"
+else
+  invalid_lifecycle_colour_status=$?
+fi
+check "lock invalid colour exits with usage status" \
+  64 "$invalid_lifecycle_colour_status"
+check_contains "lock invalid colour reports parser error" \
+  'invalid colour mode' "$invalid_lifecycle_colour_output"
+check_empty "lock invalid colour performs no inspection" "$action_log"
+check_empty "lock invalid colour performs no mutation" "$mutation_log"
+
 if help_output=$(run_vaultlock help 2>&1); then
   help_status=0
 else
@@ -2517,10 +2572,26 @@ else
 fi
 check "help exits with usage status" 64 "$help_status"
 check_line "help lists init safety options" \
-  '  init [--dry-run] [--yes] create the encrypted vault volume' \
+  '  init [--dry-run] [--yes] [-v|-vv] [--color=MODE]' \
   "$help_output"
 check_line "help lists adopt safety options" \
-  '  adopt [--dry-run] [--yes] <dir>' "$help_output"
+  '  adopt [--dry-run] [--yes] [-v|-vv] [--color=MODE] <dir>' \
+  "$help_output"
+check_line "help lists long verbose options" \
+  '  -v, --verbose              show grouped progress' "$help_output"
+check_line "help lists long very verbose options" \
+  '  -vv, --very-verbose        show every planned and completed action' \
+  "$help_output"
+check_line "help limits status to colour options" \
+  '  status [--color=MODE]      show lock state and remaining time' \
+  "$help_output"
+check_line "help documents colour modes" \
+  '  --color=auto|always|never  control terminal colour (default: auto)' \
+  "$help_output"
+
+if [[ "${VAULTLOCK_TEST_TASK1_ONLY:-0}" == "1" ]]; then
+  exit "$fail"
+fi
 
 check "confirmation accepts y" true \
   "$(run_vaultlock __confirm_response y)"

@@ -61,7 +61,18 @@ state_file="$STATE_DIR/state.json"
 OPTION_DRY_RUN=false
 OPTION_YES=false
 OPTION_HOOKS=true
+OPTION_VERBOSITY=0
+OPTION_COLOR=auto
 OPTION_OPERANDS=""
+
+COLOR_STDOUT=false
+COLOR_STDERR=false
+COLOR_RESET=$'\033[0m'
+COLOR_CYAN=$'\033[36m'
+COLOR_DIM=$'\033[2m'
+COLOR_YELLOW=$'\033[33m'
+COLOR_GREEN=$'\033[32m'
+COLOR_RED=$'\033[31m'
 
 PLAN_OPERATION_IDS=()
 PLAN_OPERATION_TEXT=()
@@ -218,8 +229,78 @@ DISCOVERED_HOOK_PATHS=()
 DISCOVERED_HOOK_SCOPES=()
 HOOK_ARGV=()
 
-die() { printf 'vaultlock: %s\n' "$*" >&2; exit 1; }
-die_usage() { printf 'vaultlock: %s\n' "$*" >&2; exit 64; }
+stream_is_terminal() { # stream
+  local stream=$1 override_name override_value
+  if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]]; then
+    case "$stream" in
+      1) override_name=VAULTLOCK_TEST_STDOUT_TTY ;;
+      2) override_name=VAULTLOCK_TEST_STDERR_TTY ;;
+      *) return 1 ;;
+    esac
+    if [[ -n "${!override_name+x}" ]]; then
+      override_value=${!override_name}
+      [[ "$override_value" == "true" ]]
+      return
+    fi
+  fi
+  case "$stream" in
+    1) [[ -t 1 ]] ;;
+    2) [[ -t 2 ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_colour() { # mode
+  local mode=$1
+  COLOR_STDOUT=false
+  COLOR_STDERR=false
+  case "$mode" in
+    always)
+      COLOR_STDOUT=true
+      COLOR_STDERR=true
+      ;;
+    never) ;;
+    auto)
+      [[ "${TERM:-}" != "dumb" && -z "${NO_COLOR:-}" ]] || return 0
+      if stream_is_terminal 1; then
+        COLOR_STDOUT=true
+      fi
+      if stream_is_terminal 2; then
+        COLOR_STDERR=true
+      fi
+      ;;
+    *) die_usage "invalid colour mode: $mode" ;;
+  esac
+}
+
+print_stdout_style() { # escape text
+  if [[ "$COLOR_STDOUT" == "true" ]]; then
+    printf '%s%s%s' "$1" "$2" "$COLOR_RESET"
+  else
+    printf '%s' "$2"
+  fi
+}
+
+print_stderr_style() { # escape text
+  if [[ "$COLOR_STDERR" == "true" ]]; then
+    printf '%s%s%s' "$1" "$2" "$COLOR_RESET" >&2
+  else
+    printf '%s' "$2" >&2
+  fi
+}
+
+print_heading() { print_stdout_style "$COLOR_CYAN" "$1"; }
+print_label() { print_stdout_style "$COLOR_DIM" "$1"; }
+print_success() { print_stdout_style "$COLOR_GREEN" "$1"; }
+print_warning() { print_stderr_style "$COLOR_YELLOW" "$1"; }
+
+print_error() { # message
+  print_stderr_style "$COLOR_RED" "vaultlock:"
+  printf ' %s\n' "$1" >&2
+}
+
+die() { print_error "$*"; exit 1; }
+die_usage() { print_error "$*"; exit 64; }
 note() { printf '%s\n' "$*"; }
 
 validate_command_options() { # command operands
@@ -231,25 +312,25 @@ validate_command_options() { # command operands
       [[ "$OPTION_HOOKS" == "true" ]] \
         || die_usage "--no-hooks is not valid for init"
       [[ $# -eq 0 ]] \
-        || die_usage "usage: vaultlock init [--dry-run] [--yes]"
+        || die_usage "usage: vaultlock init [--dry-run] [--yes] [-v|--verbose|-vv|--very-verbose] [--color=auto|always|never]"
       ;;
     adopt)
       [[ "$OPTION_HOOKS" == "true" ]] \
         || die_usage "--no-hooks is not valid for adopt"
       [[ $# -eq 1 ]] \
-        || die_usage "usage: vaultlock adopt [--dry-run] [--yes] <directory>"
+        || die_usage "usage: vaultlock adopt [--dry-run] [--yes] [-v|--verbose|-vv|--very-verbose] [--color=auto|always|never] <directory>"
       OPTION_OPERANDS=$1
       ;;
     lock)
       [[ $# -gt 0 ]] \
-        || die_usage "usage: vaultlock lock [--dry-run] [--yes] [--no-hooks] <deadline>"
+        || die_usage "usage: vaultlock lock [--dry-run] [--yes] [--no-hooks] [-v|--verbose|-vv|--very-verbose] [--color=auto|always|never] <deadline>"
       OPTION_OPERANDS=$*
       ;;
     unlock)
       [[ "$OPTION_YES" == "false" ]] \
         || die_usage "--yes is not valid for unlock"
       [[ $# -eq 0 ]] \
-        || die_usage "usage: vaultlock unlock [--dry-run] [--no-hooks]"
+        || die_usage "usage: vaultlock unlock [--dry-run] [--no-hooks] [-v|--verbose|-vv|--very-verbose] [--color=auto|always|never]"
       ;;
     *)
       die_usage "unknown command: $command"
@@ -263,22 +344,38 @@ parse_command_options() { # command argv
   OPTION_DRY_RUN=false
   OPTION_YES=false
   OPTION_HOOKS=true
+  OPTION_VERBOSITY=0
+  OPTION_COLOR=auto
   OPTION_OPERANDS=""
 
-  while [[ $# -gt 0 && $1 == --* ]]; do
+  while [[ $# -gt 0 ]]; do
     argument=$1
-    shift
     case "$argument" in
+      -v|--verbose)
+        if (( OPTION_VERBOSITY < 1 )); then
+          OPTION_VERBOSITY=1
+        fi
+        ;;
+      -vv|--very-verbose) OPTION_VERBOSITY=2 ;;
+      --color=auto|--color=always|--color=never)
+        OPTION_COLOR=${argument#--color=}
+        ;;
+      --color=*) die_usage "invalid colour mode: ${argument#--color=}" ;;
       --dry-run) OPTION_DRY_RUN=true ;;
       --yes) OPTION_YES=true ;;
       --no-hooks) OPTION_HOOKS=false ;;
-      *) die_usage "unknown $command option: $argument" ;;
+      --*) die_usage "unknown $command option: $argument" ;;
+      *) break ;;
     esac
+    shift
   done
 
   for argument in "$@"; do
-    [[ "$argument" != --* ]] \
-      || die_usage "options must precede $command operands: $argument"
+    case "$argument" in
+      -v|-vv|--*)
+        die_usage "options must precede $command operands: $argument"
+        ;;
+    esac
   done
   validate_command_options "$command" "$@"
 }
@@ -6667,43 +6764,75 @@ run_planned_command() { # command
 
 dispatch_init() {
   parse_command_options init "$@"
+  resolve_colour "$OPTION_COLOR"
   run_planned_command init
 }
 
 dispatch_adopt() {
   parse_command_options adopt "$@"
+  resolve_colour "$OPTION_COLOR"
   run_planned_command adopt
 }
 
 dispatch_lock() {
   parse_command_options lock "$@"
+  resolve_colour "$OPTION_COLOR"
   run_planned_command lock
 }
 
 dispatch_unlock() {
   parse_command_options unlock "$@"
+  resolve_colour "$OPTION_COLOR"
   [[ -f "$state_file" ]] || die "no state"
   run_planned_command unlock
 }
 
 cmd_status() {
-  [[ $# -eq 0 ]] || die_usage "usage: vaultlock status"
   inspect_runtime_state
   classify_runtime_state
   render_runtime_summary
 }
 
+dispatch_status() {
+  local argument
+  OPTION_COLOR=auto
+  while [[ $# -gt 0 ]]; do
+    argument=$1
+    shift
+    case "$argument" in
+      --color=auto|--color=always|--color=never)
+        OPTION_COLOR=${argument#--color=}
+        ;;
+      --color=*) die_usage "invalid colour mode: ${argument#--color=}" ;;
+      -v|--verbose|-vv|--very-verbose)
+        die_usage "usage: vaultlock status [--color=auto|always|never]"
+        ;;
+      *) die_usage "usage: vaultlock status [--color=auto|always|never]" ;;
+    esac
+  done
+  resolve_colour "$OPTION_COLOR"
+  cmd_status
+}
+
 usage() {
   cat >&2 <<'EOF'
 usage: vaultlock <command>
-  init [--dry-run] [--yes] create the encrypted vault volume
-  adopt [--dry-run] [--yes] <dir>
+  init [--dry-run] [--yes] [-v|-vv] [--color=MODE]
+                             create the encrypted vault volume
+  adopt [--dry-run] [--yes] [-v|-vv] [--color=MODE] <dir>
                              move a directory onto the vault, leave a symlink
-  lock [--dry-run] [--yes] [--no-hooks] <deadline>
+  lock [--dry-run] [--yes] [--no-hooks] [-v|-vv] [--color=MODE] <deadline>
                              time-lock the vault until a future deadline
-  unlock [--dry-run] [--no-hooks]
+  unlock [--dry-run] [--no-hooks] [-v|-vv] [--color=MODE]
                              unlock after the deadline (needs internet)
-  status                     show lock state and remaining time
+  status [--color=MODE]      show lock state and remaining time
+
+presentation options for init, adopt, lock, and unlock:
+  -v, --verbose              show grouped progress
+  -vv, --very-verbose        show every planned and completed action
+
+colour options for all commands:
+  --color=auto|always|never  control terminal colour (default: auto)
 
 deadline forms:
   "YYYY-MM-DD HH:MM"         absolute local date and time
@@ -6726,8 +6855,21 @@ case "${1:-}" in
       || die_usage "usage: vaultlock __options <command> [arguments...]"
     shift
     parse_command_options "$@"
-    printf 'dry_run=%s\nyes=%s\nhooks=%s\noperands=%s\n' \
-      "$OPTION_DRY_RUN" "$OPTION_YES" "$OPTION_HOOKS" "$OPTION_OPERANDS"
+    printf 'dry_run=%s\nyes=%s\nhooks=%s\nverbosity=%s\ncolor=%s\noperands=%s\n' \
+      "$OPTION_DRY_RUN" "$OPTION_YES" "$OPTION_HOOKS" \
+      "$OPTION_VERBOSITY" "$OPTION_COLOR" "$OPTION_OPERANDS"
+    ;;
+  __colour)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __colour"
+    [[ $# -eq 2 ]] \
+      || die_usage "usage: vaultlock __colour <auto|always|never>"
+    resolve_colour "$2"
+    print_heading "heading"
+    printf '\n'
+    print_success "success"
+    printf '\n'
+    print_error "error"
     ;;
   __confirm_response)
     [[ $# -eq 2 ]] \
@@ -6788,6 +6930,6 @@ case "${1:-}" in
   adopt) shift; dispatch_adopt "$@" ;;
   lock) shift; dispatch_lock "$@" ;;
   unlock) shift; dispatch_unlock "$@" ;;
-  status) shift; cmd_status "$@" ;;
+  status) shift; dispatch_status "$@" ;;
   *) usage ;;
 esac
