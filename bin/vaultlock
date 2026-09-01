@@ -228,6 +228,7 @@ LOCK_ARTIFACT_PATHS=()
 DISCOVERED_HOOK_PATHS=()
 DISCOVERED_HOOK_SCOPES=()
 HOOK_ARGV=()
+HOOK_ARGV_BUILD_COUNT=0
 
 stream_is_terminal() { # stream
   local stream=$1 override_name override_value
@@ -1638,7 +1639,7 @@ append_serialized_plan_field() { # name value
 }
 
 serialize_common_plan_fields() { # command
-  local index argument_index locked hook_signature
+  local index hook_signature
   append_serialized_plan_field schema 1
   append_serialized_plan_field command "$1"
   append_serialized_plan_field option_dry_run "$OPTION_DRY_RUN"
@@ -1706,23 +1707,6 @@ serialize_common_plan_fields() { # command
         "$hook_signature"
     else
       append_serialized_plan_field "hook_signature_$index" ""
-    fi
-    if [[ "${PLAN_OPERATION_IDS[$index]}" == hook ]]; then
-      locked=$(hook_locked_value "${PLAN_HOOK_PHASES[$index]}")
-      build_hook_argv "${PLAN_HOOK_PHASES[$index]}" \
-        "${PLAN_HOOK_SCOPES[$index]}" "$PLAN_CONTEXT_UUID" \
-        "$PLAN_CONTEXT_DEVICE" "$PLAN_CONTEXT_DEADLINE" \
-        "$PLAN_CONTEXT_DEADLINE_EPOCH" "$PLAN_CONTEXT_ROUND" "$locked"
-      append_serialized_plan_field "hook_argv_count_$index" \
-        "${#HOOK_ARGV[@]}"
-      for ((argument_index=0; argument_index<${#HOOK_ARGV[@]}; \
-          argument_index++)); do
-        append_serialized_plan_field \
-          "hook_argv_${index}_$argument_index" \
-          "${HOOK_ARGV[$argument_index]}"
-      done
-    else
-      append_serialized_plan_field "hook_argv_count_$index" 0
     fi
   done
 }
@@ -1992,6 +1976,10 @@ build_hook_argv() { # phase scope uuid device deadline epoch round locked
   local phase=$1 scope=$2 uuid=$3 device=$4 deadline=$5 epoch=$6 round=$7
   local locked=$8
 
+  if [[ "${VAULTLOCK_TEST_COUNT_HOOK_ARGV_BUILDS:-0}" == 1 ]]; then
+    HOOK_ARGV_BUILD_COUNT=$((HOOK_ARGV_BUILD_COUNT + 1))
+  fi
+
   HOOK_ARGV=(
     --phase "$phase"
     --scope "$scope"
@@ -2072,6 +2060,26 @@ runtime_inconsistency_text() {
   elif [[ "$SNAPSHOT_RECORDED_LOCKED" == false \
       && "$SNAPSHOT_APFS_LOCKED" != false ]]; then
     printf 'recorded unlocked state disagrees with APFS state\n'
+  elif [[ "$SNAPSHOT_RECORDED_LOCKED" == false \
+      && "$SNAPSHOT_APFS_LOCKED" == false \
+      && "$SNAPSHOT_APFS_MOUNTED" == true \
+      && "$SNAPSHOT_PLAINTEXT_PRESENT" != true ]]; then
+    printf 'plaintext recovery material is missing\n'
+  elif [[ "$SNAPSHOT_RECORDED_LOCKED" == true \
+      && "$SNAPSHOT_APFS_LOCKED" == true \
+      && "$SNAPSHOT_APFS_MOUNTED" == false \
+      && "$SNAPSHOT_CIPHERTEXT_PRESENT" != true ]]; then
+    printf 'time-lock ciphertext is missing\n'
+  elif [[ "$SNAPSHOT_RECORDED_LOCKED" == true \
+      && "$SNAPSHOT_APFS_LOCKED" == true \
+      && "$SNAPSHOT_APFS_MOUNTED" == false \
+      && "$SNAPSHOT_HASH_PRESENT" != true ]]; then
+    printf 'recovery hash is missing\n'
+  elif [[ "$SNAPSHOT_RECORDED_LOCKED" == true \
+      && "$SNAPSHOT_APFS_LOCKED" == true \
+      && "$SNAPSHOT_APFS_MOUNTED" == false \
+      && "$SNAPSHOT_PLAINTEXT_PRESENT" == true ]]; then
+    printf 'plaintext recovery material is retained while recorded locked\n'
   else
     printf 'recorded and APFS state are not trustworthy\n'
   fi
@@ -2239,7 +2247,11 @@ run_hook_file() { # mode phase scope hook uuid device deadline epoch round locke
   build_hook_argv "$phase" "$scope" "$uuid" "$device" "$deadline" \
     "$deadline_epoch" "$round" "$locked"
 
-  note "running $phase $scope hook: $hook"
+  case "$mode" in
+    pre|post) note "running $phase $scope hook: $hook" ;;
+    deferred-pre|deferred-post) ;;
+    *) die "unknown hook execution mode: $mode" ;;
+  esac
   if "$hook" "${HOOK_ARGV[@]}"; then
     return 0
   else
@@ -2247,7 +2259,7 @@ run_hook_file() { # mode phase scope hook uuid device deadline epoch round locke
   fi
   printf 'vaultlock: %s %s hook failed with exit %s: %s\n' \
     "$phase" "$scope" "$status" "$hook" >&2
-  [[ "$mode" == "post" ]] && return 1
+  [[ "$mode" == *post ]] && return 1
   return "$status"
 }
 
@@ -5846,7 +5858,7 @@ execute_deferred_unlock_hooks() { # index
       || die "discovered unlock hook changed before execution"
     [[ "$current_signature" == "$hook_signature" ]] \
       || die "discovered unlock hook changed before execution"
-    if run_hook_file post "$phase" "$hook_scope" "$hook" \
+    if run_hook_file deferred-post "$phase" "$hook_scope" "$hook" \
         "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
         "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
         "$PLAN_CONTEXT_ROUND" "$locked"; then
@@ -6707,7 +6719,7 @@ execute_deferred_lock_hooks() { # index
       || die "discovered pre-lock hook changed before execution"
     [[ "$current_signature" == "$hook_signature" ]] \
       || die "discovered pre-lock hook changed before execution"
-    if run_hook_file pre "$phase" "$hook_scope" "$hook" \
+    if run_hook_file deferred-pre "$phase" "$hook_scope" "$hook" \
         "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
         "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
         "$PLAN_CONTEXT_ROUND" "$locked"; then
@@ -7095,9 +7107,81 @@ case "${1:-}" in
         RUNTIME_ASSESSMENT=inconsistent
         PLAN_TARGET_TEXT="locked at the resolved deadline"
         ;;
+      inconsistent_missing_plaintext|inconsistent_missing_ciphertext|\
+inconsistent_missing_hash|inconsistent_retained_plaintext)
+        plan_add tm_exclude_state \
+          "Persistently exclude the protected state directory from Time Machine and verify the exclusion"
+        SNAPSHOT_STATE_VALID=true
+        SNAPSHOT_APFS_VALID=true
+        SNAPSHOT_EXPECTED_UUID=UUID-123
+        SNAPSHOT_ACTUAL_UUID=UUID-123
+        SNAPSHOT_ACTUAL_MOUNT_POINT=""
+        SNAPSHOT_PLAINTEXT_PRESENT=false
+        SNAPSHOT_CIPHERTEXT_PRESENT=true
+        SNAPSHOT_HASH_PRESENT=true
+        case "$4" in
+          inconsistent_missing_plaintext)
+            SNAPSHOT_RECORDED_LOCKED=false
+            SNAPSHOT_APFS_LOCKED=false
+            SNAPSHOT_APFS_MOUNTED=true
+            SNAPSHOT_ACTUAL_MOUNT_POINT=$MOUNT_POINT
+            SNAPSHOT_PLAINTEXT_PRESENT=false
+            ;;
+          inconsistent_missing_ciphertext)
+            SNAPSHOT_RECORDED_LOCKED=true
+            SNAPSHOT_APFS_LOCKED=true
+            SNAPSHOT_APFS_MOUNTED=false
+            SNAPSHOT_CIPHERTEXT_PRESENT=false
+            ;;
+          inconsistent_missing_hash)
+            SNAPSHOT_RECORDED_LOCKED=true
+            SNAPSHOT_APFS_LOCKED=true
+            SNAPSHOT_APFS_MOUNTED=false
+            SNAPSHOT_HASH_PRESENT=false
+            ;;
+          inconsistent_retained_plaintext)
+            SNAPSHOT_RECORDED_LOCKED=true
+            SNAPSHOT_APFS_LOCKED=true
+            SNAPSHOT_APFS_MOUNTED=false
+            SNAPSHOT_PLAINTEXT_PRESENT=true
+            ;;
+        esac
+        RUNTIME_ASSESSMENT=inconsistent
+        PLAN_TARGET_TEXT="locked at the resolved deadline"
+        ;;
       *) die_usage "unknown output fixture: $4" ;;
     esac
     render_selected_plan lock
+    ;;
+  __hook_argv_builds)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __hook_argv_builds"
+    [[ $# -eq 2 ]] \
+      || die_usage "usage: vaultlock __hook_argv_builds <verbosity>"
+    OPTION_VERBOSITY=$2
+    case "$OPTION_VERBOSITY" in
+      0|1|2) ;;
+      *) die_usage "invalid test verbosity: $OPTION_VERBOSITY" ;;
+    esac
+    OPTION_COLOR=never
+    resolve_colour "$OPTION_COLOR"
+    SNAPSHOT_INIT_ABSENT=false
+    SNAPSHOT_ERROR=""
+    RUNTIME_ASSESSMENT=usable
+    PLAN_CONTEXT_UUID=UUID-123
+    PLAN_CONTEXT_DEVICE=disk9s1
+    PLAN_CONTEXT_DEADLINE=2026-09-01T02:00:00+0200
+    PLAN_CONTEXT_DEADLINE_EPOCH=1788220800
+    PLAN_CONTEXT_ROUND=31805812
+    PLAN_TARGET_TEXT="locked at the resolved deadline"
+    plan_reset
+    plan_add_hook pre-lock global "$0"
+    PLAN_TARGET_TEXT="locked at the resolved deadline"
+    HOOK_ARGV_BUILD_COUNT=0
+    VAULTLOCK_TEST_COUNT_HOOK_ARGV_BUILDS=1
+    serialize_common_plan_fields lock
+    render_selected_plan lock >/dev/null
+    printf '%s\n' "$HOOK_ARGV_BUILD_COUNT"
     ;;
   __confirm_response)
     [[ $# -eq 2 ]] \

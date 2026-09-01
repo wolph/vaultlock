@@ -1873,6 +1873,31 @@ check_count() { # description expected needle output
   check "$description" "$expected" "$actual"
 }
 
+expected_discovered_hook_argv_line() { # path phase scope deadline epoch round
+  local hook_path=$1 phase=$2 scope=$3 deadline=$4 epoch=$5 round=$6
+  local argument line
+  local -a arguments=(
+    --phase "$phase"
+    --scope "$scope"
+    --volume vault
+    --mount-point "$mount_point"
+    --volume-uuid UUID-123
+    --device disk9s1
+    --state-dir "$state_dir"
+    --state-file "$state_dir/state.json"
+    --deadline "$deadline"
+    --deadline-epoch "$epoch"
+    --round "$round"
+    --locked false
+  )
+
+  printf -v line 'Discovered hook %q' "$hook_path"
+  for argument in "${arguments[@]}"; do
+    printf -v line '%s %q' "$line" "$argument"
+  done
+  printf '%s\n' "$line"
+}
+
 record_failure() { # description
   printf 'FAIL %s\n' "$1"
   fail=1
@@ -2207,6 +2232,194 @@ reset_operation_lock_fixture() {
     "$apfs_state/release_ditto" \
     "$apfs_state"/transition_*
 }
+
+task2_unlock_passphrase='VGFzazdSZWNvdmVyeQ=='
+task2_unlock_hash=$(printf '%s' "$task2_unlock_passphrase" \
+  | /usr/bin/shasum -a 256 | /usr/bin/cut -d' ' -f1)
+task2_lock_passphrase='VGFzazhPbGRSZWNvdmVyeQ=='
+task2_lock_hash=$(printf '%s' "$task2_lock_passphrase" \
+  | /usr/bin/shasum -a 256 | /usr/bin/cut -d' ' -f1)
+
+reset_task2_deferred_fixture() {
+  reset_operation_lock_fixture
+  /bin/rm -rf -- "$state_dir/hooks/pre-unlock.d" \
+    "$state_dir/hooks/post-unlock.d" "$state_dir/hooks/pre-lock.d" \
+    "$state_dir/hooks/post-lock.d" "$mount_point/.vaultlock"
+  /bin/rm -f "$state_dir/passphrase.txt" "$state_dir/passphrase.tle" \
+    "$state_dir/passphrase.sha256" "$state_dir/passphrase-new.txt" \
+    "$state_dir"/.unlock-recovery.* "$state_dir"/.tle-unlock.* \
+    "$state_dir"/.state-unlock.* "$state_dir"/.passphrase-lock.* \
+    "$state_dir"/.tle-lock.* "$state_dir"/.hash-lock.* \
+    "$state_dir"/.state-lock.* "$state_dir"/.tle-verify.* \
+    "$state_dir"/.security-output.* \
+    "$apfs_state/keychain_marker" "$apfs_state/keychain_value" \
+    "$apfs_state/expected_unlock_passphrase" \
+    "$apfs_state/expected_lock_old_passphrase" \
+    "$apfs_state/current_apfs_passphrase" \
+    "$apfs_state/tle_plaintext" "$apfs_state/lock_new_passphrase" \
+    "$apfs_state/unlock_stdin_verified" \
+    "$apfs_state/change_passphrase_stdin_verified" \
+    "$apfs_state/unlock_leaves_unmounted" \
+    "$apfs_state/verify_post_hook_target" \
+    "$apfs_state/post_hook_saw_usable_target" \
+    "$apfs_state/lock-crypto-markers"
+  : > "$action_log"
+  : > "$mutation_log"
+  : > "$hook_log"
+  : > "$confirm_device"
+}
+
+task2_check_action_order() { # description earlier later
+  local description=$1 earlier=$2 later=$3 earlier_line later_line
+  earlier_line=$(/usr/bin/grep -Fn -- "$earlier" "$action_log" \
+    | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1 || true)
+  later_line=$(/usr/bin/grep -Fn -- "$later" "$action_log" \
+    | /usr/bin/head -n 1 | /usr/bin/cut -d: -f1 || true)
+  if [[ -n "$earlier_line" && -n "$later_line" \
+      && "$earlier_line" -lt "$later_line" ]]; then
+    printf 'ok   %s\n' "$description"
+  else
+    record_failure "$description: [$earlier] must precede [$later]"
+  fi
+}
+
+test_task2_deferred_unlock_presentation() {
+  local verbosity status output path expected quoted
+  local directory first second
+  local -a options
+
+  for verbosity in default verbose audit; do
+    reset_task2_deferred_fixture
+    write_json_state true 2000-01-01T00:00:00+0000 1 1 UUID-123
+    write_apfs_state true false UUID-123 disk9s1
+    printf 'fixture ciphertext\n' > "$state_dir/passphrase.tle"
+    printf '%s\n' "$task2_unlock_hash" > "$state_dir/passphrase.sha256"
+    printf '%s' "$task2_unlock_passphrase" > "$apfs_state/tle_plaintext"
+    printf '%s' "$task2_unlock_passphrase" \
+      > "$apfs_state/expected_unlock_passphrase"
+    : > "$apfs_state/unlock_leaves_unmounted"
+    directory=$mount_point/.vaultlock/hooks/post-unlock.d
+    first=$directory/20-deferred\ unlock\ first
+    second=$directory/30-deferred-unlock-second
+    /bin/mkdir -p "$directory"
+    for path in "$first" "$second"; do
+      /bin/cp "$TEST_SELF" "$path"
+      /bin/chmod +x "$path"
+    done
+    case "$verbosity" in
+      default) options=(--color=auto) ;;
+      verbose) options=(-v) ;;
+      audit) options=(-vv) ;;
+    esac
+    if output=$(run_vaultlock unlock "${options[@]}" 2>&1); then
+      status=0
+    else
+      status=$?
+    fi
+    check "$verbosity deferred unlock exits successfully" 0 "$status"
+    for path in "$first" "$second"; do
+      if [[ "$verbosity" == audit ]]; then
+        expected=$(expected_discovered_hook_argv_line "$path" \
+          post-unlock vault 2000-01-01T00:00:00+0000 1 1)
+      else
+        printf -v quoted '%q' "$path"
+        expected="Discovered hook: post-unlock [vault] $quoted"
+      fi
+      check_line "$verbosity deferred unlock presents $(basename "$path")" \
+        "$expected" "$output"
+      check_count "$verbosity deferred unlock avoids duplicate hook note" \
+        0 "running post-unlock vault hook: $path" "$output"
+    done
+    if [[ "$verbosity" == audit ]]; then
+      check_contains "audit deferred unlock includes exact argv" \
+        "$(printf '%q' "$first") --phase post-unlock --scope vault" "$output"
+    else
+      check_not_contains "$verbosity deferred unlock hides argv" \
+        '--phase' "$output"
+    fi
+    task2_check_action_order \
+      "$verbosity deferred unlock preserves execution order" \
+      '20-deferred\ unlock\ first --phase post-unlock' \
+      '30-deferred-unlock-second --phase post-unlock'
+  done
+}
+
+test_task2_deferred_lock_presentation() {
+  local verbosity status output path expected quoted
+  local directory first second deadline epoch round
+  local -a options
+
+  for verbosity in default verbose audit; do
+    reset_task2_deferred_fixture
+    write_json_state false null null null UUID-123
+    write_apfs_state true false UUID-123 disk9s1
+    printf '%s' "$task2_lock_passphrase" > "$state_dir/passphrase.txt"
+    printf '%s\n' "$task2_lock_hash" > "$state_dir/passphrase.sha256"
+    printf '%s' "$task2_lock_passphrase" \
+      > "$apfs_state/expected_lock_old_passphrase"
+    printf '%s' "$task2_lock_passphrase" \
+      > "$apfs_state/current_apfs_passphrase"
+    printf '%s' "$task2_lock_passphrase" > "$apfs_state/keychain_value"
+    : > "$apfs_state/keychain_marker"
+    directory=$mount_point/.vaultlock/hooks/pre-lock.d
+    first=$directory/10-deferred\ lock\ first
+    second=$directory/20-deferred-lock-second
+    /bin/mkdir -p "$directory"
+    for path in "$first" "$second"; do
+      /bin/cp "$TEST_SELF" "$path"
+      /bin/chmod +x "$path"
+    done
+    case "$verbosity" in
+      default) options=(--color=auto) ;;
+      verbose) options=(-v) ;;
+      audit) options=(-vv) ;;
+    esac
+    if output=$(run_vaultlock lock "${options[@]}" --yes \
+        '2099-01-02 03:04' 2>&1); then
+      status=0
+    else
+      status=$?
+    fi
+    check "$verbosity deferred lock exits successfully" 0 "$status"
+    deadline=$(jq -r .deadline "$state_dir/state.json")
+    epoch=$(jq -r .deadline_epoch "$state_dir/state.json")
+    round=$(jq -r .round "$state_dir/state.json")
+    for path in "$first" "$second"; do
+      if [[ "$verbosity" == audit ]]; then
+        expected=$(expected_discovered_hook_argv_line "$path" pre-lock vault \
+          "$deadline" "$epoch" "$round")
+      else
+        printf -v quoted '%q' "$path"
+        expected="Discovered hook: pre-lock [vault] $quoted"
+      fi
+      check_line "$verbosity deferred lock presents $(basename "$path")" \
+        "$expected" "$output"
+      check_count "$verbosity deferred lock avoids duplicate hook note" \
+        0 "running pre-lock vault hook: $path" "$output"
+    done
+    if [[ "$verbosity" == audit ]]; then
+      check_contains "audit deferred lock includes exact argv" \
+        "$(printf '%q' "$first") --phase pre-lock --scope vault" "$output"
+    else
+      check_not_contains "$verbosity deferred lock hides argv" \
+        '--phase' "$output"
+    fi
+    task2_check_action_order \
+      "$verbosity deferred lock preserves execution order" \
+      '10-deferred\ lock\ first --phase pre-lock' \
+      '20-deferred-lock-second --phase pre-lock'
+  done
+}
+
+run_task2_deferred_presentation_tests() {
+  test_task2_deferred_unlock_presentation
+  test_task2_deferred_lock_presentation
+}
+
+if [[ "${VAULTLOCK_TEST_TASK2_DEFERRED_ONLY:-0}" == 1 ]]; then
+  run_task2_deferred_presentation_tests
+  exit "$fail"
+fi
 
 write_recovery_state() { # plaintext ciphertext hash
   local plaintext=$1 ciphertext=$2 hash=$3
@@ -7711,6 +7924,16 @@ check_action_order "lock repair mounts before Time Machine preflight" \
   'diskutil mount disk9s1' 'tmutil addexclusion'
 check_action_order "lock repair preflight precedes passphrase rotation" \
   'tmutil addexclusion' 'diskutil apfs changePassphrase'
+
+if task2_deferred_output=$(VAULTLOCK_TEST_TASK2_DEFERRED_ONLY=1 \
+    /bin/bash "$TEST_SELF" "$VL" 2>&1); then
+  printf '%s\n' "$task2_deferred_output"
+else
+  task2_deferred_status=$?
+  printf '%s\n' "$task2_deferred_output"
+  record_failure \
+    "Task 2 deferred presentation child exited $task2_deferred_status"
+fi
 
 for deferred_lock_hook_shape in symlink hardlink foreign-owner; do
   reset_lock_fixture

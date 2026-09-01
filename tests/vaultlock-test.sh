@@ -366,6 +366,55 @@ check_contains "inconsistent summary reports causal error" \
   "State: inconsistent: recorded locked state disagrees with APFS state" \
   "$inconsistent_summary"
 
+missing_plaintext_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never inconsistent_missing_plaintext)
+check_contains "inconsistent unlocked summary names missing plaintext" \
+  "State: inconsistent: plaintext recovery material is missing" \
+  "$missing_plaintext_summary"
+
+missing_ciphertext_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never inconsistent_missing_ciphertext)
+check_contains "inconsistent locked summary names missing ciphertext" \
+  "State: inconsistent: time-lock ciphertext is missing" \
+  "$missing_ciphertext_summary"
+
+missing_hash_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never inconsistent_missing_hash)
+check_contains "inconsistent locked summary names missing hash" \
+  "State: inconsistent: recovery hash is missing" \
+  "$missing_hash_summary"
+
+retained_plaintext_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never inconsistent_retained_plaintext)
+check_contains "inconsistent locked summary names retained plaintext" \
+  "State: inconsistent: plaintext recovery material is retained while recorded locked" \
+  "$retained_plaintext_summary"
+
+coloured_inconsistency=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 always inconsistent_missing_plaintext)
+check_contains "inconsistent summary colours only state label red" \
+  "${esc}[31mState:${esc}[0m inconsistent: plaintext recovery material is missing" \
+  "$coloured_inconsistency"
+check_not_contains "inconsistent summary keeps causal value plain" \
+  "${esc}[31minconsistent" "$coloured_inconsistency"
+
+for hook_argv_verbosity in 0 1 2; do
+  if hook_argv_builds=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+      "$VL" __hook_argv_builds "$hook_argv_verbosity" 2>&1); then
+    if [[ "$hook_argv_verbosity" == 2 ]]; then
+      expected_hook_argv_builds=1
+    else
+      expected_hook_argv_builds=0
+    fi
+    check "verbosity $hook_argv_verbosity builds hook argv only for audit rendering" \
+      "$expected_hook_argv_builds" "$hook_argv_builds"
+  else
+    printf 'FAIL verbosity %s hook argv build probe: got [%s]\n' \
+      "$hook_argv_verbosity" "$hook_argv_builds"
+    fail=1
+  fi
+done
+
 disabled_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never disabled)
 check_contains "disabled summary names disabled hooks" \
