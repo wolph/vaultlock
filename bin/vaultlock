@@ -7212,7 +7212,11 @@ run_planned_command() { # command
     *) die "no planned command runner for: $command" ;;
   esac
   prevalidate_progress_plan "$command"
-  run_named_transition progress_plan_before_validation "$state_file"
+  if [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == 1 \
+      && -n "${VAULTLOCK_TEST_APFS_STATE:-}" \
+      && -f "$VAULTLOCK_TEST_APFS_STATE/transition_progress_plan_before_validation" ]]; then
+    run_named_transition progress_plan_before_validation "$state_file"
+  fi
   freeze_planned_command_snapshot "$command"
   render_selected_plan "$command"
   if [[ "$OPTION_DRY_RUN" == "true" ]]; then

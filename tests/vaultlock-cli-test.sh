@@ -2573,6 +2573,9 @@ test_task3_lock_progress() {
     'Would: Lock and verify the APFS volume'
   check_count "late data snapshot cleanup does not repeat dry-run group" 1 \
     'Would: Prepare Time Machine exclusions and snapshots' "$output"
+  check_not_contains "ordinary lock dry-run runs no validation transition" \
+    'transition-fixture progress_plan_before_validation' "$action_log"
+  check_empty "ordinary lock dry-run runs no hook" "$hook_log"
 
   task3_prepare_lock_fixture
   output=$(run_vaultlock lock -vv --dry-run --no-hooks \
@@ -2647,6 +2650,9 @@ test_task3_unlock_progress() {
     'Would: Verify the mounted vault identity' \
     'Would: Restore verified recovery material' \
     'Would: Verify the usable unlocked target'
+  check_not_contains "ordinary unlock dry-run runs no validation transition" \
+    'transition-fixture progress_plan_before_validation' "$action_log"
+  check_empty "ordinary unlock dry-run runs no hook" "$hook_log"
 
   task3_prepare_unlock_fixture
   if output=$(run_vaultlock unlock -v --no-hooks 2>&1); then
