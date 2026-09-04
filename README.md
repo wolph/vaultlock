@@ -9,6 +9,8 @@ restrict is the person who can switch them off, which is fine for a nudge and
 useless for a commitment. Vaultlock removes the option instead of asking you
 not to take it.
 
+![Four panel comic. Panel one, 8:00 AM: a person works at a laptop while a games console sits on a shelf under a sign reading TIME LOCK, active until 6:00 PM. Panel two: they grin and spin the dial of a bank vault holding the console, its display reading LOCKOUT, 10 hours. Panel three, 1:00 PM: they are on their knees clawing at the sealed vault door, which reports 5 hours remaining. Panel four, 6:00 PM: the vault swings open, the console tumbles into their arms, and the laptop behind them shows a finished task.](https://raw.githubusercontent.com/wolph/vaultlock/master/assets/vaultlock-comic.jpg)
+
 ## Why a time lock
 
 I wrote this because I get distracted easily. When I need to work I lock my
