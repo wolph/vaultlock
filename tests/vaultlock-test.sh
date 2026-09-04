@@ -181,6 +181,11 @@ check "duration 20h" "$(( now + 20 * 3600 ))" "$(deadline "$now" 20h)"
 check "duration 1d4h" "$(( now + 28 * 3600 ))" "$(deadline "$now" 1d4h)"
 check "duration 1h30m" "$(( now + 90 * 60 ))" "$(deadline "$now" 1h30m)"
 check "duration 90m" "$(( now + 90 * 60 ))" "$(deadline "$now" 90m)"
+check "duration 10s" "$(( now + 10 ))" "$(deadline "$now" 10s)"
+check "duration 90s" "$(( now + 90 ))" "$(deadline "$now" 90s)"
+check "duration 1m30s" "$(( now + 90 ))" "$(deadline "$now" 1m30s)"
+check "duration 1d4h30m10s" "$(( now + 28 * 3600 + 30 * 60 + 10 ))" \
+  "$(deadline "$now" 1d4h30m10s)"
 now=$(epoch '2026-03-28 12:00:00')
 check "duration day is 86400 seconds across DST" "$(( now + 86400 ))" "$(deadline "$now" 1d)"
 
@@ -221,6 +226,10 @@ reject_deadline "reject clock hour" "$now" 24:00
 reject_deadline "reject clock minute" "$now" 1:60
 reject_deadline "reject zero duration" "$now" 0h
 reject_deadline "reject zero mixed duration" "$now" 0d0h0m
+reject_deadline "reject zero second duration" "$now" 0s
+reject_deadline "reject zero mixed second duration" "$now" 0d0h0m0s
+reject_deadline "reject reordered second duration" "$now" 10s1m
+reject_deadline "reject repeated second unit" "$now" 1s2s
 reject_deadline "reject negative duration" "$now" -1h
 reject_deadline "reject decimal duration" "$now" 1.5h
 reject_deadline "reject reordered duration" "$now" 4h1d

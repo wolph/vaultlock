@@ -7,8 +7,8 @@
 - Repository workflow with `make test`, `make check`, and guarded `make install`.
 - Dry-run plans for init, adopt, lock, and unlock.
 - Confirmation for init, adopt, and lock, with `--yes` for non-interactive use.
-- Elapsed durations such as `1d4h` and `20h`, plus calendar clock offsets such
-  as `2:00 +2d`.
+- Elapsed durations such as `1d4h`, `20h`, and `90s`, plus calendar clock
+  offsets such as `2:00 +2d`.
 - Global and vault-local lifecycle hooks with a stable 24-word named argv
   contract and `--no-hooks` bypass.
 - Status output that separates recorded JSON state from actual APFS state.

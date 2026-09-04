@@ -585,14 +585,15 @@ epoch_is_supported() {
 }
 
 resolve_duration() {
-  local expression=$1 now=$2 day_part hour_part minute_part
-  local duration_re='^([0-9]+d)?([0-9]+h)?([0-9]+m)?$'
-  local -i days=0 hours=0 minutes=0 total target
+  local expression=$1 now=$2 day_part hour_part minute_part second_part
+  local duration_re='^([0-9]+d)?([0-9]+h)?([0-9]+m)?([0-9]+s)?$'
+  local -i days=0 hours=0 minutes=0 seconds=0 total target
 
   [[ -n "$expression" && "$expression" =~ $duration_re ]] || return 1
   day_part=${BASH_REMATCH[1]%d}
   hour_part=${BASH_REMATCH[2]%h}
   minute_part=${BASH_REMATCH[3]%m}
+  second_part=${BASH_REMATCH[4]%s}
 
   if [[ -n "$day_part" ]]; then
     safe_component "$day_part" || return 1
@@ -606,8 +607,12 @@ resolve_duration() {
     safe_component "$minute_part" || return 1
     minutes=$((10#$minute_part))
   fi
+  if [[ -n "$second_part" ]]; then
+    safe_component "$second_part" || return 1
+    seconds=$((10#$second_part))
+  fi
 
-  total=$(( days * 86400 + hours * 3600 + minutes * 60 ))
+  total=$(( days * 86400 + hours * 3600 + minutes * 60 + seconds ))
   (( total > 0 )) || return 1
   target=$(( now + total ))
   (( target > now )) || return 1
@@ -7264,7 +7269,6 @@ run_planned_command() { # command
       ;;
     unlock)
       print_result_line result "unlocked and mounted at $MOUNT_POINT"
-      note "next: cd ~/your-project && ./run.sh"
       ;;
     lock)
       print_result_line result \
@@ -7346,7 +7350,7 @@ colour options for all commands:
 deadline forms:
   "YYYY-MM-DD HH:MM"         absolute local date and time
   H:MM                       next occurrence of a local clock time
-  NdNhNm                     elapsed duration, for example 1d4h or 20h
+  NdNhNmNs                   elapsed duration, for example 1d4h, 20h, or 90s
   H:MM +Nd                   local clock time N calendar days from today
 
 hook directories:

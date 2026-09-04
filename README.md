@@ -212,7 +212,7 @@ minute. A duration resolves to a future instant by adding elapsed seconds.
 |---|---|---|
 | `YYYY-MM-DD HH:MM` | Exact future local date and time | `2026-09-02 14:30` |
 | `H:MM` or `HH:MM` | First future occurrence of that local clock time | `1:00` |
-| `[Nd][Nh][Nm]` | Positive elapsed duration in day, hour, minute order | `1d4h`, `20h` |
+| `[Nd][Nh][Nm][Ns]` | Positive elapsed duration in day, hour, minute, second order | `1d4h`, `20h`, `90s` |
 | `H:MM +Nd` | That local clock time a positive N calendar days from today | `2:00 +2d` |
 
 An elapsed `d` is 86,400 seconds, so a duration need not land on a local minute.
@@ -221,6 +221,13 @@ daylight-saving gap by moving to its next valid occurrence. It can select the
 second repeated occurrence during a fall-back transition. Absolute and `+Nd`
 forms reject nonexistent local minutes and choose the first repeated
 occurrence.
+
+A duration in seconds makes short lock and unlock cycles practical to test.
+Very short deadlines race the lock itself, because the lock rotates recovery
+material and installs the ciphertext before it verifies that the drand round
+has not yet published. When that round arrives first, the lock refuses with
+`ciphertext decrypts right now (past round?), NOT locking` and leaves the vault
+unlocked.
 
 For a two-day calendar offset, these are equivalent:
 
