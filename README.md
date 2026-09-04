@@ -1,21 +1,81 @@
 # Vaultlock
 
+Vaultlock seals a folder on your Mac until a date you choose. Until that date
+arrives it does not open. Not for you, not for root, not for a machine with its
+clock wound forward.
+
+Screen-time limits and website blockers share one weakness. The person they
+restrict is the person who can switch them off, which is fine for a nudge and
+useless for a commitment. Vaultlock removes the option instead of asking you
+not to take it.
+
+## Why a time lock
+
+I wrote this because I get distracted easily. When I need to work I lock my
+games away, and the entire point is that I cannot unlock them at hour two when
+the work turns boring.
+
+The enforcement is not a preference you can revisit. Locking rotates the APFS
+passphrase, destroys the plaintext copy and the Keychain entry, and leaves the
+new passphrase only as a ciphertext encrypted against a future round of the
+drand randomness beacon. The signature for that round does not exist yet. Nobody
+can publish it ahead of schedule, so nobody can decrypt the passphrase ahead of
+schedule, and your local clock has no vote.
+
+Three limits worth knowing before you trust it with something you care about:
+
+- Unlocking fetches the beacon over the network. An offline laptop stays locked.
+- A lock that completed is a lock that is sealed. A lock that failed partway can
+  retain staged recovery material, which Vaultlock reports rather than quietly
+  deleting. See [Failure and recovery boundaries](#failure-and-recovery-boundaries).
+- Backups sit outside the lock. A Time Machine copy taken before you locked
+  still holds the data.
+
+## Use cases
+
+### Seal a distraction until the work is done
+
+`adopt` moves a directory onto the vault and leaves a symlink in its place, so
+paths that pointed at it keep working while the vault is mounted. Move the games
+across once, then lock until the morning two weeks out:
+
+```console
+vaultlock adopt ~/Games
+vaultlock lock --dry-run "9:00 +14d"
+vaultlock lock "9:00 +14d"
+```
+
+The dry run earns its line. It resolves the deadline to an exact local timestamp
+and prints the drand round it would encrypt against, while changing nothing, so
+you learn what `9:00 +14d` actually means before it is true for a fortnight.
+After the real lock, `~/Games` is a dangling symlink and the bytes behind it need
+a passphrase that no longer exists in plaintext anywhere.
+
+### Put a waiting period in front of an irreversible act
+
+Some decisions only look good for one afternoon. Sealing the credentials makes
+the impulse outlive a delay before it can act:
+
+```console
+vaultlock adopt ~/keys/trading
+vaultlock lock 72h
+```
+
+For three days those keys stop being a question of willpower, because they are
+not reachable. `vaultlock status` reports the deadline, the remaining time, and
+the target and current drand rounds, and that report is the only answer
+available until the round lands.
+
+Choose the number while the impulse is absent. `20h` is a deadline you will
+still be living with at hour 19.
+
+## How it works
+
 Vaultlock time-locks an encrypted APFS volume against a future drand round.
 At lock time it rotates the APFS passphrase, encrypts the new passphrase with
 `tle`, verifies the recovery artifacts, removes plaintext recovery material,
 and locks the volume. At unlock time it recovers the passphrase after the
 deadline and converges the volume to a mounted, usable state.
-
-The defaults are:
-
-- State directory: `~/.vaultlock`
-- Volume name: `vault`
-- APFS container: `disk3`
-- Mount point: `/Volumes/vault`
-- Keychain service: `vaultlock-vault`
-
-Review those defaults in `bin/vaultlock` before `init`. Creating or adopting a
-vault changes storage state. Start with `--dry-run`.
 
 ## Requirements
 
@@ -74,6 +134,19 @@ The installer revalidates each source, destination, and staged link immediately
 before its rename. It cannot make the final pathname check and rename atomic
 against a hostile process already running as the same macOS user. Such a
 process can swap a pathname in that interval.
+
+The defaults are:
+
+- State directory: `~/.vaultlock`
+- Volume name: `vault`
+- APFS container: `disk3`
+- Mount point: `/Volumes/vault`
+- Keychain service: `vaultlock-vault`
+
+Each one reads an environment override, for example `VAULTLOCK_CONTAINER`.
+Review them in `bin/vaultlock` before `init`, because `disk3` is a default and
+not a guess about your machine. Creating or adopting a vault changes storage
+state. Start with `--dry-run`.
 
 ## Commands
 
@@ -500,4 +573,4 @@ confirmation, failed preflight, repair failure, hook failure, incomplete
 convergence, or a retained operation lock returns nonzero. Errors identify the
 failed operation and unmet postcondition without printing recovery material.
 
-This repository does not infer a remote or software license.
+Vaultlock is released under the BSD 3-Clause license. See [LICENSE](LICENSE).
