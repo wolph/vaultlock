@@ -168,7 +168,12 @@ check "round genesis+3"     2 "$("$VL" __round 1692803370)"
 check "round genesis+4"     3 "$("$VL" __round 1692803371)"
 
 exp=$(epoch '2026-08-26 03:00:00')
-check "parse deadline" "$exp" "$("$VL" __parse '2026-08-26 03:00')"
+check "parse deadline" "$exp" \
+  "$(TZ=Europe/Amsterdam "$VL" __parse '2026-08-26 03:00')"
+check "parse deadline in UTC" 1787713200 \
+  "$(TZ=UTC0 "$VL" __parse '2026-08-26 03:00')"
+check "parse deadline in New York" 1787727600 \
+  "$(TZ=America/New_York "$VL" __parse '2026-08-26 03:00')"
 
 if "$VL" __parse 'not-a-date' >/dev/null 2>&1; then
   printf 'FAIL parse rejects garbage\n'; fail=1
