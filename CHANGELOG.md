@@ -12,12 +12,14 @@
 - Global and vault-local lifecycle hooks with a stable 24-word named argv
   contract and `--no-hooks` bypass.
 - Status output that separates recorded JSON state from actual APFS state.
+- Compact status with `-v` and `-vv` options for technical observations.
+- Absolute local deadlines with remaining days, hours, minutes, or seconds.
 
 ### Changed
 
-- Made lifecycle output concise by default, added grouped `-v` progress and
-  complete `-vv` audit plans, kept hook paths visible, and added automatic
-  terminal colour with explicit overrides.
+- Added bold headings, aligned fields, and coloured status words throughout
+  the CLI. Short progress groups now appear by default, with detailed `-v`
+  descriptions and complete `-vv` audit plans. Hook paths remain visible.
 - Migrated the standalone command and helper suite into a complete local Git
   project.
 - Lock and unlock now converge repairable observations to verified target

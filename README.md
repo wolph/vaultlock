@@ -64,9 +64,9 @@ vaultlock lock 72h
 ```
 
 For three days those keys stop being a question of willpower, because they are
-not reachable. `vaultlock status` reports the deadline, the remaining time, and
-the target and current drand rounds, and that report is the only answer
-available until the round lands.
+not reachable. `vaultlock status` reports the deadline and remaining time.
+Add `-v` for the target and current drand rounds. The vault stays locked until
+the target round lands.
 
 Choose the number while the impulse is absent. `20h` is a deadline you will
 still be living with at hour 19.
@@ -196,7 +196,7 @@ vaultlock init [-v | -vv] [--color=auto|always|never] [--dry-run] [--yes]
 vaultlock adopt [-v | -vv] [--color=auto|always|never] [--dry-run] [--yes] <directory>
 vaultlock lock [-v | -vv] [--color=auto|always|never] [--dry-run] [--yes] [--no-hooks] <deadline>
 vaultlock unlock [-v | -vv] [--color=auto|always|never] [--dry-run] [--no-hooks]
-vaultlock status [--color=auto|always|never]
+vaultlock status [-v | -vv] [--color=auto|always|never]
 ```
 
 Options must appear immediately after the subcommand and before the first
@@ -205,18 +205,17 @@ both quoted and unquoted `2:00 +2d` forms work.
 
 | Option | `init` | `adopt` | `lock` | `unlock` | `status` | Effect |
 |---|---:|---:|---:|---:|---:|---|
-| `-v`, `--verbose` | yes | yes | yes | yes | no | Add grouped progress |
-| `-vv`, `--very-verbose` | yes | yes | yes | yes | no | Add grouped progress and the complete numbered plan |
+| `-v`, `--verbose` | yes | yes | yes | yes | yes | Add technical details and detailed progress descriptions |
+| `-vv`, `--very-verbose` | yes | yes | yes | yes | yes | Also show the complete numbered lifecycle plan and hook argv |
 | `--color=auto|always|never` | yes | yes | yes | yes | yes | Select terminal colour handling |
 | `--dry-run` | yes | yes | yes | yes | no | Inspect the planned outcome without making changes |
 | `--yes` | yes | yes | yes | no | no | Bypass confirmation only |
 | `--no-hooks` | no | no | yes | yes | no | Disable all lifecycle hooks |
 
 Repeated verbosity options select the highest requested level regardless of
-order. Repeated colour options use the last value. `status` accepts colour
-selection, but rejects `-v`, `-vv`, and their long forms because it has no
-operation plan or progress stream. The colour value must use the inline form,
-such as `--color=never`.
+order. Repeated colour options use the last value. `status -v` and `status -vv`
+show the same technical observations, because status has no operation plan.
+The colour value must use the inline form, such as `--color=never`.
 
 Unknown options, options after an operand, missing required operands, and extra
 fixed-arity operands are usage errors. `lock` instead joins every remaining
@@ -228,55 +227,41 @@ nothing.
 
 | Mode | Output |
 | --- | --- |
-| default | Current state, target, request details, hooks, confirmation, warnings, and result |
-| `-v`, `--verbose` | Default output plus grouped execution progress, or `Would:` groups in a dry-run |
-| `-vv`, `--very-verbose` | Verbose output plus the complete numbered operation plan and exact planned hook argv |
+| default | Compact state, deadline and remaining time, relevant target details, hooks, short progress, warnings and result |
+| `-v`, `--verbose` | Technical observations and detailed progress descriptions |
+| `-vv`, `--very-verbose` | Verbose output plus the complete numbered lifecycle plan and exact planned hook argv |
 
-Default lifecycle output is concise. It identifies the command, current state,
-target, resolved request details, known hook scripts, deferred hook
-directories, confirmation when required, warnings, and the final result. It
-does not print an `Actions:` section or hook argv. A dry-run lock can resemble:
+Default lifecycle output identifies the command, current state, intended
+result, deadline, hooks and progress. Confirmation appears when required.
+Warnings and repair advice remain visible at every verbosity level.
 
-```text
-Lock vault
-  State: unlocked and mounted at /Volumes/vault
-  Target: locked at the resolved deadline
-  Requested deadline: 2026-09-02T02:00:00+0200
-  Resolved drand round: target 31805812
-
-Hooks:
-  pre-lock [global] /Users/example/Vault\ Hooks/pre-lock.sh
-
-Result: no changes made
-```
+Deadlines pair an absolute local timestamp, including seconds and the UTC
+offset, with the remaining time. Durations use days, hours and minutes, omitting
+zero units. Below one minute they use seconds. At or after the deadline the
+suffix reads `deadline passed`. Unlocking still needs the published drand round
+and an internet connection.
 
 Hook paths and deferred directories use shell-safe quoting. `after mount`
 marks a vault-local directory whose entries cannot be inspected until the
 expected volume is mounted and its identity is verified. A hook found then is
-also reported by phase, scope, and path. A summary containing both forms can
-include:
+also reported by phase, scope, and path.
 
-```text
-Hooks:
-  pre-lock [global] /Users/example/Vault\ Hooks/pre-lock.sh
-  pre-lock [vault, after mount] /Volumes/vault/.vaultlock/hooks/pre-lock.d
-```
-
-`Hooks: disabled` records `--no-hooks`. `Hooks: none` records that no known or
+The Hooks field records `disabled` for `--no-hooks` and `none` when no known or
 deferred hooks apply. Exact hook argv appears only in very verbose output.
 
-Verbose mode prints each meaningful progress group once across the command.
-Execution uses `->` prefixes. Dry-run uses `Would:` prefixes and never claims
-that an operation ran. Hook runs remain individual progress entries rather
-than being combined into one group.
+Every mode prints each meaningful progress group once across the command.
+Default mode uses short descriptions and verbose mode gives more detail.
+Execution uses `->` prefixes when a group starts. Dry-run uses `Would:` prefixes.
+Hook runs remain individual progress entries.
 
 Colour mode defaults to `--color=auto`. Automatic mode decides separately for
 stdout and stderr. A stream receives colour only when it is a TTY, `TERM` is
 not `dumb`, and `NO_COLOR` is unset or empty. `--color=always` and
-`--color=never` explicitly override terminal and environment detection. Colour
-styles labels and prefixes only. Paths, UUIDs, devices, deadlines, rounds,
-operation descriptions, and hook argv remain plain, so colour never carries
-meaning by itself.
+`--color=never` explicitly override terminal and environment detection.
+Headings are bold and labels dim. Status words use cyan for `LOCKED`, green for
+`UNLOCKED`, yellow for `REPAIRABLE` and red for `INCONSISTENT`. Warnings are yellow
+and errors red. Paths, UUIDs, devices, deadlines, rounds, operation descriptions
+and hook argv remain plain. The same words remain readable without colour.
 
 ## Deadlines
 
@@ -319,8 +304,8 @@ round. It does not extend the lock with the newly supplied expression.
 Every lifecycle command builds a complete typed plan from the recorded and
 actual APFS observations, requested target, resolved deadline, hooks, and
 ordered mutations. Default output renders the concise state, target, request,
-and hook summary. Very verbose output renders the complete numbered `Actions:`
-list and exact planned hook argv.
+and hook summary, followed by short progress groups. Very verbose output
+renders the complete numbered `Actions:` list and exact planned hook argv.
 
 `init`, `adopt`, and `lock` prompt on the controlling terminal with
 `Confirmation required. Continue? [y/N] `. Only `y` or `yes`, ignoring case,
@@ -383,11 +368,15 @@ discovery report exact argv at `-vv` when they run.
 
 ## Status and convergence
 
-`status` reports recorded JSON state and actual APFS state separately. It also
-shows the expected and actual mount point, recovery-file presence, an
-assessment, and the remaining time and drand round for recorded-locked state.
+`status` shows `LOCKED`, `UNLOCKED`, `REPAIRABLE` or `INCONSISTENT`, with the
+relevant deadline, mount observation and next action. Problems and repair
+advice appear even without `-v`.
 
-The assessment is one of:
+`status -v` also reports recorded JSON state and actual APFS state separately,
+the expected and actual mount point, recovery-file presence, and the target
+and current drand rounds for recorded-locked state.
+
+The verbose assessment is one of:
 
 - `usable`: recorded unlocked, APFS unlocked and mounted as expected, with
   plaintext recovery material present
@@ -456,9 +445,9 @@ directories and non-executable entries are ignored. A hook's path, type,
 identity, and executable state are rechecked before execution.
 
 Default output lists every known hook by phase, scope, and safely quoted path.
-It lists an unavailable vault-local hook directory with `after mount`. `-v`
-keeps those summaries and reports each hook run as an individual progress
-entry. It does not print argv. `-vv` adds exact argv for hooks known while
+It lists an unavailable vault-local hook directory with `after mount`. Every
+mode reports each hook run as an individual progress entry. `-vv` adds exact
+argv for hooks known while
 planning and for hooks found through deferred discovery during execution.
 
 Each hook receives exactly these 24 argv words, in this order:

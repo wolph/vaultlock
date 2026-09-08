@@ -19,12 +19,13 @@ unexport BIN_DIR
 
 test:
 	tests/vaultlock-test.sh bin/vaultlock
+	tests/vaultlock-time-test.sh bin/vaultlock
 	tests/vaultlock-cli-test.sh bin/vaultlock
 	tests/install-test.sh
 
 check: test
-	/bin/bash -n bin/vaultlock scripts/install.sh tests/vaultlock-test.sh tests/vaultlock-cli-test.sh tests/install-test.sh
-	shellcheck bin/vaultlock scripts/install.sh tests/vaultlock-test.sh tests/vaultlock-cli-test.sh tests/install-test.sh
+	/bin/bash -n bin/vaultlock scripts/install.sh tests/vaultlock-test.sh tests/vaultlock-time-test.sh tests/vaultlock-cli-test.sh tests/install-test.sh
+	shellcheck bin/vaultlock scripts/install.sh tests/vaultlock-test.sh tests/vaultlock-time-test.sh tests/vaultlock-cli-test.sh tests/install-test.sh
 
 install: check
 	@scripts/install.sh
