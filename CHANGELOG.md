@@ -6,6 +6,8 @@
 
 - Repository workflow with `make test`, `make check`, and guarded `make install`.
 - GitHub Actions checks on macOS 15 and 26 for Intel and Apple Silicon.
+- A bounded `make check-ci` gate with CLI smoke coverage. The complete
+  regressions remain available through `make check` and required by installation.
 - Dry-run plans for init, adopt, lock, and unlock.
 - Confirmation for init, adopt, and lock, with `--yes` for non-interactive use.
 - Elapsed durations such as `1d4h`, `20h`, and `90s`, plus calendar clock

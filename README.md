@@ -94,22 +94,35 @@ system Bash 3.2. Normal use requires:
 
 Development checks also require Git, GNU Make, and ShellCheck. Use a clone
 with full Git history so the crypto tests can read the original baseline.
-Run the complete gate before installation:
+Run the CI checks locally:
+
+```console
+make check-ci
+```
+
+This runs the complete helper, deadline, and guarded-install suites, plus
+CLI smoke tests for status, options, colour, help, lock, unlock, init, adopt
+dry-runs, and a broken output pipe during locking. It also checks Bash syntax
+and runs ShellCheck on every shell source. All lifecycle tests use temporary
+fixtures and do not perform a real APFS operation.
+
+Run the complete regressions before installation:
 
 ```console
 make check
 ```
 
-The gate runs the helper, deadline, isolated CLI, and guarded-install suites.
-It also runs Bash syntax checks and ShellCheck. The suites use temporary
-fixtures and do not perform a real APFS lifecycle operation.
+The complete gate also covers the slower filesystem, recovery, hook, and
+fault-injection scenarios, including adopt operations on fixtures.
+`make install` requires this complete gate.
 
 [GitHub Actions](https://github.com/wolph/vaultlock/actions/workflows/ci.yml)
-runs the same gate on macOS 15 and 26, using both Intel and Apple Silicon
-runners with the system Bash 3.2. Pushes and pull requests trigger all four
-jobs, each limited to five minutes. A new run cancels an older run for the
-same branch or pull request. You can also start the workflow manually from
-the Actions tab.
+runs the CI tests and syntax checks on macOS 15 and 26, using both Intel and
+Apple Silicon runners with the system Bash 3.2. ShellCheck runs once on the
+macOS 15 Apple Silicon runner. Pushes to `master` and pull requests trigger
+all four jobs, each limited to five minutes. A failed job cancels the remaining jobs.
+A new run cancels an older run for the same branch or pull request. You can
+also start the workflow manually from the Actions tab.
 
 ## Installation
 

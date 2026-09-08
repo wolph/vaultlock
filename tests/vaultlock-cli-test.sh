@@ -3207,11 +3207,15 @@ check_task4_locked_convergence() { # description
       && printf true || printf false)"
 }
 
+expected_lock_crypto_markers() {
+  printf '%s\n' $'generate-new-plaintext\nwrite-staged-plaintext\nchange-apfs-passphrase\ninstall-rotated-plaintext\nupdate-keychain\ncreate-tle-ciphertext\nverify-ciphertext-nonempty\nverify-ciphertext-not-early\nverify-expected-early-error\nwrite-plaintext-hash\nwrite-locked-json\ninstall-locked-json\nremove-plaintext\nremove-keychain-plaintext\nlock-apfs\nverify-filevault\nverify-mount-resistance'
+}
+
 test_task4_epipe_presentation() {
   local epipe_group signal_case signal_name signal_status
   local expected_crypto_markers
 
-  expected_crypto_markers=$'generate-new-plaintext\nwrite-staged-plaintext\nchange-apfs-passphrase\ninstall-rotated-plaintext\nupdate-keychain\ncreate-tle-ciphertext\nverify-ciphertext-nonempty\nverify-ciphertext-not-early\nverify-expected-early-error\nwrite-plaintext-hash\nwrite-locked-json\ninstall-locked-json\nremove-plaintext\nremove-keychain-plaintext\nlock-apfs\nverify-filevault\nverify-mount-resistance'
+  expected_crypto_markers=$(expected_lock_crypto_markers)
 
   test_default_lock_epipe "$expected_crypto_markers"
   test_default_unlock_epipe
@@ -3510,10 +3514,14 @@ test_task4_epipe_presentation() {
   done
 }
 
-test_default_lock_epipe() { # expected_crypto_markers
+test_default_lock_epipe() { # expected_crypto_markers [checkpoint...]
   local expected_crypto_markers=$1 epipe_group
+  shift
+  if [[ $# -eq 0 ]]; then
+    set -- progress_time-machine progress_time-lock progress_apfs-lock
+  fi
 
-  for epipe_group in progress_time-machine progress_time-lock progress_apfs-lock; do
+  for epipe_group in "$@"; do
     task3_prepare_lock_fixture
     run_with_stdout_epipe "$epipe_group" lock --yes --no-hooks \
       '2099-01-02 03:04'
@@ -3688,6 +3696,55 @@ test_default_adopt_progress() {
   task3_check_output_order "default adopt execution group order" "$output" \
     '-> Copy source into vault' '-> Verify copied source' \
     '-> Replace source with symlink'
+}
+
+test_ci_adopt_dry_run() {
+  local output source
+
+  reset_task2_deferred_fixture
+  write_json_state false null null null UUID-INIT
+  write_apfs_state false true UUID-INIT disk8s1
+  printf '%s' "$task2_unlock_passphrase" > "$state_dir/passphrase.txt"
+  source="$test_root/CI adopt source"
+  /bin/mkdir -p "$source"
+  printf 'payload\n' > "$source/file with spaces"
+  output=$(run_vaultlock adopt --dry-run "$source" 2>&1)
+  check_line_prefix_count "CI adopt dry-run prints three groups" \
+    3 'Would:' "$output"
+  task3_check_output_order "CI adopt dry-run group order" "$output" \
+    'Would: Copy source into vault' 'Would: Verify copied source' \
+    'Would: Replace source with symlink'
+  check_not_contains "CI adopt dry-run emits no start arrows" '->' "$output"
+  check_empty "CI adopt dry-run performs no mutation" "$mutation_log"
+  check_empty "CI adopt dry-run runs no hook" "$hook_log"
+  check "CI adopt dry-run preserves source directory" true \
+    "$([[ -d "$source" && ! -L "$source" ]] && printf true || printf false)"
+  check "CI adopt dry-run preserves source contents" payload \
+    "$(< "$source/file with spaces")"
+  check "CI adopt dry-run creates no destination" false \
+    "$([[ -e "$mount_point/${source##*/}" \
+        || -L "$mount_point/${source##*/}" ]] && printf true || printf false)"
+  check "CI adopt dry-run acquires no operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+}
+
+test_ci_lock_stdout_epipe() {
+  local expected_crypto_markers expected_before_apfs_lock
+
+  expected_crypto_markers=$(expected_lock_crypto_markers)
+  expected_before_apfs_lock=${expected_crypto_markers%$'\nlock-apfs\nverify-filevault\nverify-mount-resistance'}
+  test_default_lock_epipe "$expected_crypto_markers" progress_apfs-lock
+  check "CI APFS lock EPIPE occurs after both recovery removals" \
+    "$expected_before_apfs_lock" "$(< "$test_root/epipe-crypto-at-failure")"
+  check "CI lock EPIPE preserves ciphertext" true \
+    "$([[ -s "$state_dir/passphrase.tle" ]] && printf true || printf false)"
+  check "CI lock EPIPE preserves recovery hash" true \
+    "$([[ -s "$state_dir/passphrase.sha256" ]] && printf true || printf false)"
+  check "CI lock EPIPE releases writer" '' "$EPIPE_ACTIVE_WRITER_PID"
+  check "CI lock EPIPE releases readers" '' "${EPIPE_ACTIVE_READER_PIDS[*]-}"
+  check "CI lock EPIPE removes stdout FIFO" false \
+    "$([[ -e "$test_root/epipe-stdout.fifo" ]] && printf true || printf false)"
 }
 
 run_task3_progress_tests() {
@@ -4406,6 +4463,18 @@ check_line "help lists status presentation options" \
 check_line "help documents colour modes" \
   '  --color=auto|always|never  control terminal colour (default: auto)' \
   "$help_output"
+
+if [[ "${VAULTLOCK_TEST_CI_ONLY:-0}" == "1" ]]; then
+  test_default_lock_progress
+  test_default_unlock_progress
+  test_default_init_progress
+  test_task3_progress_mapper_prevalidation
+  check_not_contains "CI mapper failure performs no coordination action" \
+    'transition-fixture progress_plan_before_validation' "$(< "$action_log")"
+  test_ci_adopt_dry_run
+  test_ci_lock_stdout_epipe
+  exit "$fail"
+fi
 
 if [[ "${VAULTLOCK_TEST_TASK1_ONLY:-0}" == "1" ]]; then
   exit "$fail"

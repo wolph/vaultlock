@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -22,7 +23,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         os:
           - macos-15-intel
@@ -42,7 +43,7 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: brew install jq shellcheck
 
-      - name: Run the complete check with native macOS tools
+      - name: Run CI tests with native macOS tools
         run: |
           export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$(brew --prefix)/bin:$PATH"
           sw_vers
@@ -52,4 +53,8 @@ jobs:
           /usr/bin/git --version
           jq --version
           shellcheck --version
-          /usr/bin/make check
+          /usr/bin/make test-ci check-syntax
+
+      - name: Check all shell sources with ShellCheck
+        if: matrix.os == 'macos-15'
+        run: /usr/bin/make lint
