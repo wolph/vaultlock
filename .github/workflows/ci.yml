@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 defaults:
   run:
     shell: /bin/bash --noprofile --norc -e -o pipefail {0}
@@ -16,7 +20,7 @@ jobs:
   check:
     name: Check (${{ matrix.os }}, Bash 3.2)
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 240
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:

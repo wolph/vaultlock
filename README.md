@@ -107,7 +107,9 @@ fixtures and do not perform a real APFS lifecycle operation.
 [GitHub Actions](https://github.com/wolph/vaultlock/actions/workflows/ci.yml)
 runs the same gate on macOS 15 and 26, using both Intel and Apple Silicon
 runners with the system Bash 3.2. Pushes and pull requests trigger all four
-jobs. You can also start the workflow manually from the Actions tab.
+jobs, each limited to five minutes. A new run cancels an older run for the
+same branch or pull request. You can also start the workflow manually from
+the Actions tab.
 
 ## Installation
 
