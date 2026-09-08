@@ -5426,10 +5426,46 @@ verify_unlock_recovery_boundaries() {
     || die "protected state changed after unlock plan revalidation"
 }
 
+normalise_presentation_epoch() { # nonnegative integral numeric text
+  local value=$1 digits fraction exponent padding
+  local numeric_re='^([0-9]+)([.]([0-9]+))?([eE]([+-]?[0-9]+))?$'
+  local -i sign=1 shift integral_length
+  [[ ${#value} -le 128 && "$value" =~ $numeric_re ]] || return 1
+  digits=${BASH_REMATCH[1]}${BASH_REMATCH[3]}
+  fraction=${BASH_REMATCH[3]}
+  exponent=${BASH_REMATCH[5]:-0}
+  while [[ "$digits" == 0* ]]; do digits=${digits#0}; done
+  if [[ -z "$digits" ]]; then printf '0\n'; return 0; fi
+  case "$exponent" in
+    -*) sign=-1; exponent=${exponent#-} ;;
+    +*) exponent=${exponent#+} ;;
+  esac
+  while [[ "$exponent" == 0* ]]; do exponent=${exponent#0}; done
+  exponent=${exponent:-0}
+  [[ ${#exponent} -le 3 ]] || return 1
+  shift=$(( sign * 10#$exponent - ${#fraction} ))
+  if (( shift >= 0 )); then
+    (( ${#digits} + shift <= 18 )) || return 1
+    printf -v padding '%*s' "$shift" ''
+    digits+=${padding// /0}
+  else
+    integral_length=$(( ${#digits} + shift ))
+    (( integral_length > 0 )) || return 1
+    [[ "${digits:integral_length}" != *[!0]* ]] || return 1
+    digits=${digits:0:integral_length}
+  fi
+  safe_epoch "$digits" || return 1
+  printf '%s\n' "$digits"
+}
+
 remaining_human() { # target_epoch [now_epoch]
   local target=$1 now=${2:-} text=""
   local -i rem days hours minutes
   [[ -n "$now" ]] || now=$(/bin/date +%s)
+  target=$(normalise_presentation_epoch "$target") \
+    || { printf 'remaining time unavailable\n'; return 0; }
+  now=$(normalise_presentation_epoch "$now") \
+    || { printf 'remaining time unavailable\n'; return 0; }
   rem=$(( target - now ))
   if (( rem <= 0 )); then printf 'deadline passed\n'; return 0; fi
   if (( rem < 60 )); then printf '%ds\n' "$rem"; return 0; fi
@@ -5443,11 +5479,19 @@ remaining_human() { # target_epoch [now_epoch]
 }
 
 format_deadline() { # target_epoch now_epoch
-  local target=$1 now=$2 timestamp remaining
-  timestamp=$(/bin/date -j -r "$target" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null) \
-    || timestamp="epoch $target (local timestamp unavailable)"
+  local target=$1 now=$2 timestamp remaining normalised
+  if normalised=$(normalise_presentation_epoch "$target"); then
+    target=$normalised
+    timestamp=$(/bin/date -j -r "$target" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null) \
+      || timestamp="epoch $target (local timestamp unavailable)"
+  else
+    timestamp="epoch $target (local timestamp unavailable)"
+  fi
   remaining=$(remaining_human "$target" "$now")
-  [[ "$remaining" == 'deadline passed' ]] || remaining="in $remaining"
+  case "$remaining" in
+    'deadline passed'|'remaining time unavailable') ;;
+    *) remaining="in $remaining" ;;
+  esac
   printf '%s (%s)\n' "$timestamp" "$remaining"
 }
 
@@ -7636,15 +7680,15 @@ case "${1:-}" in
       || die_usage "usage: vaultlock __format_time <remaining|deadline|lock_result> <arguments>"
     case "$2" in
       remaining|deadline)
-        if ! safe_epoch "$3"; then
+        if [[ ! "$3" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
           die_usage "invalid test target epoch"
         fi
-        time_fixture_target=$((10#$3))
+        time_fixture_target=$3
         if [[ $# -eq 4 ]]; then
-          if ! safe_epoch "$4"; then
+          if [[ ! "$4" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
             die_usage "invalid test current epoch"
           fi
-          time_fixture_now=$((10#$4))
+          time_fixture_now=$4
         elif [[ "$2" == deadline ]]; then
           die_usage "deadline formatting requires the current epoch"
         fi
@@ -7662,10 +7706,10 @@ case "${1:-}" in
           0|1|2) OPTION_VERBOSITY=$3 ;;
           *) die_usage "invalid test verbosity" ;;
         esac
-        if ! safe_epoch "$4"; then
+        if [[ ! "$4" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]]; then
           die_usage "invalid test target epoch"
         fi
-        PLAN_CONTEXT_DEADLINE_EPOCH=$((10#$4))
+        PLAN_CONTEXT_DEADLINE_EPOCH=$4
         PLAN_CONTEXT_DEADLINE=stale-formatted-deadline
         PLAN_CONTEXT_ROUND=31805812
         LOCK_REQUEST_DEADLINE_EPOCH=4102444800

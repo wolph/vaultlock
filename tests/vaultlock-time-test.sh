@@ -118,7 +118,38 @@ check_format 'unsupported local date retains passed deadline' \
   'epoch 999999999999999999 (local timestamp unavailable) (deadline passed)' \
   UTC0 deadline 999999999999999999 999999999999999999
 
-for unsafe_epoch in 'not-an-epoch' '1+2' '-1' '1000000000000000000'; do
+while IFS='|' read -r notation expected; do
+  json_epoch=$(printf '%s\n' "$notation" | jq -r tostring)
+  check_format "JSON epoch $notation uses exact integer arithmetic" "$expected" UTC0 \
+    remaining "$json_epoch" 0
+done <<'CASES'
+1.0|1s
+1e3|16m
+1E+17|1157407407407d 9h 46m
+CASES
+
+check_format 'decimal epoch formats canonical local time' \
+  '1970-01-01 00:00:01 +0000 (in 1s)' UTC0 deadline 1.0 0
+check_format 'scientific epoch formats canonical local time' \
+  '1970-01-01 00:16:40 +0000 (in 1s)' UTC0 deadline 1e3 9.99e2
+check_format 'fractional mantissa shifts exactly' '2m' UTC0 remaining 1.25e2 0
+check_format 'negative exponent shifts exactly' '1s' UTC0 remaining 1000e-3 0
+check_format 'decimal shift preserves all eighteen integer digits' \
+  '1s' UTC0 remaining 9.99999999999999999e17 999999999999999998
+check_format 'zero does not overflow a large exponent' 'deadline passed' UTC0 \
+  remaining 0e999999999999999999999 0
+check_format 'nonintegral target has explicit unavailable duration' \
+  'remaining time unavailable' UTC0 remaining 1.5 0
+check_format 'nonintegral current time has explicit unavailable duration' \
+  '1970-01-01 00:00:01 +0000 (remaining time unavailable)' UTC0 deadline 1 0.5
+check_format 'unsupported integral range has explicit unavailable duration' \
+  'epoch 1000000000000000000 (local timestamp unavailable) (remaining time unavailable)' \
+  UTC0 deadline 1000000000000000000 0
+check_format 'unsupported exponent has explicit unavailable duration' \
+  'epoch 1e1000 (local timestamp unavailable) (remaining time unavailable)' UTC0 \
+  deadline 1e1000 0
+
+for unsafe_epoch in 'not-an-epoch' '1+2' '-1'; do
   if output=$(format_time deadline "$unsafe_epoch" 1000000 2>&1); then
     status=0
   else
