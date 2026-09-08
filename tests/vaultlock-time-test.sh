@@ -111,6 +111,32 @@ check_format 'autumn local calendar day lasts 25 hours' \
   '2026-10-25 12:00:00 +0100 (in 1d 1h)' Europe/Amsterdam \
   deadline "$(( now + 25 * 3600 ))" "$now"
 
+check_format 'unsupported local date retains epoch and relative duration' \
+  'epoch 999999999999999999 (local timestamp unavailable) (in 11574074074062d 11h 59m)' \
+  UTC0 deadline 999999999999999999 1000000
+check_format 'unsupported local date retains passed deadline' \
+  'epoch 999999999999999999 (local timestamp unavailable) (deadline passed)' \
+  UTC0 deadline 999999999999999999 999999999999999999
+
+for unsafe_epoch in 'not-an-epoch' '1+2' '-1' '1000000000000000000'; do
+  if output=$(format_time deadline "$unsafe_epoch" 1000000 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  check "unsafe target epoch $unsafe_epoch is rejected" 64 "$status"
+  check "unsafe target epoch $unsafe_epoch reports validation failure" \
+    'vaultlock: invalid test target epoch' "$output"
+  if output=$(format_time deadline 1000000 "$unsafe_epoch" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  check "unsafe current epoch $unsafe_epoch is rejected" 64 "$status"
+  check "unsafe current epoch $unsafe_epoch reports validation failure" \
+    'vaultlock: invalid test current epoch' "$output"
+done
+
 target=$(( $(/bin/date +%s) + 3599 ))
 check_format 'remaining duration defaults to current time' '59m' UTC0 \
   remaining "$target"

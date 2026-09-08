@@ -5259,7 +5259,8 @@ remaining_human() { # target_epoch [now_epoch]
 
 format_deadline() { # target_epoch now_epoch
   local target=$1 now=$2 timestamp remaining
-  timestamp=$(/bin/date -j -r "$target" '+%Y-%m-%d %H:%M:%S %z')
+  timestamp=$(/bin/date -j -r "$target" '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null) \
+    || timestamp="epoch $target (local timestamp unavailable)"
   remaining=$(remaining_human "$target" "$now")
   [[ "$remaining" == 'deadline passed' ]] || remaining="in $remaining"
   printf '%s (%s)\n' "$timestamp" "$remaining"
@@ -7448,12 +7449,12 @@ case "${1:-}" in
       || die_usage "usage: vaultlock __format_time <remaining|deadline|lock_result> <arguments>"
     case "$2" in
       remaining|deadline)
-        if ! safe_epoch "$3" || ! epoch_is_supported "$3"; then
+        if ! safe_epoch "$3"; then
           die_usage "invalid test target epoch"
         fi
         time_fixture_target=$((10#$3))
         if [[ $# -eq 4 ]]; then
-          if ! safe_epoch "$4" || ! epoch_is_supported "$4"; then
+          if ! safe_epoch "$4"; then
             die_usage "invalid test current epoch"
           fi
           time_fixture_now=$((10#$4))
@@ -7474,7 +7475,7 @@ case "${1:-}" in
           0|1|2) OPTION_VERBOSITY=$3 ;;
           *) die_usage "invalid test verbosity" ;;
         esac
-        if ! safe_epoch "$4" || ! epoch_is_supported "$4"; then
+        if ! safe_epoch "$4"; then
           die_usage "invalid test target epoch"
         fi
         PLAN_CONTEXT_DEADLINE_EPOCH=$((10#$4))
