@@ -629,6 +629,26 @@ for preserved_fixture in preserved_lock preserved_repair; do
     'Preserved epoch: 4070999040' "$preserved_verbose"
 done
 
+equal_deadline_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never preserved_equal_numeric)
+check_not_contains "equivalent numeric deadlines omit duplicate request" \
+  'Requested:' "$equal_deadline_summary"
+equal_timestamp=$(/bin/date -r 1800000000 '+%Y-%m-%d %H:%M:%S %z')
+check_count "equivalent numeric deadlines print effective date once" 1 \
+  "$equal_timestamp" "$equal_deadline_summary"
+equal_deadline_verbose=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 1 never preserved_equal_numeric)
+check_contains "numeric equality retains raw requested epoch in verbose output" \
+  'Requested epoch: 1800000000' "$equal_deadline_verbose"
+check_contains "numeric equality retains raw preserved epoch in verbose output" \
+  'Preserved epoch: 1.8E+9' "$equal_deadline_verbose"
+invalid_deadline_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never preserved_invalid_numeric 2>&1)
+check_contains "failed normalisation keeps requested deadline visible" \
+  "Requested: $equal_timestamp" "$invalid_deadline_summary"
+check_contains "failed normalisation keeps preserved deadline visible" \
+  'Preserved: epoch 1.8E+999 (local timestamp unavailable)' "$invalid_deadline_summary"
+
 hook_test_root=$(mktemp -d "/tmp/vaultlock hooks.XXXXXX")
 trap 'rm -rf "$hook_test_root"' EXIT
 hook_state="$hook_test_root/global state"

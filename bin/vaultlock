@@ -2362,6 +2362,7 @@ render_current_state() { # width
 
 render_request_metadata() { # width now
   local width=$1 now=$2 line label value epoch
+  local requested_epoch preserved_epoch same_deadline
 
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
@@ -2370,9 +2371,14 @@ render_request_metadata() { # width now
     case "$label" in
       'Requested deadline')
         epoch=${LOCK_REQUEST_DEADLINE_EPOCH:-$PLAN_CONTEXT_DEADLINE_EPOCH}
+        same_deadline=false
+        if requested_epoch=$(normalise_presentation_epoch "$epoch") \
+            && preserved_epoch=$(normalise_presentation_epoch "$SNAPSHOT_DEADLINE_EPOCH"); then
+          [[ "$requested_epoch" != "$preserved_epoch" ]] || same_deadline=true
+        fi
         if (( OPTION_VERBOSITY > 0 )) \
             || [[ "$PLAN_REQUEST_TEXT" == *'Existing locked deadline preserved:'* \
-              && "$epoch" != "$SNAPSHOT_DEADLINE_EPOCH" ]]; then
+              && "$same_deadline" != true ]]; then
           print_field "$width" Requested "$(format_deadline "$epoch" "$now")"
         fi
         if (( OPTION_VERBOSITY > 0 )); then
@@ -7849,13 +7855,21 @@ case "${1:-}" in
         plan_add verify_secure_target "Verify secure target"
         PLAN_TARGET_TEXT="securely locked without changes"
         ;;
-      preserved_lock|preserved_repair)
+      preserved_lock|preserved_repair|preserved_equal_numeric|preserved_invalid_numeric)
         RUNTIME_ASSESSMENT='securely locked'
         SNAPSHOT_RECORDED_LOCKED=true
         SNAPSHOT_DEADLINE=2099-01-02T02:04:00+0100
         SNAPSHOT_DEADLINE_EPOCH=4070999040
         SNAPSHOT_ROUND=792731235
         LOCK_REQUEST_DEADLINE_EPOCH=1788220800
+        if [[ "$4" == preserved_equal_numeric \
+            || "$4" == preserved_invalid_numeric ]]; then
+          LOCK_REQUEST_DEADLINE_EPOCH=1800000000
+          SNAPSHOT_DEADLINE=2027-01-15T09:00:00+0100
+          SNAPSHOT_DEADLINE_EPOCH=1.8E+9
+          [[ "$4" != preserved_invalid_numeric ]] \
+            || SNAPSHOT_DEADLINE_EPOCH=1.8E+999
+        fi
         PLAN_CONTEXT_DEADLINE=$SNAPSHOT_DEADLINE
         PLAN_CONTEXT_DEADLINE_EPOCH=$SNAPSHOT_DEADLINE_EPOCH
         PLAN_CONTEXT_ROUND=$SNAPSHOT_ROUND
