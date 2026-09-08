@@ -359,7 +359,62 @@ check_not_contains "verbose summary still hides actions" \
 check_not_contains "verbose summary still hides hook argv" \
   "--phase" "$verbose_summary"
 
-progress_inventory=$'init\toperation_lock_acquire\t<silent>\ninit\toperation_lock_quarantine\t<silent>\ninit\toperation_lock_release\t<silent>\nadopt\toperation_lock_acquire\t<silent>\nadopt\toperation_lock_quarantine\t<silent>\nadopt\toperation_lock_release\t<silent>\nlock\toperation_lock_acquire\t<silent>\nlock\toperation_lock_quarantine\t<silent>\nlock\toperation_lock_release\t<silent>\nunlock\toperation_lock_acquire\t<silent>\nunlock\toperation_lock_quarantine\t<silent>\nunlock\toperation_lock_release\t<silent>\nlock\trepair_verify_plaintext\trepair\tRepair the prerequisite usable vault state\nunlock\trepair_verify_plaintext\trepair\tRepair the prerequisite usable vault state\nlock\trepair_unlock_apfs\trepair\tRepair the prerequisite usable vault state\nunlock\trepair_unlock_apfs\trepair\tRepair the prerequisite usable vault state\nlock\trepair_mount\tmount\tEnsure the expected APFS volume is mounted\nunlock\trepair_mount\tmount\tEnsure the expected APFS volume is mounted\nlock\tverify_mount_identity\tmount-identity\tVerify the mounted vault identity\nunlock\tverify_mount_identity\tmount-identity\tVerify the mounted vault identity\nlock\thooks_disabled\t<silent>\nunlock\thooks_disabled\t<silent>\nlock\thook\t<silent>\nunlock\thook\t<silent>\nlock\tdeferred_hook_discovery\t<silent>\nunlock\tdeferred_hook_discovery\t<silent>\nlock\ttm_exclude_state\ttime-machine\tPrepare Time Machine exclusions and snapshots\nlock\ttm_exclude\ttime-machine\tPrepare Time Machine exclusions and snapshots\nlock\ttm_delete_vault_snapshots\ttime-machine\tPrepare Time Machine exclusions and snapshots\nlock\ttm_delete_data_snapshots\ttime-machine\tPrepare Time Machine exclusions and snapshots\nlock\tunmount_vault\tunmount\tUnmount the vault for locking\nlock\tstage_recovery\trecovery-rotation\tRotate recovery material\nlock\trotate_apfs_recovery\trecovery-rotation\tRotate recovery material\nlock\tkeychain_update\trecovery-rotation\tRotate recovery material\nunlock\tkeychain_update\trecovery-restore\tRestore verified recovery material\nlock\ttle_encrypt\ttime-lock\tEncrypt and record time-locked recovery material\nlock\ttle_verify_future\ttime-lock\tEncrypt and record time-locked recovery material\nlock\tpersist_locked_recovery\ttime-lock\tEncrypt and record time-locked recovery material\nlock\tremove_plaintext\trecovery-removal\tEnsure plaintext and keychain recovery material are absent\nlock\tapfs_lock\tapfs-lock\tLock and verify the APFS volume\nlock\tverify_locked_postconditions\tapfs-lock\tLock and verify the APFS volume\nunlock\ttle_decrypt\ttime-unlock\tDecrypt and verify time-locked recovery material\nunlock\tverify_decrypted_hash\ttime-unlock\tDecrypt and verify time-locked recovery material\nunlock\tapfs_unlock\tapfs-unlock\tUnlock the expected APFS volume\nunlock\tpersist_plaintext\trecovery-restore\tRestore verified recovery material\nunlock\tpersist_unlocked_state\trecovery-restore\tRestore verified recovery material\nlock\tverify_secure_target\tsecure-target\tVerify the secure locked target\nunlock\tverify_unlocked_target\tusable-target\tVerify the usable unlocked target\ninit\tinit_prepare_state\tinit-state\tPrepare protected vault state\ninit\tinit_create_volume\tinit-volume\tCreate the encrypted APFS volume\ninit\tinit_write_state\tinit-record\tRecord the usable vault state\nadopt\tadopt_copy\tadopt-copy\tCopy the source into the vault\nadopt\tadopt_verify\tadopt-verify\tVerify the copied source\nadopt\tadopt_replace_source\tadopt-replace\tReplace the source with its vault symlink'
+for default_fixture in full_lock full_unlock init adopt unlock_repair \
+    secure_noop repair_remove; do
+  default_progress=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+    "$VL" __render_output 0 never "$default_fixture")
+  case "$default_fixture" in
+    full_lock)
+      expected_progress=$'Would: Prepare Time Machine\nWould: Unmount vault\nWould: Rotate recovery material\nWould: Encrypt recovery material\nWould: Remove plaintext recovery material\nWould: Lock vault'
+      ;;
+    full_unlock)
+      expected_progress=$'Would: Decrypt recovery material\nWould: Unlock vault\nWould: Ensure vault is mounted\nWould: Verify mounted vault\nWould: Restore recovery material\nWould: Verify unlocked vault'
+      ;;
+    init)
+      expected_progress=$'Would: Prepare vault state\nWould: Create encrypted vault\nWould: Record vault state'
+      ;;
+    adopt)
+      expected_progress=$'Would: Copy source into vault\nWould: Verify copied source\nWould: Replace source with symlink'
+      ;;
+    unlock_repair)
+      expected_progress=$'Would: Prepare vault\nWould: Ensure vault is mounted\nWould: Verify mounted vault\nWould: Restore recovery material\nWould: Verify unlocked vault'
+      ;;
+    secure_noop) expected_progress='Would: Verify locked vault' ;;
+    repair_remove)
+      expected_progress='Would: Remove plaintext recovery material'
+      ;;
+  esac
+  check "$default_fixture default progress has ordered unique short labels" \
+    "$expected_progress" "$(grep '^Would:' <<< "$default_progress" || true)"
+  check_not_contains "$default_fixture default dry-run hides actions" \
+    'Actions:' "$default_progress"
+  check_not_contains "$default_fixture default dry-run emits no execution arrow" \
+    '->' "$default_progress"
+done
+
+default_hook_progress=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 never hooks)
+check_count "default dry-run includes each individual hook" 2 \
+  'Would: Run pre-lock [global]' "$default_hook_progress"
+check_not_contains "default dry-run hooks hide arguments" \
+  '--phase' "$default_hook_progress"
+
+help_status=0
+help_output=$("$VL" help 2>&1) || help_status=$?
+check "help preserves usage exit status" 64 "$help_status"
+check_contains "help describes default short progress" \
+  'default                   short progress and the final result' "$help_output"
+check_contains "help describes detailed progress" \
+  '-v, --verbose             detailed progress and state information' "$help_output"
+check_contains "help describes audit presentation" \
+  '-vv, --very-verbose        detailed progress, numbered plan, and exact hook arguments' \
+  "$help_output"
+check_contains "help gives a duration example" \
+  'vaultlock lock 20h' "$help_output"
+check_contains "help gives a calendar deadline example" \
+  'vaultlock lock "09:00 +2d"' "$help_output"
+
+progress_inventory=$'init\toperation_lock_acquire\t<silent>\ninit\toperation_lock_quarantine\t<silent>\ninit\toperation_lock_release\t<silent>\nadopt\toperation_lock_acquire\t<silent>\nadopt\toperation_lock_quarantine\t<silent>\nadopt\toperation_lock_release\t<silent>\nlock\toperation_lock_acquire\t<silent>\nlock\toperation_lock_quarantine\t<silent>\nlock\toperation_lock_release\t<silent>\nunlock\toperation_lock_acquire\t<silent>\nunlock\toperation_lock_quarantine\t<silent>\nunlock\toperation_lock_release\t<silent>\nlock\trepair_verify_plaintext\trepair\tRepair the prerequisite usable vault state\tPrepare vault\nunlock\trepair_verify_plaintext\trepair\tRepair the prerequisite usable vault state\tPrepare vault\nlock\trepair_unlock_apfs\trepair\tRepair the prerequisite usable vault state\tPrepare vault\nunlock\trepair_unlock_apfs\trepair\tRepair the prerequisite usable vault state\tPrepare vault\nlock\trepair_mount\tmount\tEnsure the expected APFS volume is mounted\tEnsure vault is mounted\nunlock\trepair_mount\tmount\tEnsure the expected APFS volume is mounted\tEnsure vault is mounted\nlock\tverify_mount_identity\tmount-identity\tVerify the mounted vault identity\tVerify mounted vault\nunlock\tverify_mount_identity\tmount-identity\tVerify the mounted vault identity\tVerify mounted vault\nlock\thooks_disabled\t<silent>\nunlock\thooks_disabled\t<silent>\nlock\thook\t<silent>\nunlock\thook\t<silent>\nlock\tdeferred_hook_discovery\t<silent>\nunlock\tdeferred_hook_discovery\t<silent>\nlock\ttm_exclude_state\ttime-machine\tPrepare Time Machine exclusions and snapshots\tPrepare Time Machine\nlock\ttm_exclude\ttime-machine\tPrepare Time Machine exclusions and snapshots\tPrepare Time Machine\nlock\ttm_delete_vault_snapshots\ttime-machine\tPrepare Time Machine exclusions and snapshots\tPrepare Time Machine\nlock\ttm_delete_data_snapshots\ttime-machine\tPrepare Time Machine exclusions and snapshots\tPrepare Time Machine\nlock\tunmount_vault\tunmount\tUnmount the vault for locking\tUnmount vault\nlock\tstage_recovery\trecovery-rotation\tRotate recovery material\tRotate recovery material\nlock\trotate_apfs_recovery\trecovery-rotation\tRotate recovery material\tRotate recovery material\nlock\tkeychain_update\trecovery-rotation\tRotate recovery material\tRotate recovery material\nunlock\tkeychain_update\trecovery-restore\tRestore verified recovery material\tRestore recovery material\nlock\ttle_encrypt\ttime-lock\tEncrypt and record time-locked recovery material\tEncrypt recovery material\nlock\ttle_verify_future\ttime-lock\tEncrypt and record time-locked recovery material\tEncrypt recovery material\nlock\tpersist_locked_recovery\ttime-lock\tEncrypt and record time-locked recovery material\tEncrypt recovery material\nlock\tremove_plaintext\trecovery-removal\tEnsure plaintext and keychain recovery material are absent\tRemove plaintext recovery material\nlock\tapfs_lock\tapfs-lock\tLock and verify the APFS volume\tLock vault\nlock\tverify_locked_postconditions\tapfs-lock\tLock and verify the APFS volume\tLock vault\nunlock\ttle_decrypt\ttime-unlock\tDecrypt and verify time-locked recovery material\tDecrypt recovery material\nunlock\tverify_decrypted_hash\ttime-unlock\tDecrypt and verify time-locked recovery material\tDecrypt recovery material\nunlock\tapfs_unlock\tapfs-unlock\tUnlock the expected APFS volume\tUnlock vault\nunlock\tpersist_plaintext\trecovery-restore\tRestore verified recovery material\tRestore recovery material\nunlock\tpersist_unlocked_state\trecovery-restore\tRestore verified recovery material\tRestore recovery material\nlock\tverify_secure_target\tsecure-target\tVerify the secure locked target\tVerify locked vault\nunlock\tverify_unlocked_target\tusable-target\tVerify the usable unlocked target\tVerify unlocked vault\ninit\tinit_prepare_state\tinit-state\tPrepare protected vault state\tPrepare vault state\ninit\tinit_create_volume\tinit-volume\tCreate the encrypted APFS volume\tCreate encrypted vault\ninit\tinit_write_state\tinit-record\tRecord the usable vault state\tRecord vault state\nadopt\tadopt_copy\tadopt-copy\tCopy the source into the vault\tCopy source into vault\nadopt\tadopt_verify\tadopt-verify\tVerify the copied source\tVerify copied source\nadopt\tadopt_replace_source\tadopt-replace\tReplace the source with its vault symlink\tReplace source with symlink'
 known_operations=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 "$VL" __known_operations)
 known_operation_count=$(printf '%s\n' "$known_operations" \
   | /usr/bin/awk 'NF { count++ } END { print count }')
@@ -369,7 +424,7 @@ inventory_ids=$(/usr/bin/awk -F '\t' '!seen[$2]++ { print $2 }' \
   <<< "$progress_inventory")
 check "progress inventory derives exactly from production registry" \
   "$known_operations" "$inventory_ids"
-while IFS=$'\t' read -r command operation_id expected_group expected_label; do
+while IFS=$'\t' read -r command operation_id expected_group expected_label expected_short_label; do
   progress_mapping_status=0
   if progress_mapping=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
       "$VL" __progress_group "$command" "$operation_id" 2>&1); then
@@ -384,7 +439,8 @@ while IFS=$'\t' read -r command operation_id expected_group expected_label; do
       '' "$progress_mapping"
   else
     check "progress inventory maps $command:$operation_id" \
-      "$expected_group"$'\t'"$expected_label" "$progress_mapping"
+      "$expected_group"$'\t'"$expected_label"$'\t'"$expected_short_label" \
+      "$progress_mapping"
   fi
 done <<< "$progress_inventory"
 
@@ -465,6 +521,13 @@ check_contains "progress colours only Would prefix cyan" \
   "${esc}[36mWould:${esc}[0m Prepare Time Machine" "$coloured_progress"
 check_not_contains "progress keeps label plain" \
   "${esc}[36mWould: Prepare Time Machine" "$coloured_progress"
+
+default_coloured_progress=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+  "$VL" __render_output 0 always full_lock)
+check_contains "default progress colours only the Would prefix" \
+  "${esc}[36mWould:${esc}[0m Encrypt recovery material" "$default_coloured_progress"
+check_not_contains "default progress keeps the short label plain" \
+  "${esc}[36mWould: Encrypt recovery material" "$default_coloured_progress"
 
 inconsistent_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never inconsistent)

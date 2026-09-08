@@ -2315,71 +2315,71 @@ unlock:hooks_disabled|unlock:hook|unlock:deferred_hook_discovery)
       ;;
     lock:repair_verify_plaintext|unlock:repair_verify_plaintext|\
 lock:repair_unlock_apfs|unlock:repair_unlock_apfs)
-      printf 'repair\tRepair the prerequisite usable vault state\n'
+      printf 'repair\tRepair the prerequisite usable vault state\tPrepare vault\n'
       ;;
     lock:repair_mount|unlock:repair_mount)
-      printf 'mount\tEnsure the expected APFS volume is mounted\n'
+      printf 'mount\tEnsure the expected APFS volume is mounted\tEnsure vault is mounted\n'
       ;;
     lock:verify_mount_identity|unlock:verify_mount_identity)
-      printf 'mount-identity\tVerify the mounted vault identity\n'
+      printf 'mount-identity\tVerify the mounted vault identity\tVerify mounted vault\n'
       ;;
     lock:tm_exclude_state|lock:tm_exclude|\
 lock:tm_delete_vault_snapshots|lock:tm_delete_data_snapshots)
-      printf 'time-machine\tPrepare Time Machine exclusions and snapshots\n'
+      printf 'time-machine\tPrepare Time Machine exclusions and snapshots\tPrepare Time Machine\n'
       ;;
     lock:unmount_vault)
-      printf 'unmount\tUnmount the vault for locking\n'
+      printf 'unmount\tUnmount the vault for locking\tUnmount vault\n'
       ;;
     lock:stage_recovery|lock:rotate_apfs_recovery)
-      printf 'recovery-rotation\tRotate recovery material\n'
+      printf 'recovery-rotation\tRotate recovery material\tRotate recovery material\n'
       ;;
     lock:keychain_update)
-      printf 'recovery-rotation\tRotate recovery material\n'
+      printf 'recovery-rotation\tRotate recovery material\tRotate recovery material\n'
       ;;
     unlock:keychain_update)
-      printf 'recovery-restore\tRestore verified recovery material\n'
+      printf 'recovery-restore\tRestore verified recovery material\tRestore recovery material\n'
       ;;
     lock:tle_encrypt|lock:tle_verify_future|lock:persist_locked_recovery)
-      printf 'time-lock\tEncrypt and record time-locked recovery material\n'
+      printf 'time-lock\tEncrypt and record time-locked recovery material\tEncrypt recovery material\n'
       ;;
     lock:remove_plaintext)
-      printf 'recovery-removal\tEnsure plaintext and keychain recovery material are absent\n'
+      printf 'recovery-removal\tEnsure plaintext and keychain recovery material are absent\tRemove plaintext recovery material\n'
       ;;
     lock:apfs_lock|lock:verify_locked_postconditions)
-      printf 'apfs-lock\tLock and verify the APFS volume\n'
+      printf 'apfs-lock\tLock and verify the APFS volume\tLock vault\n'
       ;;
     unlock:tle_decrypt|unlock:verify_decrypted_hash)
-      printf 'time-unlock\tDecrypt and verify time-locked recovery material\n'
+      printf 'time-unlock\tDecrypt and verify time-locked recovery material\tDecrypt recovery material\n'
       ;;
     unlock:apfs_unlock)
-      printf 'apfs-unlock\tUnlock the expected APFS volume\n'
+      printf 'apfs-unlock\tUnlock the expected APFS volume\tUnlock vault\n'
       ;;
     unlock:persist_plaintext|unlock:persist_unlocked_state)
-      printf 'recovery-restore\tRestore verified recovery material\n'
+      printf 'recovery-restore\tRestore verified recovery material\tRestore recovery material\n'
       ;;
     lock:verify_secure_target)
-      printf 'secure-target\tVerify the secure locked target\n'
+      printf 'secure-target\tVerify the secure locked target\tVerify locked vault\n'
       ;;
     unlock:verify_unlocked_target)
-      printf 'usable-target\tVerify the usable unlocked target\n'
+      printf 'usable-target\tVerify the usable unlocked target\tVerify unlocked vault\n'
       ;;
     init:init_prepare_state)
-      printf 'init-state\tPrepare protected vault state\n'
+      printf 'init-state\tPrepare protected vault state\tPrepare vault state\n'
       ;;
     init:init_create_volume)
-      printf 'init-volume\tCreate the encrypted APFS volume\n'
+      printf 'init-volume\tCreate the encrypted APFS volume\tCreate encrypted vault\n'
       ;;
     init:init_write_state)
-      printf 'init-record\tRecord the usable vault state\n'
+      printf 'init-record\tRecord the usable vault state\tRecord vault state\n'
       ;;
     adopt:adopt_copy)
-      printf 'adopt-copy\tCopy the source into the vault\n'
+      printf 'adopt-copy\tCopy the source into the vault\tCopy source into vault\n'
       ;;
     adopt:adopt_verify)
-      printf 'adopt-verify\tVerify the copied source\n'
+      printf 'adopt-verify\tVerify the copied source\tVerify copied source\n'
       ;;
     adopt:adopt_replace_source)
-      printf 'adopt-replace\tReplace the source with its vault symlink\n'
+      printf 'adopt-replace\tReplace the source with its vault symlink\tReplace source with symlink\n'
       ;;
     *) die "no progress group for command/operation: $command:$operation_id" ;;
   esac
@@ -2415,15 +2415,16 @@ emit_hook_progress_values() { # prefix phase scope path
 }
 
 emit_operation_progress() { # command operation_id prefix
-  local command=$1 operation_id=$2 prefix=$3 mapping group_id label
+  local command=$1 operation_id=$2 prefix=$3 mapping group_id label short_label
   known_operation_id "$operation_id" \
     || die "no progress group for operation ID: $operation_id"
   mapping=$(progress_group_for_operation "$command" "$operation_id") \
     || return $?
   [[ -n "$mapping" ]] || return 0
-  IFS=$'\t' read -r group_id label <<< "$mapping"
+  IFS=$'\t' read -r group_id label short_label <<< "$mapping"
   progress_group_was_emitted "$group_id" && return 0
   PROGRESS_EMITTED_GROUP_IDS+=("$group_id")
+  (( OPTION_VERBOSITY >= 1 )) || label=$short_label
   local text styled_prefix=$prefix
   [[ "$COLOR_STDOUT" != true ]] \
     || printf -v styled_prefix '%s%s%s' \
@@ -2468,7 +2469,7 @@ render_selected_plan_body() { # command
     render_plan_actions
     render_confirmation_detail "$command"
   fi
-  if [[ "$OPTION_DRY_RUN" == true ]] && (( OPTION_VERBOSITY >= 1 )); then
+  if [[ "$OPTION_DRY_RUN" == true ]]; then
     render_dry_run_progress "$command"
   fi
 }
@@ -6100,9 +6101,7 @@ run_verified_planned_hook() { # index
   path=${PLAN_HOOK_PATHS[$index]}
   verify_planned_hook "$index"
   locked=$(hook_locked_value "$phase")
-  if (( OPTION_VERBOSITY >= 1 )); then
-    emit_hook_progress "->" "$index"
-  fi
+  emit_hook_progress "->" "$index"
   run_hook_file "${phase%%-*}" "$phase" "$scope" "$path" \
     "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
     "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
@@ -6168,9 +6167,7 @@ execute_deferred_unlock_hooks() { # index
       || die "discovered unlock hook changed before execution"
     [[ "$current_signature" == "$hook_signature" ]] \
       || die "discovered unlock hook changed before execution"
-    if (( OPTION_VERBOSITY >= 1 )); then
-      emit_hook_progress_values "->" "$phase" "$hook_scope" "$hook"
-    fi
+    emit_hook_progress_values "->" "$phase" "$hook_scope" "$hook"
     if run_hook_file deferred-post "$phase" "$hook_scope" "$hook" \
         "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
         "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
@@ -6755,9 +6752,7 @@ persist_locked_recovery_state() {
 execute_rotate_and_encrypt() {
   generate_and_stage_rotated_recovery
   rotate_and_install_recovery
-  if (( OPTION_VERBOSITY >= 1 )); then
-    emit_operation_progress lock tle_encrypt "->"
-  fi
+  emit_operation_progress lock tle_encrypt "->"
   encrypt_and_verify_lock_ciphertext
   persist_locked_recovery_state
 }
@@ -7045,9 +7040,7 @@ execute_deferred_lock_hooks() { # index
       || die "discovered pre-lock hook changed before execution"
     [[ "$current_signature" == "$hook_signature" ]] \
       || die "discovered pre-lock hook changed before execution"
-    if (( OPTION_VERBOSITY >= 1 )); then
-      emit_hook_progress_values "->" "$phase" "$hook_scope" "$hook"
-    fi
+    emit_hook_progress_values "->" "$phase" "$hook_scope" "$hook"
     if run_hook_file deferred-pre "$phase" "$hook_scope" "$hook" \
         "$PLAN_CONTEXT_UUID" "$PLAN_CONTEXT_DEVICE" \
         "$PLAN_CONTEXT_DEADLINE" "$PLAN_CONTEXT_DEADLINE_EPOCH" \
@@ -7158,9 +7151,7 @@ persist_locked_recovery) ;;
 
 execute_plan() {
   local index operation_id
-  if (( OPTION_VERBOSITY >= 1 )); then
-    prevalidate_progress_plan "$OPERATION_LOCK_COMMAND"
-  fi
+  prevalidate_progress_plan "$OPERATION_LOCK_COMMAND"
   PROGRESS_EMITTED_GROUP_IDS=()
   for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
     operation_id=${PLAN_OPERATION_IDS[$index]}
@@ -7169,8 +7160,7 @@ execute_plan() {
 operation_lock_release) continue ;;
     esac
     if [[ "$operation_id" != hook \
-        && "$operation_id" != deferred_hook_discovery ]] \
-        && (( OPTION_VERBOSITY >= 1 )); then
+        && "$operation_id" != deferred_hook_discovery ]]; then
       emit_operation_progress "$OPERATION_LOCK_COMMAND" "$operation_id" "->"
     fi
     case "$OPERATION_LOCK_COMMAND" in
@@ -7354,6 +7344,8 @@ dispatch_status() {
 usage() {
   cat >&2 <<'EOF'
 usage: vaultlock <command>
+
+commands:
   init [--dry-run] [--yes] [-v|-vv] [--color=MODE]
                              create the encrypted vault volume
   adopt [--dry-run] [--yes] [-v|-vv] [--color=MODE] <dir>
@@ -7362,11 +7354,16 @@ usage: vaultlock <command>
                              time-lock the vault until a future deadline
   unlock [--dry-run] [--no-hooks] [-v|-vv] [--color=MODE]
                              unlock after the deadline (needs internet)
-  status [--color=MODE]      show lock state and remaining time
+  status [-v|-vv] [--color=MODE]
+                             show vault readiness and remaining time
 
-presentation options for init, adopt, lock, and unlock:
-  -v, --verbose              show grouped progress
-  -vv, --very-verbose        grouped progress plus the complete numbered operation plan and exact planned hook argv
+presentation levels:
+  default                   short progress and the final result
+  -v, --verbose             detailed progress and state information
+  -vv, --very-verbose        detailed progress, numbered plan, and exact hook arguments
+  status                    concise readiness by default, more state details with -v or -vv
+  --dry-run                 show what would run, without making changes
+                            (init, adopt, lock, and unlock)
 
 colour options for all commands:
   --color=auto|always|never  control terminal colour (default: auto)
@@ -7376,6 +7373,11 @@ deadline forms:
   H:MM                       next occurrence of a local clock time
   NdNhNmNs                   elapsed duration, for example 1d4h, 20h, or 90s
   H:MM +Nd                   local clock time N calendar days from today
+
+deadline examples:
+  vaultlock lock 20h
+  vaultlock lock "09:00 +2d"
+  vaultlock lock "2027-01-02 09:00"
 
 hook directories:
   ~/.vaultlock/hooks/<phase>.d

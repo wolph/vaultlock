@@ -2393,15 +2393,10 @@ test_task2_deferred_unlock_presentation() {
       check_count "$verbosity deferred unlock avoids duplicate hook note" \
         0 "running post-unlock vault hook: $path" "$output"
       arrow="-> Run post-unlock [vault] $quoted"
-      if [[ "$verbosity" == default ]]; then
-        check_count "default deferred unlock has no grouped hook arrow" \
-          0 "$arrow" "$output"
-      else
-        check_line "$verbosity deferred unlock emits grouped hook arrow" \
-          "$arrow" "$output"
-        check_count "$verbosity deferred unlock emits grouped hook arrow once" \
-          1 "$arrow" "$output"
-      fi
+      check_line "$verbosity deferred unlock emits grouped hook arrow" \
+        "$arrow" "$output"
+      check_count "$verbosity deferred unlock emits grouped hook arrow once" \
+        1 "$arrow" "$output"
       if [[ "$verbosity" == audit ]]; then
         task3_check_output_order \
           "audit deferred unlock discovery precedes audit and execution" \
@@ -2480,15 +2475,10 @@ test_task2_deferred_lock_presentation() {
       check_count "$verbosity deferred lock avoids duplicate hook note" \
         0 "running pre-lock vault hook: $path" "$output"
       arrow="-> Run pre-lock [vault] $quoted"
-      if [[ "$verbosity" == default ]]; then
-        check_count "default deferred lock has no grouped hook arrow" \
-          0 "$arrow" "$output"
-      else
-        check_line "$verbosity deferred lock emits grouped hook arrow" \
-          "$arrow" "$output"
-        check_count "$verbosity deferred lock emits grouped hook arrow once" \
-          1 "$arrow" "$output"
-      fi
+      check_line "$verbosity deferred lock emits grouped hook arrow" \
+        "$arrow" "$output"
+      check_count "$verbosity deferred lock emits grouped hook arrow once" \
+        1 "$arrow" "$output"
       if [[ "$verbosity" == audit ]]; then
         task3_check_output_order \
           "audit deferred lock discovery precedes audit and execution" \
@@ -2792,7 +2782,7 @@ test_task3_progress_mapper_prevalidation() {
   printf 'mark_validation_transition\n' \
     > "$apfs_state/transition_progress_plan_before_validation"
   if output=$(VAULTLOCK_TEST_PROGRESS_MAPPING_FAIL_OPERATION=tm_exclude \
-      run_vaultlock lock -v --yes --no-hooks '2099-01-02 03:04' 2>&1); then
+      run_vaultlock lock --yes --no-hooks '2099-01-02 03:04' 2>&1); then
     status=0
   else
     status=$?
@@ -2800,7 +2790,7 @@ test_task3_progress_mapper_prevalidation() {
   check "progress mapper failure exits nonzero" 1 "$status"
   check_contains "progress mapper failure reports injected operation" \
     'progress mapping failure for operation ID: tm_exclude' "$output"
-  check_not_contains "progress mapper failure emits no success arrow" \
+  check_not_contains "progress mapper failure emits no start arrow" \
     '->' "$output"
   check "progress mapper failure never opens confirmation device" \
     'confirmation sentinel' "$(< "$confirm_device")"
@@ -3219,6 +3209,10 @@ test_task4_epipe_presentation() {
 
   expected_crypto_markers=$'generate-new-plaintext\nwrite-staged-plaintext\nchange-apfs-passphrase\ninstall-rotated-plaintext\nupdate-keychain\ncreate-tle-ciphertext\nverify-ciphertext-nonempty\nverify-ciphertext-not-early\nverify-expected-early-error\nwrite-plaintext-hash\nwrite-locked-json\ninstall-locked-json\nremove-plaintext\nremove-keychain-plaintext\nlock-apfs\nverify-filevault\nverify-mount-resistance'
 
+  test_default_lock_epipe "$expected_crypto_markers"
+  test_default_unlock_epipe
+  test_default_init_adopt_epipe
+
   task3_prepare_lock_fixture
   run_with_stdout_epipe summary lock -v --yes --no-hooks \
     '2099-01-02 03:04'
@@ -3278,10 +3272,10 @@ test_task4_epipe_presentation() {
   : > "$apfs_state/unmount_emits_success"
   run_with_stream_closed_at_transition stdout lock_before_execution \
     lock --yes --no-hooks '2099-01-02 03:04'
-  check "default lock child-first stdout EPIPE preserves presentation status" \
+  check "default lock stdout EPIPE before execution preserves presentation status" \
     74 "$EPIPE_STATUS"
-  check_task4_locked_convergence "default lock child-first stdout EPIPE"
-  check "default lock child-first stdout EPIPE preserves exact crypto order" \
+  check_task4_locked_convergence "default lock stdout EPIPE before execution"
+  check "default lock stdout EPIPE before execution preserves exact crypto order" \
     "$expected_crypto_markers" "$(< "$apfs_state/lock-crypto-markers")"
 
   task3_prepare_lock_fixture
@@ -3512,7 +3506,191 @@ test_task4_epipe_presentation() {
   done
 }
 
+test_default_lock_epipe() { # expected_crypto_markers
+  local expected_crypto_markers=$1 epipe_group
+
+  for epipe_group in progress_time-machine progress_time-lock progress_apfs-lock; do
+    task3_prepare_lock_fixture
+    run_with_stdout_epipe "$epipe_group" lock --yes --no-hooks \
+      '2099-01-02 03:04'
+    check "default $epipe_group EPIPE exits with presentation status" \
+      74 "$EPIPE_STATUS"
+    check_task4_locked_convergence "default $epipe_group EPIPE"
+    check "default $epipe_group EPIPE preserves exact crypto order" \
+      "$expected_crypto_markers" "$(< "$apfs_state/lock-crypto-markers")"
+    check_contains "default $epipe_group EPIPE reports through stderr" \
+      'vaultlock: presentation output failed' "$(< "$test_root/epipe-stderr")"
+    if [[ "$epipe_group" == progress_time-lock ]]; then
+      check "default encryption EPIPE occurs after rotation and before encryption" \
+        $'generate-new-plaintext\nwrite-staged-plaintext\nchange-apfs-passphrase\ninstall-rotated-plaintext\nupdate-keychain' \
+        "$(< "$test_root/epipe-crypto-at-failure")"
+    fi
+  done
+}
+
+test_default_unlock_epipe() {
+  local epipe_group
+
+  for epipe_group in progress_mount hook-progress; do
+    task3_prepare_unlock_fixture
+    /bin/mkdir -p "$state_dir/hooks/post-unlock.d"
+    /bin/cp "$TEST_SELF" "$state_dir/hooks/post-unlock.d/20-epipe-post"
+    /bin/chmod 700 "$state_dir/hooks/post-unlock.d/20-epipe-post"
+    : > "$apfs_state/verify_hook_pipe_default"
+    run_with_stdout_epipe "$epipe_group" unlock
+    check "default unlock $epipe_group EPIPE returns presentation status" \
+      74 "$EPIPE_STATUS"
+    check "default unlock $epipe_group EPIPE records usable state" false \
+      "$(jq -r .locked "$state_dir/state.json")"
+    check "default unlock $epipe_group EPIPE leaves APFS mounted" true \
+      "$(< "$apfs_state/mounted")"
+    check_contains "default unlock $epipe_group EPIPE runs the post hook" \
+      '20-epipe-post --phase post-unlock' "$(< "$hook_log")"
+    check "default unlock $epipe_group EPIPE preserves hook PIPE disposition" true \
+      "$([[ -f "$apfs_state/hook_pipe_was_default" ]] \
+        && printf true || printf false)"
+    check "default unlock $epipe_group EPIPE releases operation lock" false \
+      "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+        && printf true || printf false)"
+  done
+}
+
+test_default_init_adopt_epipe() {
+  task3_reset_init_fixture
+  run_with_stdout_epipe progress_init-volume init --yes
+  check "default init progress EPIPE returns presentation status" 74 "$EPIPE_STATUS"
+  check "default init progress EPIPE records usable state" false \
+    "$(jq -r .locked "$state_dir/state.json")"
+  check "default init progress EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+
+  reset_task2_deferred_fixture
+  write_json_state false null null null UUID-INIT
+  write_apfs_state false true UUID-INIT disk8s1
+  printf '%s' "$task2_unlock_passphrase" > "$state_dir/passphrase.txt"
+  EPIPE_ADOPT_SOURCE="$test_root/default epipe adopt source"
+  /bin/mkdir -p "$EPIPE_ADOPT_SOURCE"
+  printf 'payload\n' > "$EPIPE_ADOPT_SOURCE/file"
+  run_with_stdout_epipe progress_adopt-verify adopt --yes "$EPIPE_ADOPT_SOURCE"
+  check "default adopt progress EPIPE returns presentation status" 74 "$EPIPE_STATUS"
+  check "default adopt progress EPIPE replaces source with symlink" true \
+    "$([[ -L "$EPIPE_ADOPT_SOURCE" ]] && printf true || printf false)"
+  check "default adopt progress EPIPE releases operation lock" false \
+    "$([[ -e "$operation_lock_dir" || -L "$operation_lock_dir" ]] \
+      && printf true || printf false)"
+}
+
+test_default_lock_progress() {
+  local output hook_path
+
+  task3_prepare_lock_fixture
+  output=$(run_vaultlock lock --dry-run --no-hooks '2099-01-02 03:04' 2>&1)
+  check_line_prefix_count "default lock dry-run prints six groups" \
+    6 'Would:' "$output"
+  task3_check_output_order "default lock dry-run group order" "$output" \
+    'Would: Prepare Time Machine' 'Would: Unmount vault' \
+    'Would: Rotate recovery material' 'Would: Encrypt recovery material' \
+    'Would: Remove plaintext recovery material' 'Would: Lock vault'
+  check_not_contains "default lock dry-run emits no start arrows" '->' "$output"
+  check_empty "default lock dry-run performs no mutation" "$mutation_log"
+
+  task3_prepare_lock_fixture
+  hook_path=$state_dir/hooks/pre-lock.d/10-default\ progress
+  /bin/mkdir -p "${hook_path%/*}"
+  /bin/cp "$TEST_SELF" "$hook_path"
+  /bin/chmod +x "$hook_path"
+  output=$(VAULTLOCK_TEST_PRINT_LOCK_CRYPTO_MARKERS=1 \
+    run_vaultlock lock --yes '2099-01-02 03:04' 2>&1)
+  check_line_prefix_count "default lock prints one start arrow per group and hook" \
+    7 '->' "$output"
+  task3_check_output_order "default lock groups precede their real operations" \
+    "$output" \
+    "-> Run pre-lock [global] $(printf '%q' "$hook_path")" \
+    '-> Prepare Time Machine' '-> Unmount vault' \
+    '-> Rotate recovery material' 'CRYPTO: generate-new-plaintext' \
+    'CRYPTO: update-keychain' '-> Encrypt recovery material' \
+    'CRYPTO: create-tle-ciphertext' '-> Remove plaintext recovery material' \
+    'CRYPTO: remove-plaintext' '-> Lock vault' 'CRYPTO: lock-apfs'
+  check_count "default lock deduplicates late Time Machine operations" \
+    1 '-> Prepare Time Machine' "$output"
+  check_count "default lock deduplicates nested encryption operations" \
+    1 '-> Encrypt recovery material' "$output"
+  check_not_contains "default lock hides detailed group description" \
+    'Encrypt and record time-locked recovery material' "$output"
+  check_not_contains "default hook progress hides exact arguments" \
+    '--phase' "$output"
+}
+
+test_default_unlock_progress() {
+  local output
+
+  task3_prepare_unlock_fixture
+  output=$(run_vaultlock unlock --dry-run --no-hooks 2>&1)
+  check_line_prefix_count "default unlock dry-run prints six groups" \
+    6 'Would:' "$output"
+  task3_check_output_order "default unlock dry-run group order" "$output" \
+    'Would: Decrypt recovery material' 'Would: Unlock vault' \
+    'Would: Ensure vault is mounted' 'Would: Verify mounted vault' \
+    'Would: Restore recovery material' 'Would: Verify unlocked vault'
+  check_empty "default unlock dry-run performs no mutation" "$mutation_log"
+  output=$(run_vaultlock unlock --no-hooks 2>&1)
+  check_line_prefix_count "default unlock prints six start arrows" \
+    6 '->' "$output"
+  task3_check_output_order "default unlock execution group order" "$output" \
+    '-> Decrypt recovery material' '-> Unlock vault' \
+    '-> Ensure vault is mounted' '-> Verify mounted vault' \
+    '-> Restore recovery material' '-> Verify unlocked vault'
+
+  task3_prepare_unlock_fixture
+  /bin/rm -f "$apfs_state/unlock_leaves_unmounted"
+  output=$(run_vaultlock unlock --no-hooks 2>&1)
+  check_count "default auto-mounted unlock describes mount assurance once" \
+    1 '-> Ensure vault is mounted' "$output"
+  check_count "default auto-mounted unlock skips redundant explicit mount" \
+    0 'diskutil mount disk9s1' "$(< "$mutation_log")"
+}
+
+test_default_init_progress() {
+  local output
+
+  task3_reset_init_fixture
+  output=$(run_vaultlock init --dry-run 2>&1)
+  check_line_prefix_count "default init dry-run prints three groups" \
+    3 'Would:' "$output"
+  output=$(run_vaultlock init --yes 2>&1)
+  check_line_prefix_count "default init prints three start arrows" \
+    3 '->' "$output"
+  task3_check_output_order "default init execution group order" "$output" \
+    '-> Prepare vault state' '-> Create encrypted vault' '-> Record vault state'
+}
+
+test_default_adopt_progress() {
+  local output source
+
+  reset_task2_deferred_fixture
+  write_json_state false null null null UUID-INIT
+  write_apfs_state false true UUID-INIT disk8s1
+  printf '%s' "$task2_unlock_passphrase" > "$state_dir/passphrase.txt"
+  source="$test_root/default progress source"
+  /bin/mkdir -p "$source"
+  printf 'payload\n' > "$source/file with spaces"
+  output=$(run_vaultlock adopt --dry-run "$source" 2>&1)
+  check_line_prefix_count "default adopt dry-run prints three groups" \
+    3 'Would:' "$output"
+  output=$(run_vaultlock adopt --yes "$source" 2>&1)
+  check_line_prefix_count "default adopt prints three start arrows" \
+    3 '->' "$output"
+  task3_check_output_order "default adopt execution group order" "$output" \
+    '-> Copy source into vault' '-> Verify copied source' \
+    '-> Replace source with symlink'
+}
+
 run_task3_progress_tests() {
+  test_default_lock_progress
+  test_default_unlock_progress
+  test_default_init_progress
+  test_default_adopt_progress
   test_task3_lock_progress
   test_task3_unlock_progress
   test_task3_secure_and_repair_progress
@@ -4065,12 +4243,12 @@ check_line "help lists adopt safety options" \
   '  adopt [--dry-run] [--yes] [-v|-vv] [--color=MODE] <dir>' \
   "$help_output"
 check_line "help lists long verbose options" \
-  '  -v, --verbose              show grouped progress' "$help_output"
+  '  -v, --verbose             detailed progress and state information' "$help_output"
 check_line "help lists long very verbose options" \
-  '  -vv, --very-verbose        grouped progress plus the complete numbered operation plan and exact planned hook argv' \
+  '  -vv, --very-verbose        detailed progress, numbered plan, and exact hook arguments' \
   "$help_output"
-check_line "help limits status to colour options" \
-  '  status [--color=MODE]      show lock state and remaining time' \
+check_line "help lists status presentation options" \
+  '  status [-v|-vv] [--color=MODE]' \
   "$help_output"
 check_line "help documents colour modes" \
   '  --color=auto|always|never  control terminal colour (default: auto)' \
