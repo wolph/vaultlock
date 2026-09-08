@@ -15,19 +15,27 @@ export VAULTLOCK_INSTALL_BIN_DIR
 export VAULTLOCK_INSTALL_HOME
 unexport BIN_DIR
 
-.PHONY: test test-ci check-syntax lint check check-ci install
+.PHONY: test test-ci test-helpers test-deadlines test-cli test-cli-ci test-install check-syntax lint check check-ci install
 
-test:
+test: test-helpers test-deadlines test-cli test-install
+
+test-ci: test-helpers test-deadlines test-cli-ci test-install
+
+test-helpers:
 	tests/vaultlock-test.sh bin/vaultlock
+
+test-deadlines:
 	tests/vaultlock-time-test.sh bin/vaultlock
+
+test-cli:
 	VAULTLOCK_TEST_CI_ONLY=0 tests/vaultlock-cli-test.sh bin/vaultlock
-	tests/install-test.sh
 
-test-ci:
-	tests/vaultlock-test.sh bin/vaultlock
-	tests/vaultlock-time-test.sh bin/vaultlock
+test-cli-ci:
 	VAULTLOCK_TEST_CI_ONLY=1 tests/vaultlock-cli-test.sh bin/vaultlock
-	tests/install-test.sh
+
+# Nested fixture builds run serially without the outer make jobserver.
+test-install:
+	MAKEFLAGS= MFLAGS= tests/install-test.sh
 
 check-syntax:
 	@for shell_source in bin/vaultlock scripts/install.sh tests/vaultlock-test.sh tests/vaultlock-time-test.sh tests/vaultlock-cli-test.sh tests/install-test.sh; do \

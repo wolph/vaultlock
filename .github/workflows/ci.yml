@@ -53,7 +53,7 @@ jobs:
           /usr/bin/git --version
           jq --version
           shellcheck --version
-          /usr/bin/make test-ci check-syntax
+          /usr/bin/make -j2 test-ci check-syntax
 
       - name: Check all shell sources with ShellCheck
         if: matrix.os == 'macos-15'

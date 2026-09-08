@@ -118,7 +118,8 @@ fault-injection scenarios, including adopt operations on fixtures.
 
 [GitHub Actions](https://github.com/wolph/vaultlock/actions/workflows/ci.yml)
 runs the CI tests and syntax checks on macOS 15 and 26, using both Intel and
-Apple Silicon runners with the system Bash 3.2. ShellCheck runs once on the
+Apple Silicon runners with the system Bash 3.2. At most two isolated suites
+run concurrently in each job. ShellCheck runs once on the
 macOS 15 Apple Silicon runner. Pushes to `master` and pull requests trigger
 all four jobs, each limited to five minutes. A failed job cancels the remaining jobs.
 A new run cancels an older run for the same branch or pull request. You can
