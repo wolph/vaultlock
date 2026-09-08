@@ -3007,7 +3007,8 @@ cleanup_epipe_processes() {
 }
 
 wait_for_epipe_entry() { # path
-  local path=$1 attempts=${EPIPE_ENTRY_WAIT_ATTEMPTS:-500}
+  # Give late checkpoints the same polling budget as writer completion.
+  local path=$1 attempts=${EPIPE_ENTRY_WAIT_ATTEMPTS:-12000}
   wait_for_fixture "$path" "$attempts"
 }
 
