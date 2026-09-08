@@ -118,9 +118,12 @@ write_fixture_sources() { # version
     > "$fixture_repo/tests/vaultlock-test.sh"
   printf '#!/bin/bash\nexit 0\n' \
     > "$fixture_repo/tests/vaultlock-cli-test.sh"
+  printf '#!/bin/bash\nexit 0\n' \
+    > "$fixture_repo/tests/vaultlock-time-test.sh"
   /bin/chmod +x "$fixture_repo/bin/vaultlock" \
     "$fixture_repo/tests/vaultlock-test.sh" \
-    "$fixture_repo/tests/vaultlock-cli-test.sh"
+    "$fixture_repo/tests/vaultlock-cli-test.sh" \
+    "$fixture_repo/tests/vaultlock-time-test.sh"
 }
 
 create_one_commit_fixture() { # repository
@@ -135,9 +138,12 @@ create_one_commit_fixture() { # repository
     > "$repository/tests/vaultlock-test.sh"
   printf '#!/bin/bash\nexit 0\n' \
     > "$repository/tests/vaultlock-cli-test.sh"
+  printf '#!/bin/bash\nexit 0\n' \
+    > "$repository/tests/vaultlock-time-test.sh"
   /bin/chmod +x "$repository/bin/vaultlock" \
     "$repository/tests/vaultlock-test.sh" \
     "$repository/tests/vaultlock-cli-test.sh" \
+    "$repository/tests/vaultlock-time-test.sh" \
     "$repository/tests/install-test.sh" \
     "$repository/scripts/install.sh"
   /usr/bin/git -C "$repository" init -q -b master 2>/dev/null \
