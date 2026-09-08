@@ -5240,12 +5240,39 @@ verify_unlock_recovery_boundaries() {
     || die "protected state changed after unlock plan revalidation"
 }
 
-remaining_human() {
-  local target=$1 now rem
-  now=$(/bin/date +%s)
+remaining_human() { # target_epoch [now_epoch]
+  local target=$1 now=${2:-} text=""
+  local -i rem days hours minutes
+  [[ -n "$now" ]] || now=$(/bin/date +%s)
   rem=$(( target - now ))
   if (( rem <= 0 )); then printf 'deadline passed\n'; return 0; fi
-  printf '%dh %dm\n' $(( rem / 3600 )) $(( rem % 3600 / 60 ))
+  if (( rem < 60 )); then printf '%ds\n' "$rem"; return 0; fi
+  days=$(( rem / 86400 ))
+  hours=$(( rem % 86400 / 3600 ))
+  minutes=$(( rem % 3600 / 60 ))
+  if (( days > 0 )); then text="${days}d"; fi
+  if (( hours > 0 )); then text+="${text:+ }${hours}h"; fi
+  if (( minutes > 0 )); then text+="${text:+ }${minutes}m"; fi
+  printf '%s\n' "$text"
+}
+
+format_deadline() { # target_epoch now_epoch
+  local target=$1 now=$2 timestamp remaining
+  timestamp=$(/bin/date -j -r "$target" '+%Y-%m-%d %H:%M:%S %z')
+  remaining=$(remaining_human "$target" "$now")
+  [[ "$remaining" == 'deadline passed' ]] || remaining="in $remaining"
+  printf '%s (%s)\n' "$timestamp" "$remaining"
+}
+
+print_lock_result() {
+  local now deadline detail
+  now=$(/bin/date +%s)
+  deadline=$(format_deadline "$PLAN_CONTEXT_DEADLINE_EPOCH" "$now")
+  detail="locked until $deadline"
+  if (( OPTION_VERBOSITY >= 1 )); then
+    detail+=" (drand round $PLAN_CONTEXT_ROUND)"
+  fi
+  print_result_line result "$detail"
 }
 
 plan_discovered_hook_file() { # phase scope path
@@ -7270,10 +7297,7 @@ run_planned_command() { # command
     unlock)
       print_result_line result "unlocked and mounted at $MOUNT_POINT"
       ;;
-    lock)
-      print_result_line result \
-        "locked until $PLAN_CONTEXT_DEADLINE (drand round $PLAN_CONTEXT_ROUND)"
-      ;;
+    lock) print_lock_result ;;
   esac
   finish_presentation_status
 }
@@ -7414,6 +7438,51 @@ case "${1:-}" in
     print_success "success"
     printf '\n'
     print_error "error"
+    ;;
+  __format_time)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __format_time"
+    [[ $# -ge 3 && $# -le 4 ]] \
+      || die_usage "usage: vaultlock __format_time <remaining|deadline|lock_result> <arguments>"
+    case "$2" in
+      remaining|deadline)
+        if ! safe_epoch "$3" || ! epoch_is_supported "$3"; then
+          die_usage "invalid test target epoch"
+        fi
+        time_fixture_target=$((10#$3))
+        if [[ $# -eq 4 ]]; then
+          if ! safe_epoch "$4" || ! epoch_is_supported "$4"; then
+            die_usage "invalid test current epoch"
+          fi
+          time_fixture_now=$((10#$4))
+        elif [[ "$2" == deadline ]]; then
+          die_usage "deadline formatting requires the current epoch"
+        fi
+        if [[ "$2" == deadline ]]; then
+          format_deadline "$time_fixture_target" "$time_fixture_now"
+        elif [[ $# -eq 4 ]]; then
+          remaining_human "$time_fixture_target" "$time_fixture_now"
+        else
+          remaining_human "$time_fixture_target"
+        fi
+        ;;
+      lock_result)
+        [[ $# -eq 4 ]] || die_usage "lock result requires verbosity and epoch"
+        case "$3" in
+          0|1|2) OPTION_VERBOSITY=$3 ;;
+          *) die_usage "invalid test verbosity" ;;
+        esac
+        if ! safe_epoch "$4" || ! epoch_is_supported "$4"; then
+          die_usage "invalid test target epoch"
+        fi
+        PLAN_CONTEXT_DEADLINE_EPOCH=$((10#$4))
+        PLAN_CONTEXT_DEADLINE=stale-formatted-deadline
+        PLAN_CONTEXT_ROUND=31805812
+        LOCK_REQUEST_DEADLINE_EPOCH=4102444800
+        print_lock_result
+        ;;
+      *) die_usage "unknown time formatting fixture: $2" ;;
+    esac
     ;;
   __render_output)
     [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
