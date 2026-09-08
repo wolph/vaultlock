@@ -955,6 +955,19 @@ runtime_mount_text() {
   if [[ "$SNAPSHOT_APFS_INSPECTED" == true ]]; then
     actual_mount=${SNAPSHOT_ACTUAL_MOUNT_POINT:-not mounted}
   fi
+  if (( OPTION_VERBOSITY == 0 )); then
+    if [[ "$SNAPSHOT_APFS_INSPECTED" != true \
+        || "$SNAPSHOT_APFS_MOUNTED" == unknown ]]; then
+      printf '%s (actual mount unknown)\n' "$MOUNT_POINT"
+      return 0
+    elif [[ "$SNAPSHOT_APFS_MOUNTED" == false ]]; then
+      printf '%s (not mounted)\n' "$MOUNT_POINT"
+      return 0
+    elif [[ "$actual_mount" == "$MOUNT_POINT" ]]; then
+      printf '%s\n' "$actual_mount"
+      return 0
+    fi
+  fi
   printf 'expected %s, actual %s\n' "$MOUNT_POINT" "$actual_mount"
 }
 
@@ -1106,6 +1119,7 @@ render_runtime_summary_body() {
   print_heading "$VOLUME:"
   presentation_stdout field ' '
   print_status_word "$state"
+  note ''
   note ''
   if [[ "$SNAPSHOT_STATE_VALID" == true \
       && "$SNAPSHOT_RECORDED_LOCKED" == true ]]; then
@@ -2413,6 +2427,7 @@ render_plan_summary() { # command
     (( OPTION_VERBOSITY == 0 )) || width=16
   fi
   print_heading "$heading $VOLUME"
+  note ''
   note ''
   render_current_state "$width"
   print_field "$width" Target "$target"

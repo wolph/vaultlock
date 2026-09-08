@@ -331,6 +331,7 @@ check_contains "empty NO_COLOR permits automatic colour" \
 summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never mixed)
 check_contains "summary names command" "Lock vault" "$summary"
+check "summary separates heading from fields" '' "$(sed -n '2p' <<< "$summary")"
 check_contains "summary names state" \
   "UNLOCKED" "$summary"
 check_contains "summary names target" \

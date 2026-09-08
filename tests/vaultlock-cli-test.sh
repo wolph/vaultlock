@@ -3745,6 +3745,8 @@ assert_status_snapshot() { # description recorded apfs mount recovery assessment
     status=$?
   fi
   check "$description exits successfully" 0 "$status"
+  check "$description separates verbose heading from fields" '' \
+    "$(sed -n '2p' <<< "$output")"
   check_status_alignment "$description verbose output" "$output"
   output=$(printf '%s\n' "$output" | status_fields)
   check_line "$description recorded line" "Recorded: $recorded" "$output"
@@ -3758,6 +3760,8 @@ assert_status_snapshot() { # description recorded apfs mount recovery assessment
   check "$description performs no other system operation" \
     'diskutil info -plist UUID-123' "$(< "$action_log")"
   compact=$(run_vaultlock status --color=never)
+  check "$description separates compact heading from fields" '' \
+    "$(sed -n '2p' <<< "$compact")"
   check_status_alignment "$description compact output" "$compact"
   case "$assessment" in
     usable) state_word=UNLOCKED ;;
@@ -3778,6 +3782,8 @@ assert_status_snapshot() { # description recorded apfs mount recovery assessment
     check_contains "$description compact output gives inspection command" \
       'vaultlock status -v' "$compact"
   elif [[ "$state_word" == UNLOCKED ]]; then
+    check_line "$description compact mount keeps one complete path" \
+      "Mount: $mount_point" "$(printf '%s\n' "$compact" | status_fields)"
     check_not_contains "$description compact output omits unlock deadline" \
       'Unlock at:' "$compact"
     check_not_contains "$description compact output omits next action" \
@@ -3794,6 +3800,8 @@ assert_invalid_snapshot() { # description
     status=$?
   fi
   check "$description exits successfully" 0 "$status"
+  check "$description separates verbose heading from fields" '' \
+    "$(sed -n '2p' <<< "$output")"
   check_status_alignment "$description verbose output" "$output"
   output=$(printf '%s\n' "$output" | status_fields)
   check_line "$description recorded line" \
@@ -3809,6 +3817,8 @@ assert_invalid_snapshot() { # description
   check_empty "$description performs no system operation" "$action_log"
   output=$(run_vaultlock status --color=never)
   check_status_alignment "$description compact output" "$output"
+  check_contains "$description compact mount makes unknown observation explicit" \
+    "$mount_point (actual mount unknown)" "$output"
   check_line "$description compact header is inconsistent" 'vault: INCONSISTENT' "$output"
   check_contains "$description compact output retains malformed-state diagnosis" \
     'state file fields are missing or malformed' "$output"
@@ -3859,7 +3869,7 @@ assert_status_snapshot "securely locked vault" \
 locked_output=$(run_vaultlock status)
 check_line "locked compact status names volume and state" 'vault: LOCKED' "$locked_output"
 check_contains "locked compact status formats local deadline" 'Unlock at: 2099-01-02 02:04:00 +0100 (in ' "$locked_output"
-check_contains "locked compact status makes absent mount explicit" "Mount:     expected $mount_point, actual not mounted" "$locked_output"
+check_contains "locked compact status makes absent mount explicit" "Mount:     $mount_point (not mounted)" "$locked_output"
 check_contains "locked compact status keeps unlock instruction" 'Next:      vaultlock unlock (needs internet)' "$locked_output"
 check_not_contains "locked compact status hides raw epoch" '4070999040' "$locked_output"
 check_not_contains "locked compact status hides raw round" '792731235' "$locked_output"
@@ -4096,6 +4106,8 @@ printf '%s\n' "$test_root/Volumes/vaultXtest" \
 output=$(run_vaultlock status)
 check_contains "mount point matching is literal" \
   'INCONSISTENT' "$output"
+check_contains "compact mount mismatch retains expected and actual paths" \
+  "expected $mount_point, actual $test_root/Volumes/vaultXtest" "$output"
 
 write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
 write_apfs_state true false UUID-123 disk9s1
@@ -4129,6 +4141,38 @@ check_contains "unsupported local epoch explains unavailable timestamp" \
   'local timestamp unavailable' "$unsupported_epoch_output"
 check_not_contains "unsupported local epoch emits no raw date diagnostic" \
   'date: invalid time' "$unsupported_epoch_output"
+
+for numeric_epoch_case in 1.0:1 1e3:1000 1e17:100000000000000000; do
+  numeric_epoch=${numeric_epoch_case%%:*}
+  numeric_value=${numeric_epoch_case#*:}
+  write_json_state true numeric-notation "$numeric_epoch" 792731235 UUID-123
+  for numeric_mode in compact verbose; do
+    numeric_flags=()
+    [[ "$numeric_mode" != verbose ]] || numeric_flags=(-v)
+    if numeric_output=$(run_vaultlock status --color=never \
+        "${numeric_flags[@]+${numeric_flags[@]}}" \
+        2> "$test_root/numeric-status-error"); then
+      numeric_status=0
+    else
+      numeric_status=$?
+    fi
+    check "$numeric_epoch $numeric_mode status succeeds" 0 "$numeric_status"
+    check_line "$numeric_epoch $numeric_mode preserves assessed state" \
+      'vault: LOCKED' "$numeric_output"
+    check_empty "$numeric_epoch $numeric_mode emits no arithmetic or date diagnostics" \
+      "$test_root/numeric-status-error"
+    check_not_contains "$numeric_epoch $numeric_mode has no empty remaining time" \
+      '(in )' "$numeric_output"
+    if [[ "$numeric_value" == 100000000000000000 ]]; then
+      check_contains "$numeric_epoch $numeric_mode retains exact unavailable epoch" \
+        "epoch $numeric_value (local timestamp unavailable)" "$numeric_output"
+    else
+      numeric_timestamp=$(/bin/date -r "$numeric_value" '+%Y-%m-%d %H:%M:%S %z')
+      check_contains "$numeric_epoch $numeric_mode formats the numeric instant" \
+        "$numeric_timestamp (deadline passed)" "$numeric_output"
+    fi
+  done
+done
 
 write_json_state false null null null UUID-123
 write_apfs_state false true UUID-123 disk9s1
