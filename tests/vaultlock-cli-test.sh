@@ -5026,8 +5026,8 @@ check_not_contains "default init summary hides coordination" \
   'Acquire cooperative operation lock' "$init_summary"
 check_not_contains "default init summary hides standard actions" \
   'Prepare protected state and generate recovery material' "$init_summary"
-check_not_contains "default init summary hides grouped progress" \
-  'Would:' "$init_summary"
+check_line "default init summary shows short progress" \
+  'Would: Prepare vault state' "$init_summary"
 check_not_contains "default init summary hides confirmation detail" \
   'Confirmation:' "$init_summary"
 check "init dry-run never opens confirmation device" \
@@ -9290,8 +9290,8 @@ fi
 check "planned lock exits successfully" 0 "$lock_success_status"
 check_contains "planned lock reports verified success" 'Result: locked until' \
   "$lock_success_output"
-check_not_contains "default lock execution hides grouped progress" \
-  '->' "$lock_success_output"
+check_line "default lock execution shows short progress" \
+  '-> Prepare Time Machine' "$lock_success_output"
 assert_lock_secure "planned lock"
 [[ -e "$apfs_state/change_passphrase_stdin_verified" ]] \
   || record_failure "lock rotates APFS with old and new stdin passphrases"
@@ -9528,16 +9528,18 @@ write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
 write_apfs_state true false UUID-123 disk9s1
 printf 'fixture ciphertext\n' > "$state_dir/passphrase.tle"
 printf '%s\n' "$lock_old_hash" > "$state_dir/passphrase.sha256"
-if secure_lock_output=$(run_vaultlock lock --yes 20h 2>&1); then
+if secure_lock_output=$(TZ=UTC0 run_vaultlock lock --yes 20h 2>&1); then
   secure_lock_status=0
 else
   secure_lock_status=$?
 fi
 check "secure lock no-op exits successfully" 0 "$secure_lock_status"
-check_contains "secure lock no-op preserves deadline" \
-  '2099-01-02 02:04:00 +0100' "$secure_lock_output"
+check_contains "secure lock no-op displays preserved deadline epoch" \
+  'Result: locked until 2099-01-02 01:04:00 +0000 (in ' "$secure_lock_output"
 check "secure lock no-op preserves JSON deadline" \
   '2099-01-02T03:04:00+0100' "$(jq -r .deadline "$state_dir/state.json")"
+check "secure lock no-op preserves JSON epoch" \
+  4070999040 "$(jq -r .deadline_epoch "$state_dir/state.json")"
 check "secure lock no-op preserves JSON round" 792731235 \
   "$(jq -r .round "$state_dir/state.json")"
 check "secure lock no-op performs only mount-resistance verification" \

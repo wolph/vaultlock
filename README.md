@@ -241,6 +241,16 @@ zero units. Below one minute they use seconds. At or after the deadline the
 suffix reads `deadline passed`. Unlocking still needs the published drand round
 and an internet connection.
 
+With a fixture clock set to `2026-09-08 20:26:00 +0200`, the formatter produces:
+
+```text
+2026-09-09 09:00:00 +0200 (in 12h 34m)
+```
+
+The absolute timestamp identifies the deadline and its time zone. The suffix
+shows the elapsed time left from that fixture clock. Normal output reads the
+current clock once per summary and again after the operation finishes.
+
 Hook paths and deferred directories use shell-safe quoting. `after mount`
 marks a vault-local directory whose entries cannot be inspected until the
 expected volume is mounted and its identity is verified. A hook found then is
@@ -447,8 +457,8 @@ identity, and executable state are rechecked before execution.
 Default output lists every known hook by phase, scope, and safely quoted path.
 It lists an unavailable vault-local hook directory with `after mount`. Every
 mode reports each hook run as an individual progress entry. `-vv` adds exact
-argv for hooks known while
-planning and for hooks found through deferred discovery during execution.
+argv for hooks known while planning and for hooks found through deferred
+discovery during execution.
 
 Each hook receives exactly these 24 argv words, in this order:
 
