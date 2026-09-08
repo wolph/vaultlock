@@ -9438,6 +9438,16 @@ else
     "Task 2 deferred presentation child exited $task2_deferred_status"
 fi
 
+if task3_progress_output=$(VAULTLOCK_TEST_TASK3_PROGRESS_ONLY=1 \
+    /bin/bash "$TEST_SELF" "$VL" 2>&1); then
+  printf '%s\n' "$task3_progress_output"
+else
+  task3_progress_status=$?
+  printf '%s\n' "$task3_progress_output"
+  record_failure \
+    "Task 3 progress presentation child exited $task3_progress_status"
+fi
+
 if presentation_epipe_output=$(VAULTLOCK_TEST_PRESENTATION_EPIPE_ONLY=1 \
     /bin/bash "$TEST_SELF" "$VL" 2>&1); then
   printf '%s\n' "$presentation_epipe_output"

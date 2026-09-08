@@ -92,8 +92,9 @@ system Bash 3.2. Normal use requires:
 - `curl` and internet access to the Quicknet drand service
 - administrator access for the `sudo tmutil` operations used while locking
 
-Development checks also require Git, GNU Make, and ShellCheck. Run the complete
-gate before installation:
+Development checks also require Git, GNU Make, and ShellCheck. Use a clone
+with full Git history so the crypto tests can read the original baseline.
+Run the complete gate before installation:
 
 ```console
 make check
