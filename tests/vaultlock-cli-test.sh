@@ -1805,6 +1805,9 @@ $VAULTLOCK_STATE_DIR/hooks/pre-lock.d/10-planned-link
   exit 0
 fi
 
+# Render deadline fixtures in a fixed time zone.
+export TZ=Europe/Amsterdam
+
 VL=${1:-$(cd "$(dirname "$0")/.." && pwd)/bin/vaultlock}
 fail=0
 test_root=$(mktemp -d "/tmp/vaultlock cli.XXXXXX")

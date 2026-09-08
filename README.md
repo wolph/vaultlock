@@ -1,5 +1,7 @@
 # Vaultlock
 
+[![CI](https://github.com/wolph/vaultlock/actions/workflows/ci.yml/badge.svg)](https://github.com/wolph/vaultlock/actions/workflows/ci.yml)
+
 Vaultlock seals a folder on your Mac until a date you choose. Until that date
 arrives it does not open. Not for you, not for root, not for a machine with its
 clock wound forward.
@@ -97,9 +99,14 @@ gate before installation:
 make check
 ```
 
-The gate runs the helper, isolated CLI, and guarded-install suites. It also
-runs Bash syntax checks and ShellCheck. The suites use temporary fixtures and
-do not perform a real APFS lifecycle operation.
+The gate runs the helper, deadline, isolated CLI, and guarded-install suites.
+It also runs Bash syntax checks and ShellCheck. The suites use temporary
+fixtures and do not perform a real APFS lifecycle operation.
+
+[GitHub Actions](https://github.com/wolph/vaultlock/actions/workflows/ci.yml)
+runs the same gate on macOS 15 and 26, using both Intel and Apple Silicon
+runners with the system Bash 3.2. Pushes and pull requests trigger all four
+jobs. You can also start the workflow manually from the Actions tab.
 
 ## Installation
 

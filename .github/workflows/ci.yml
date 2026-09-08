@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: /bin/bash --noprofile --norc -e -o pipefail {0}
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }}, Bash 3.2)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15-intel
+          - macos-15
+          - macos-26-intel
+          - macos-26
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install test dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install jq shellcheck
+
+      - name: Run the complete check with native macOS tools
+        run: |
+          export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$(brew --prefix)/bin:$PATH"
+          sw_vers
+          uname -m
+          /bin/bash --version
+          /usr/bin/make --version
+          /usr/bin/git --version
+          jq --version
+          shellcheck --version
+          /usr/bin/make check
