@@ -1092,7 +1092,8 @@ render_runtime_summary_body() {
   if [[ "$SNAPSHOT_STATE_VALID" == true \
       && "$SNAPSHOT_RECORDED_LOCKED" == true ]]; then
     width=10
-  elif [[ "$RUNTIME_ASSESSMENT" == repairable:* ]]; then
+  elif [[ "$RUNTIME_ASSESSMENT" == repairable:* \
+      || "$RUNTIME_ASSESSMENT" == inconsistent ]]; then
     width=7
   fi
   if (( OPTION_VERBOSITY > 0 )); then

@@ -3727,6 +3727,14 @@ status_fields() {
   sed -E 's/^  //; s/:[ ]+/: /'
 }
 
+check_status_alignment() { # description output
+  local columns
+  columns=$(printf '%s\n' "$2" \
+    | awk '/^  [A-Za-z][A-Za-z ]*:/ { match($0, /: +/); print RSTART + RLENGTH }' \
+    | sort -u | wc -l | tr -d '[:space:]')
+  check "$1 aligns field values" 1 "$columns"
+}
+
 assert_status_snapshot() { # description recorded apfs mount recovery assessment
   local description=$1 recorded=$2 apfs=$3 mount=$4 recovery=$5 assessment=$6
   local output status diskutil_calls compact state_word
@@ -3737,6 +3745,7 @@ assert_status_snapshot() { # description recorded apfs mount recovery assessment
     status=$?
   fi
   check "$description exits successfully" 0 "$status"
+  check_status_alignment "$description verbose output" "$output"
   output=$(printf '%s\n' "$output" | status_fields)
   check_line "$description recorded line" "Recorded: $recorded" "$output"
   check_line "$description APFS line" "APFS: $apfs" "$output"
@@ -3749,6 +3758,7 @@ assert_status_snapshot() { # description recorded apfs mount recovery assessment
   check "$description performs no other system operation" \
     'diskutil info -plist UUID-123' "$(< "$action_log")"
   compact=$(run_vaultlock status --color=never)
+  check_status_alignment "$description compact output" "$compact"
   case "$assessment" in
     usable) state_word=UNLOCKED ;;
     'securely locked') state_word=LOCKED ;;
@@ -3784,6 +3794,7 @@ assert_invalid_snapshot() { # description
     status=$?
   fi
   check "$description exits successfully" 0 "$status"
+  check_status_alignment "$description verbose output" "$output"
   output=$(printf '%s\n' "$output" | status_fields)
   check_line "$description recorded line" \
     'Recorded: unknown (state file fields are missing or malformed)' "$output"
@@ -3797,6 +3808,7 @@ assert_invalid_snapshot() { # description
     'Assessment: inconsistent' "$output"
   check_empty "$description performs no system operation" "$action_log"
   output=$(run_vaultlock status --color=never)
+  check_status_alignment "$description compact output" "$output"
   check_line "$description compact header is inconsistent" 'vault: INCONSISTENT' "$output"
   check_contains "$description compact output retains malformed-state diagnosis" \
     'state file fields are missing or malformed' "$output"
