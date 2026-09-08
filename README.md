@@ -43,7 +43,7 @@ across once, then lock until the morning two weeks out:
 
 ```console
 vaultlock adopt ~/Games
-vaultlock lock --dry-run "9:00 +14d"
+vaultlock lock -v --dry-run "9:00 +14d"
 vaultlock lock "9:00 +14d"
 ```
 

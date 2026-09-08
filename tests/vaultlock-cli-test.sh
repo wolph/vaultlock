@@ -4285,7 +4285,7 @@ red_prefix="${esc}[31mvaultlock:${esc}[0m"
 plain_prefix='vaultlock:'
 unlock_usage='usage: vaultlock unlock [--dry-run] [--no-hooks] [-v|--verbose|-vv|--very-verbose] [--color=auto|always|never]'
 lock_usage='usage: vaultlock lock [--dry-run] [--yes] [--no-hooks] [-v|--verbose|-vv|--very-verbose] [--color=auto|always|never] <deadline>'
-status_usage='usage: vaultlock status [--color=auto|always|never]'
+status_usage='usage: vaultlock status [-v|-vv] [--color=auto|always|never]'
 
 mv "$state_dir/state.json" "$test_root/state.json.saved"
 assert_fake_error "auto lifecycle error uses stderr TTY" \
