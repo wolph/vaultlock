@@ -296,7 +296,7 @@ check "never colour stays plain" \
 stdout_only=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   VAULTLOCK_TEST_STDOUT_TTY=true VAULTLOCK_TEST_STDERR_TTY=false \
   NO_COLOR='' TERM=xterm-256color "$VL" __colour auto 2>&1)
-check_contains "stdout TTY colours heading" "${esc}[36mheading" "$stdout_only"
+check_contains "stdout TTY colours heading" "${esc}[1mheading" "$stdout_only"
 check_not_contains "plain stderr has no red prefix" \
   "${esc}[31mvaultlock:" "$stdout_only"
 
@@ -304,7 +304,7 @@ stderr_only=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   VAULTLOCK_TEST_STDOUT_TTY=false VAULTLOCK_TEST_STDERR_TTY=true \
   NO_COLOR='' TERM=xterm-256color "$VL" __colour auto 2>&1)
 check_not_contains "plain stdout has no cyan heading" \
-  "${esc}[36mheading" "$stderr_only"
+  "${esc}[1mheading" "$stderr_only"
 check_contains "stderr TTY colours error prefix" \
   "${esc}[31mvaultlock:" "$stderr_only"
 
@@ -326,17 +326,23 @@ empty_no_color=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   VAULTLOCK_TEST_STDOUT_TTY=true VAULTLOCK_TEST_STDERR_TTY=true \
   NO_COLOR='' TERM=xterm-256color "$VL" __colour auto 2>&1)
 check_contains "empty NO_COLOR permits automatic colour" \
-  "${esc}[36mheading" "$empty_no_color"
+  "${esc}[1mheading" "$empty_no_color"
 
 summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never mixed)
 check_contains "summary names command" "Lock vault" "$summary"
 check_contains "summary names state" \
-  "State: unlocked and mounted at /Volumes/vault" "$summary"
+  "UNLOCKED" "$summary"
 check_contains "summary names target" \
-  "Target: locked at the resolved deadline" "$summary"
-check_contains "summary includes request metadata" \
-  "Requested deadline: 2026-09-01T02:00:00+0200" "$summary"
+  "Target:    lock now" "$summary"
+check_contains "summary includes effective deadline" \
+  "Unlock at: 2026-" "$summary"
+check_not_contains "default summary omits duplicate request" "Requested:" "$summary"
+check_not_contains "default summary omits raw epochs" "epoch " "$summary"
+check_not_contains "default summary hides raw rounds" "drand round" "$summary"
+check_contains "default summary includes relative deadline" "(deadline passed)" "$summary"
+summary_columns=$(printf '%s\n' "$summary" | awk '/^  (State|Target|Unlock at):/ { match($0, /: +/); print RSTART + RLENGTH }' | sort -u)
+check "summary aligns field values" 14 "$summary_columns"
 check_contains "summary lists known hook" \
   "pre-lock [global] /tmp/pre\\ lock" "$summary"
 check_contains "summary lists deferred directory" \
@@ -354,6 +360,7 @@ check_contains "verbose groups APFS locking" \
   "Would: Lock and verify the APFS volume" "$verbose_summary"
 check_count "Time Machine progress prints once" 1 \
   "Prepare Time Machine exclusions and snapshots" "$verbose_summary"
+check_contains "verbose summary exposes target round" "target 31805812" "$verbose_summary"
 check_not_contains "verbose summary still hides actions" \
   "Actions:" "$verbose_summary"
 check_not_contains "verbose summary still hides hook argv" \
@@ -508,12 +515,12 @@ check "audit summary prints state once" 1 "$check_count_text"
 
 coloured_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 always mixed)
-check_contains "summary colours command heading cyan" \
-  "${esc}[36mLock vault${esc}[0m" "$coloured_summary"
-check_contains "summary colours usable state label green" \
-  "${esc}[32mState:${esc}[0m unlocked and mounted" "$coloured_summary"
-check_contains "summary dims only request label" \
-  "${esc}[2mRequested deadline:${esc}[0m 2026-09-01" "$coloured_summary"
+check_contains "summary makes command heading bold" \
+  "${esc}[1mLock vault${esc}[0m" "$coloured_summary"
+check_contains "summary colours usable state word green" \
+  "${esc}[32mUNLOCKED${esc}[0m" "$coloured_summary"
+check_contains "summary dims effective deadline label" \
+  "${esc}[2mUnlock at:${esc}[0m 2026-" "$coloured_summary"
 
 coloured_progress=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 1 always mixed)
@@ -532,44 +539,44 @@ check_not_contains "default progress keeps the short label plain" \
 inconsistent_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never inconsistent)
 check_contains "inconsistent summary reports causal error" \
-  "State: inconsistent: recorded locked state disagrees with APFS state" \
+  "INCONSISTENT: recorded locked state disagrees with APFS state" \
   "$inconsistent_summary"
 
 missing_plaintext_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never inconsistent_missing_plaintext)
 check_contains "inconsistent unlocked summary names missing plaintext" \
-  "State: inconsistent: plaintext recovery material is missing" \
+  "INCONSISTENT: plaintext recovery material is missing" \
   "$missing_plaintext_summary"
 
 unmounted_missing_plaintext_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never inconsistent_unmounted_missing_plaintext)
 check_contains \
   "inconsistent unmounted unlocked summary names missing plaintext" \
-  "State: inconsistent: plaintext recovery material is missing" \
+  "INCONSISTENT: plaintext recovery material is missing" \
   "$unmounted_missing_plaintext_summary"
 
 missing_ciphertext_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never inconsistent_missing_ciphertext)
 check_contains "inconsistent locked summary names missing ciphertext" \
-  "State: inconsistent: time-lock ciphertext is missing" \
+  "INCONSISTENT: time-lock ciphertext is missing" \
   "$missing_ciphertext_summary"
 
 missing_hash_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never inconsistent_missing_hash)
 check_contains "inconsistent locked summary names missing hash" \
-  "State: inconsistent: recovery hash is missing" \
+  "INCONSISTENT: recovery hash is missing" \
   "$missing_hash_summary"
 
 retained_plaintext_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never inconsistent_retained_plaintext)
 check_contains "inconsistent locked summary names retained plaintext" \
-  "State: inconsistent: plaintext recovery material is retained while recorded locked" \
+  "INCONSISTENT: plaintext recovery material is retained while recorded locked" \
   "$retained_plaintext_summary"
 
 coloured_inconsistency=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 always inconsistent_missing_plaintext)
-check_contains "inconsistent summary colours only state label red" \
-  "${esc}[31mState:${esc}[0m inconsistent: plaintext recovery material is missing" \
+check_contains "inconsistent summary colours state word red" \
+  "${esc}[31mINCONSISTENT${esc}[0m: plaintext recovery material is missing" \
   "$coloured_inconsistency"
 check_not_contains "inconsistent summary keeps causal value plain" \
   "${esc}[31minconsistent" "$coloured_inconsistency"
@@ -599,6 +606,27 @@ check_contains "disabled summary names disabled hooks" \
 empty_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
   "$VL" __render_output 0 never none)
 check_contains "empty summary names absent hooks" "Hooks: none" "$empty_summary"
+
+for preserved_fixture in preserved_lock preserved_repair; do
+  preserved_summary=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+    "$VL" __render_output 0 never "$preserved_fixture" 2>&1 || true)
+  check_contains "$preserved_fixture shows distinct request" \
+    'Requested: 2026-' "$preserved_summary"
+  check_contains "$preserved_fixture shows effective preserved deadline" \
+    'Preserved: 2099-' "$preserved_summary"
+  check_count "$preserved_fixture prints effective deadline once" 1 \
+    '2099-' "$preserved_summary"
+  check_not_contains "$preserved_fixture hides technical request epoch" \
+    '1788220800' "$preserved_summary"
+  check_not_contains "$preserved_fixture hides technical preserved round" \
+    '792731235' "$preserved_summary"
+  preserved_verbose=$(VAULTLOCK_TEST_FAKE_SYSTEM=1 \
+    "$VL" __render_output 1 never "$preserved_fixture" 2>&1 || true)
+  check_contains "$preserved_fixture verbose includes requested epoch" \
+    'Requested epoch: 1788220800' "$preserved_verbose"
+  check_contains "$preserved_fixture verbose includes preserved epoch" \
+    'Preserved epoch: 4070999040' "$preserved_verbose"
+done
 
 hook_test_root=$(mktemp -d "/tmp/vaultlock hooks.XXXXXX")
 trap 'rm -rf "$hook_test_root"' EXIT

@@ -68,6 +68,7 @@ OPTION_OPERANDS=""
 COLOR_STDOUT=false
 COLOR_STDERR=false
 COLOR_RESET=$'\033[0m'
+COLOR_BOLD=$'\033[1m'
 COLOR_CYAN=$'\033[36m'
 COLOR_DIM=$'\033[2m'
 COLOR_YELLOW=$'\033[33m'
@@ -358,9 +359,42 @@ print_stderr_style() { # escape text
   presentation_stderr styled "$text"
 }
 
-print_heading() { print_stdout_style "$COLOR_CYAN" "$1"; }
+print_heading() { print_stdout_style "$COLOR_BOLD" "$1"; }
 print_label() { print_stdout_style "$COLOR_DIM" "$1"; }
 print_success() { print_stdout_style "$COLOR_GREEN" "$1"; }
+print_field_prefix() { # width label
+  local width=$1 label=$2 padding
+  printf -v padding '%*s' "$((width - ${#label} - 1))" ''
+  presentation_stdout field '  '
+  print_label "$label:"
+  presentation_stdout field "$padding "
+}
+
+print_field() { # width label value
+  print_field_prefix "$1" "$2"
+  note "$3"
+}
+
+print_status_word() { # state
+  local style
+  case "$1" in
+    LOCKED) style=$COLOR_CYAN ;;
+    UNLOCKED|READY) style=$COLOR_GREEN ;;
+    REPAIRABLE) style=$COLOR_YELLOW ;;
+    *) style=$COLOR_RED ;;
+  esac
+  print_stdout_style "$style" "$1"
+}
+
+runtime_status_word() {
+  case "$RUNTIME_ASSESSMENT" in
+    usable) printf 'UNLOCKED\n' ;;
+    'securely locked') printf 'LOCKED\n' ;;
+    repairable:*) printf 'REPAIRABLE\n' ;;
+    *) printf 'INCONSISTENT\n' ;;
+  esac
+}
+
 print_warning() { # message
   local text prefix=vaultlock:
   [[ "$COLOR_STDERR" != true ]] \
@@ -916,68 +950,174 @@ classify_runtime_state() {
   fi
 }
 
-render_runtime_summary_body() {
-  local actual_mount=unknown plaintext=absent ciphertext=absent hash=absent
+runtime_mount_text() {
+  local actual_mount=unknown
+  if [[ "$SNAPSHOT_APFS_INSPECTED" == true ]]; then
+    actual_mount=${SNAPSHOT_ACTUAL_MOUNT_POINT:-not mounted}
+  fi
+  printf 'expected %s, actual %s\n' "$MOUNT_POINT" "$actual_mount"
+}
 
-  if [[ "$SNAPSHOT_INIT_ABSENT" == "true" ]]; then
-    note "Recorded: absent (init preflight)"
-  elif [[ "$SNAPSHOT_STATE_VALID" == "true" ]]; then
-    if [[ "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
-      note "Recorded: locked until $SNAPSHOT_DEADLINE"
-    else
-      note "Recorded: unlocked"
+runtime_apfs_problems() {
+  [[ "$SNAPSHOT_APFS_INSPECTED" == true ]] || return 0
+  if [[ "$SNAPSHOT_APFS_LOCKED" == true \
+      && "$SNAPSHOT_APFS_MOUNTED" == true ]]; then
+    printf 'APFS volume reports locked while mounted\n'
+  fi
+  if [[ "$SNAPSHOT_APFS_MOUNTED" == true \
+      && "$SNAPSHOT_ACTUAL_MOUNT_POINT" != "$MOUNT_POINT" ]]; then
+    printf 'APFS volume is mounted at an unexpected path\n'
+  fi
+  [[ "$SNAPSHOT_STATE_VALID" == true ]] || return 0
+  if [[ "$SNAPSHOT_ACTUAL_UUID" != unknown \
+      && "$SNAPSHOT_ACTUAL_UUID" != "$SNAPSHOT_EXPECTED_UUID" ]]; then
+    printf 'volume UUID mismatch: expected %s, actual %s\n' \
+      "$SNAPSHOT_EXPECTED_UUID" "$SNAPSHOT_ACTUAL_UUID"
+  fi
+  if [[ "$SNAPSHOT_RECORDED_LOCKED" == true \
+      && "$SNAPSHOT_APFS_LOCKED" == false ]]; then
+    printf 'recorded locked state disagrees with APFS state\n'
+  elif [[ "$SNAPSHOT_RECORDED_LOCKED" == false \
+      && "$SNAPSHOT_APFS_LOCKED" == true ]]; then
+    printf 'recorded unlocked state disagrees with APFS state\n'
+  fi
+}
+
+runtime_recovery_problems() {
+  [[ "$SNAPSHOT_STATE_VALID" == true ]] || return 0
+  if [[ "$SNAPSHOT_RECORDED_LOCKED" == true ]]; then
+    if [[ "$SNAPSHOT_CIPHERTEXT_PRESENT" != true ]]; then
+      printf 'time-lock ciphertext is missing\n'
+    fi
+    if [[ "$SNAPSHOT_HASH_PRESENT" != true ]]; then
+      printf 'recovery hash is missing\n'
+    fi
+    if [[ "$SNAPSHOT_PLAINTEXT_PRESENT" == true ]]; then
+      printf 'plaintext recovery material is retained while recorded locked\n'
     fi
   else
-    note "Recorded: unknown ($SNAPSHOT_ERROR)"
-  fi
-
-  if [[ "$SNAPSHOT_INIT_ABSENT" == "true" ]]; then
-    note "APFS: absent (no volume named $VOLUME)"
-  elif [[ "$SNAPSHOT_APFS_VALID" == "true" ]]; then
-    if [[ "$SNAPSHOT_APFS_LOCKED" == "true" ]]; then
-      note "APFS: locked (UUID $SNAPSHOT_ACTUAL_UUID, device $SNAPSHOT_DEVICE)"
-    else
-      note "APFS: unlocked (UUID $SNAPSHOT_ACTUAL_UUID, device $SNAPSHOT_DEVICE)"
+    if [[ "$SNAPSHOT_PLAINTEXT_PRESENT" != true ]]; then
+      printf 'plaintext recovery material is missing\n'
     fi
-  elif [[ "$SNAPSHOT_APFS_INSPECTED" == "true" ]]; then
-    note "APFS: unknown ($SNAPSHOT_ERROR)"
-  elif [[ "$SNAPSHOT_STATE_VALID" == "true" ]]; then
-    note "APFS: unknown ($SNAPSHOT_ERROR)"
-  else
-    note "APFS: unknown (not inspected: invalid state snapshot)"
-  fi
-
-  if [[ "$SNAPSHOT_APFS_INSPECTED" == "true" ]]; then
-    if [[ -n "$SNAPSHOT_ACTUAL_MOUNT_POINT" ]]; then
-      actual_mount=$SNAPSHOT_ACTUAL_MOUNT_POINT
-    else
-      actual_mount="not mounted"
+    if [[ "$SNAPSHOT_APFS_LOCKED" == true \
+        && "$SNAPSHOT_HASH_PRESENT" != true ]]; then
+      printf 'recovery hash is missing\n'
     fi
   fi
-  note "Mount: expected $MOUNT_POINT, actual $actual_mount"
+}
 
-  [[ "$SNAPSHOT_PLAINTEXT_PRESENT" == "true" ]] && plaintext=present
-  [[ "$SNAPSHOT_CIPHERTEXT_PRESENT" == "true" ]] && ciphertext=present
-  [[ "$SNAPSHOT_HASH_PRESENT" == "true" ]] && hash=present
-  note "Recovery: plaintext $plaintext, ciphertext $ciphertext, hash $hash"
+render_runtime_diagnosis() { # width
+  local width=$1 reason repair problems seen=$'\n' label=Reason
   case "$RUNTIME_ASSESSMENT" in
-    usable)
-      print_stdout_style "$COLOR_GREEN" "Assessment:"
+    repairable:*)
+      if [[ "$SNAPSHOT_APFS_LOCKED" == true ]]; then
+        reason='recorded unlocked, but the APFS volume is locked'
+      else
+        reason='the unlocked APFS volume is not mounted'
+      fi
+      repair=${RUNTIME_ASSESSMENT#repairable: run }
+      print_field "$width" Reason "$reason"
+      print_field "$width" Repair "$repair"
       ;;
-    "securely locked"|repairable:*)
-      print_stdout_style "$COLOR_YELLOW" "Assessment:"
-      ;;
-    *)
-      print_stdout_style "$COLOR_RED" "Assessment:"
+    inconsistent)
+      problems=$(runtime_inconsistency_text
+        runtime_apfs_problems
+        runtime_recovery_problems)
+      while IFS= read -r reason; do
+        [[ -n "$reason" ]] || continue
+        [[ "$seen" != *$'\n'"$reason"$'\n'* ]] || continue
+        print_field "$width" "$label" "$reason"
+        seen+="$reason"$'\n'
+        label=Also
+      done <<< "$problems"
+      print_field "$width" Next 'vaultlock status -v (inspect recorded and APFS state)'
       ;;
   esac
-  printf ' %s\n' "$RUNTIME_ASSESSMENT"
+}
 
-  if [[ "$SNAPSHOT_STATE_VALID" == "true" \
-      && "$SNAPSHOT_RECORDED_LOCKED" == "true" ]]; then
-    note "remaining: $(remaining_human "$SNAPSHOT_DEADLINE_EPOCH")"
-    note "drand round: target $SNAPSHOT_ROUND, current $(current_round)"
-    note "when the deadline passes: vaultlock unlock (needs internet)"
+render_runtime_detail() { # width now
+  local width=$1 now=$2 plaintext=absent ciphertext=absent hash=absent
+  local recorded apfs
+
+  if [[ "${SNAPSHOT_INIT_ABSENT:-false}" == true ]]; then
+    recorded='absent (init preflight)'
+    apfs="absent (no volume named $VOLUME)"
+  else
+    if [[ "$SNAPSHOT_STATE_VALID" == true ]]; then
+      if [[ "$SNAPSHOT_RECORDED_LOCKED" == true ]]; then
+        recorded="locked until $SNAPSHOT_DEADLINE"
+      else
+        recorded=unlocked
+      fi
+    else
+      recorded="unknown ($SNAPSHOT_ERROR)"
+    fi
+    if [[ "$SNAPSHOT_APFS_VALID" == true ]]; then
+      if [[ "$SNAPSHOT_APFS_LOCKED" == true ]]; then
+        apfs=locked
+      else
+        apfs=unlocked
+      fi
+      apfs="$apfs (UUID $SNAPSHOT_ACTUAL_UUID, device $SNAPSHOT_DEVICE)"
+    elif [[ "$SNAPSHOT_APFS_INSPECTED" == true \
+        || "$SNAPSHOT_STATE_VALID" == true ]]; then
+      apfs="unknown ($SNAPSHOT_ERROR)"
+    else
+      apfs='unknown (not inspected: invalid state snapshot)'
+    fi
+  fi
+  print_field "$width" Recorded "$recorded"
+  print_field "$width" APFS "$apfs"
+  print_field "$width" 'Expected UUID' "$SNAPSHOT_EXPECTED_UUID"
+  print_field "$width" 'Actual UUID' "$SNAPSHOT_ACTUAL_UUID"
+  print_field "$width" Device "$SNAPSHOT_DEVICE"
+  [[ "$SNAPSHOT_PLAINTEXT_PRESENT" == true ]] && plaintext=present
+  [[ "$SNAPSHOT_CIPHERTEXT_PRESENT" == true ]] && ciphertext=present
+  [[ "$SNAPSHOT_HASH_PRESENT" == true ]] && hash=present
+  print_field "$width" Recovery \
+    "plaintext $plaintext, ciphertext $ciphertext, hash $hash"
+  print_field "$width" Assessment "$RUNTIME_ASSESSMENT"
+  if [[ "$SNAPSHOT_STATE_VALID" == true \
+      && "$SNAPSHOT_RECORDED_LOCKED" == true ]]; then
+    print_field "$width" 'Deadline epoch' "$SNAPSHOT_DEADLINE_EPOCH"
+    print_field "$width" 'Drand round' \
+      "target $SNAPSHOT_ROUND, current $(round_for_epoch "$now")"
+  fi
+}
+
+render_runtime_summary_body() {
+  local now width=6 state
+  now=$(/bin/date +%s)
+  state=$(runtime_status_word)
+  if [[ "$SNAPSHOT_STATE_VALID" == true \
+      && "$SNAPSHOT_RECORDED_LOCKED" == true ]]; then
+    width=10
+  elif [[ "$RUNTIME_ASSESSMENT" == repairable:* ]]; then
+    width=7
+  fi
+  if (( OPTION_VERBOSITY > 0 )); then
+    width=14
+    if [[ "$SNAPSHOT_STATE_VALID" == true \
+        && "$SNAPSHOT_RECORDED_LOCKED" == true ]]; then
+      width=15
+    fi
+  fi
+  print_heading "$VOLUME:"
+  presentation_stdout field ' '
+  print_status_word "$state"
+  note ''
+  if [[ "$SNAPSHOT_STATE_VALID" == true \
+      && "$SNAPSHOT_RECORDED_LOCKED" == true ]]; then
+    print_field "$width" 'Unlock at' \
+      "$(format_deadline "$SNAPSHOT_DEADLINE_EPOCH" "$now")"
+  fi
+  print_field "$width" Mount "$(runtime_mount_text)"
+  if [[ "$state" == LOCKED ]]; then
+    print_field "$width" Next 'vaultlock unlock (needs internet)'
+  fi
+  render_runtime_diagnosis "$width"
+  if (( OPTION_VERBOSITY > 0 )); then
+    render_runtime_detail "$width" "$now"
   fi
 }
 
@@ -2185,65 +2325,101 @@ runtime_inconsistency_text() {
   fi
 }
 
-render_current_state() {
-  local state style
+render_current_state() { # width
+  local width=$1 state suffix=''
 
-  if [[ "$SNAPSHOT_INIT_ABSENT" == "true" ]]; then
-    state="absent and ready for initialization"
-    style=$COLOR_GREEN
-  elif [[ "$RUNTIME_ASSESSMENT" == "usable" ]]; then
-    state="unlocked and mounted at $MOUNT_POINT"
-    style=$COLOR_GREEN
-  elif [[ "$RUNTIME_ASSESSMENT" == "securely locked" ]]; then
-    state="securely locked until $SNAPSHOT_DEADLINE"
-    style=$COLOR_YELLOW
-  elif [[ "$RUNTIME_ASSESSMENT" == repairable:* ]]; then
-    state=$RUNTIME_ASSESSMENT
-    style=$COLOR_YELLOW
+  if [[ "${SNAPSHOT_INIT_ABSENT:-false}" == true ]]; then
+    state=READY
+    suffix=': absent and ready for initialisation'
   else
-    state="inconsistent: $(runtime_inconsistency_text)"
-    style=$COLOR_RED
+    state=$(runtime_status_word)
+    case "$state" in
+      UNLOCKED) suffix=", mounted at $MOUNT_POINT" ;;
+      REPAIRABLE) suffix=": ${RUNTIME_ASSESSMENT#repairable: }" ;;
+      LOCKED) ;;
+      *) suffix=": $(runtime_inconsistency_text)" ;;
+    esac
   fi
-
-  printf '  '
-  print_stdout_style "$style" "State:"
-  printf ' %s\n' "$state"
+  print_field_prefix "$width" State
+  print_status_word "$state"
+  note "$suffix"
 }
 
-render_request_metadata() {
-  local line label value
+render_request_metadata() { # width now
+  local width=$1 now=$2 line label value epoch
 
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
-    if [[ "$line" == *:* ]]; then
-      label=${line%%:*}:
-      value=${line#*:}
-      printf '  '
-      print_label "$label"
-      printf '%s\n' "$value"
-    else
-      printf '  '
-      print_label "$line"
-      printf '\n'
-    fi
+    label=${line%%:*}
+    value=${line#*: }
+    case "$label" in
+      'Requested deadline')
+        epoch=${LOCK_REQUEST_DEADLINE_EPOCH:-$PLAN_CONTEXT_DEADLINE_EPOCH}
+        if (( OPTION_VERBOSITY > 0 )) \
+            || [[ "$PLAN_REQUEST_TEXT" == *'Existing locked deadline preserved:'* \
+              && "$epoch" != "$SNAPSHOT_DEADLINE_EPOCH" ]]; then
+          print_field "$width" Requested "$(format_deadline "$epoch" "$now")"
+        fi
+        if (( OPTION_VERBOSITY > 0 )); then
+          print_field "$width" 'Requested epoch' "$epoch"
+        fi
+        ;;
+      'Resolved drand round')
+        if (( OPTION_VERBOSITY > 0 )); then
+          print_field "$width" 'Requested round' "$value"
+        fi
+        ;;
+      'Existing locked deadline preserved')
+        print_field "$width" Preserved \
+          "$(format_deadline "$SNAPSHOT_DEADLINE_EPOCH" "$now")"
+        if (( OPTION_VERBOSITY > 0 )); then
+          print_field "$width" 'Preserved epoch' "$SNAPSHOT_DEADLINE_EPOCH"
+          print_field "$width" 'Preserved round' "$SNAPSHOT_ROUND"
+        fi
+        ;;
+      *) print_field "$width" "$label" "$value" ;;
+    esac
   done <<< "$PLAN_REQUEST_TEXT"
 }
 
 render_plan_summary() { # command
-  local command=$1 heading
+  local command=$1 heading target now width=7 show_unlock=false
+  now=$(/bin/date +%s)
+  target=$PLAN_TARGET_TEXT
 
   case "$command" in
-    init) heading="Initialize" ;;
-    adopt) heading="Adopt into" ;;
-    lock) heading="Lock" ;;
-    unlock) heading="Unlock" ;;
+    init)
+      heading=Initialise
+      target=${target/initialized/initialised}
+      ;;
+    adopt) heading='Adopt into' ;;
+    lock)
+      heading=Lock
+      width=10
+      if [[ "$target" == 'locked at the resolved deadline' ]]; then
+        target='lock now'
+        show_unlock=true
+      elif [[ "$SNAPSHOT_DEADLINE" != null \
+          && "$target" == *"$SNAPSHOT_DEADLINE"* ]]; then
+        target=${target%" until $SNAPSHOT_DEADLINE"}
+      fi
+      ;;
+    unlock) heading=Unlock ;;
     *) die "unknown summary command: $command" ;;
   esac
+  if [[ -n "$PLAN_REQUEST_TEXT" ]]; then
+    width=10
+    (( OPTION_VERBOSITY == 0 )) || width=16
+  fi
   print_heading "$heading $VOLUME"
-  printf '\n'
-  render_current_state
-  printf '  Target: %s\n' "$PLAN_TARGET_TEXT"
-  [[ -z "$PLAN_REQUEST_TEXT" ]] || render_request_metadata
+  note ''
+  render_current_state "$width"
+  print_field "$width" Target "$target"
+  if [[ "$show_unlock" == true ]]; then
+    print_field "$width" 'Unlock at' \
+      "$(format_deadline "$PLAN_CONTEXT_DEADLINE_EPOCH" "$now")"
+  fi
+  [[ -z "$PLAN_REQUEST_TEXT" ]] || render_request_metadata "$width" "$now"
 }
 
 render_hook_summary() {
@@ -2251,7 +2427,9 @@ render_hook_summary() {
 
   for ((index=0; index<${#PLAN_OPERATION_IDS[@]}; index++)); do
     if [[ "${PLAN_OPERATION_IDS[$index]}" == hooks_disabled ]]; then
-      printf '\nHooks: disabled\n'
+      note ''
+      print_heading 'Hooks:'
+      note ' disabled'
       return 0
     fi
   done
@@ -2261,7 +2439,9 @@ render_hook_summary() {
     case "$operation_id" in
       hook|deferred_hook_discovery)
         if [[ "$has_hooks" == false ]]; then
-          printf '\nHooks:\n'
+          note ''
+          print_heading 'Hooks:'
+          note ''
           has_hooks=true
         fi
         phase=${PLAN_HOOK_PHASES[$index]}
@@ -2277,7 +2457,11 @@ render_hook_summary() {
         ;;
     esac
   done
-  [[ "$has_hooks" == true ]] || printf '\nHooks: none\n'
+  if [[ "$has_hooks" != true ]]; then
+    note ''
+    print_heading 'Hooks:'
+    note ' none'
+  fi
 }
 
 render_plan_actions() {
@@ -7323,6 +7507,7 @@ cmd_status() {
 dispatch_status() {
   local argument
   OPTION_COLOR=auto
+  OPTION_VERBOSITY=0
   resolve_colour "$OPTION_COLOR"
   while [[ $# -gt 0 ]]; do
     argument=$1
@@ -7333,10 +7518,11 @@ dispatch_status() {
         resolve_colour "$OPTION_COLOR"
         ;;
       --color=*) die_usage "invalid colour mode: ${argument#--color=}" ;;
-      -v|--verbose|-vv|--very-verbose)
-        die_usage "usage: vaultlock status [--color=auto|always|never]"
+      -v|--verbose)
+        (( OPTION_VERBOSITY >= 1 )) || OPTION_VERBOSITY=1
         ;;
-      *) die_usage "usage: vaultlock status [--color=auto|always|never]" ;;
+      -vv|--very-verbose) OPTION_VERBOSITY=2 ;;
+      *) die_usage "usage: vaultlock status [-v|-vv] [--color=auto|always|never]" ;;
     esac
   done
   cmd_status
@@ -7602,6 +7788,25 @@ case "${1:-}" in
       secure_noop)
         plan_add verify_secure_target "Verify secure target"
         PLAN_TARGET_TEXT="securely locked without changes"
+        ;;
+      preserved_lock|preserved_repair)
+        RUNTIME_ASSESSMENT='securely locked'
+        SNAPSHOT_RECORDED_LOCKED=true
+        SNAPSHOT_DEADLINE=2099-01-02T02:04:00+0100
+        SNAPSHOT_DEADLINE_EPOCH=4070999040
+        SNAPSHOT_ROUND=792731235
+        LOCK_REQUEST_DEADLINE_EPOCH=1788220800
+        PLAN_CONTEXT_DEADLINE=$SNAPSHOT_DEADLINE
+        PLAN_CONTEXT_DEADLINE_EPOCH=$SNAPSHOT_DEADLINE_EPOCH
+        PLAN_CONTEXT_ROUND=$SNAPSHOT_ROUND
+        PLAN_REQUEST_TEXT=$'Requested deadline: 2026-09-01T02:00:00+0200 (epoch 1788220800)\nResolved drand round: target 31805812, current 1\nExisting locked deadline preserved: 2099-01-02T02:04:00+0100, existing drand round 792731235'
+        if [[ "$4" == preserved_repair ]]; then
+          plan_add remove_plaintext 'Remove retained keychain recovery material'
+          PLAN_TARGET_TEXT="remove retained keychain recovery material and preserve the existing lock until $SNAPSHOT_DEADLINE"
+        else
+          PLAN_TARGET_TEXT="already securely locked until $SNAPSHOT_DEADLINE"
+        fi
+        plan_add verify_secure_target 'Verify secure target'
         ;;
       hooks)
         plan_add_hook pre-lock global "/tmp/first hook"

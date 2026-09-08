@@ -3723,16 +3723,21 @@ write_recovery_state() { # plaintext ciphertext hash
   if [[ "$hash" == "true" ]]; then : > "$state_dir/passphrase.sha256"; fi
 }
 
+status_fields() {
+  sed -E 's/^  //; s/:[ ]+/: /'
+}
+
 assert_status_snapshot() { # description recorded apfs mount recovery assessment
   local description=$1 recorded=$2 apfs=$3 mount=$4 recovery=$5 assessment=$6
-  local output status diskutil_calls
+  local output status diskutil_calls compact state_word
   : > "$action_log"
-  if output=$(run_vaultlock status 2>&1); then
+  if output=$(run_vaultlock status -v 2>&1); then
     status=0
   else
     status=$?
   fi
   check "$description exits successfully" 0 "$status"
+  output=$(printf '%s\n' "$output" | status_fields)
   check_line "$description recorded line" "Recorded: $recorded" "$output"
   check_line "$description APFS line" "APFS: $apfs" "$output"
   check_line "$description mount line" "Mount: $mount" "$output"
@@ -3743,17 +3748,43 @@ assert_status_snapshot() { # description recorded apfs mount recovery assessment
   check "$description reads APFS plist exactly once" 1 "$diskutil_calls"
   check "$description performs no other system operation" \
     'diskutil info -plist UUID-123' "$(< "$action_log")"
+  compact=$(run_vaultlock status --color=never)
+  case "$assessment" in
+    usable) state_word=UNLOCKED ;;
+    'securely locked') state_word=LOCKED ;;
+    repairable:*) state_word=REPAIRABLE ;;
+    *) state_word=INCONSISTENT ;;
+  esac
+  check_line "$description compact header reports actual state" \
+    "vault: $state_word" "$compact"
+  check_not_contains "$description compact output omits technical recovery" \
+    'Recovery:' "$compact"
+  if [[ "$state_word" == REPAIRABLE ]]; then
+    check_contains "$description compact output gives repair command" \
+      "Repair: ${assessment#repairable: run }" "$compact"
+    check_contains "$description compact output gives cause" 'Reason:' "$compact"
+  elif [[ "$state_word" == INCONSISTENT ]]; then
+    check_contains "$description compact output gives cause" 'Reason:' "$compact"
+    check_contains "$description compact output gives inspection command" \
+      'vaultlock status -v' "$compact"
+  elif [[ "$state_word" == UNLOCKED ]]; then
+    check_not_contains "$description compact output omits unlock deadline" \
+      'Unlock at:' "$compact"
+    check_not_contains "$description compact output omits next action" \
+      'Next:' "$compact"
+  fi
 }
 
 assert_invalid_snapshot() { # description
   local description=$1 output status
   : > "$action_log"
-  if output=$(run_vaultlock status 2>&1); then
+  if output=$(run_vaultlock status -v 2>&1); then
     status=0
   else
     status=$?
   fi
   check "$description exits successfully" 0 "$status"
+  output=$(printf '%s\n' "$output" | status_fields)
   check_line "$description recorded line" \
     'Recorded: unknown (state file fields are missing or malformed)' "$output"
   check_line "$description APFS line" \
@@ -3765,6 +3796,11 @@ assert_invalid_snapshot() { # description
   check_line "$description assessment line" \
     'Assessment: inconsistent' "$output"
   check_empty "$description performs no system operation" "$action_log"
+  output=$(run_vaultlock status --color=never)
+  check_line "$description compact header is inconsistent" 'vault: INCONSISTENT' "$output"
+  check_contains "$description compact output retains malformed-state diagnosis" \
+    'state file fields are missing or malformed' "$output"
+  check_empty "$description compact output performs no system operation" "$action_log"
 }
 
 write_json_state false null null null UUID-123
@@ -3794,8 +3830,8 @@ assert_status_snapshot "usable unlocked vault" \
   usable
 status_esc=$'\033'
 usable_colour_output=$(run_vaultlock status --color=always)
-check_line "usable status colours only assessment label green" \
-  "${status_esc}[32mAssessment:${status_esc}[0m usable" \
+check_contains "usable status colours state word green" \
+  "${status_esc}[32mUNLOCKED${status_esc}[0m" \
   "$usable_colour_output"
 
 write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
@@ -3809,16 +3845,31 @@ assert_status_snapshot "securely locked vault" \
   'plaintext absent, ciphertext present, hash present' \
   'securely locked'
 locked_output=$(run_vaultlock status)
-check_contains "locked status preserves remaining output" \
-  'remaining: ' "$locked_output"
-check_contains "locked status preserves target round" \
-  'drand round: target 792731235, current ' "$locked_output"
-check_line "locked status preserves unlock instruction" \
-  'when the deadline passes: vaultlock unlock (needs internet)' "$locked_output"
+check_line "locked compact status names volume and state" 'vault: LOCKED' "$locked_output"
+check_contains "locked compact status formats local deadline" 'Unlock at: 2099-01-02 02:04:00 +0100 (in ' "$locked_output"
+check_contains "locked compact status makes absent mount explicit" "Mount:     expected $mount_point, actual not mounted" "$locked_output"
+check_contains "locked compact status keeps unlock instruction" 'Next:      vaultlock unlock (needs internet)' "$locked_output"
+check_not_contains "locked compact status hides raw epoch" '4070999040' "$locked_output"
+check_not_contains "locked compact status hides raw round" '792731235' "$locked_output"
+check_not_contains "locked compact status hides recovery detail" 'Recovery:' "$locked_output"
 locked_colour_output=$(run_vaultlock status --color=always)
-check_line "locked status colours only assessment label yellow" \
-  "${status_esc}[33mAssessment:${status_esc}[0m securely locked" \
-  "$locked_colour_output"
+check_contains "locked status colours state word cyan" \
+  "${status_esc}[36mLOCKED${status_esc}[0m" "$locked_colour_output"
+locked_plain_from_colour=$(printf '%s\n' "$locked_colour_output" | sed -E $'s/\033\[[0-9;]*m//g')
+check "forced colour preserves compact content" "$locked_output" "$locked_plain_from_colour"
+for status_verbosity in -v --verbose -vv --very-verbose; do
+  locked_verbose=$(run_vaultlock status "$status_verbosity")
+  check_contains "status $status_verbosity exposes expected UUID" 'Expected UUID:' "$locked_verbose"
+  check_contains "status $status_verbosity exposes actual UUID" 'Actual UUID:' "$locked_verbose"
+  check_contains "status $status_verbosity exposes APFS device" 'Device:' "$locked_verbose"
+  check_contains "status $status_verbosity exposes raw epoch" '4070999040' "$locked_verbose"
+  check_contains "status $status_verbosity exposes target round" 'target 792731235, current ' "$locked_verbose"
+  check_contains "status $status_verbosity exposes recovery files" 'plaintext absent, ciphertext present, hash present' "$locked_verbose"
+done
+locked_maximum=$(run_vaultlock status -vv -v --verbose)
+check "status maximum verbosity wins" \
+  "$(printf '%s\n' "$locked_verbose" | sed -E 's/current [0-9]+/current ROUND/; s/\(in [^)]+\)/(in DURATION)/')" \
+  "$(printf '%s\n' "$locked_maximum" | sed -E 's/current [0-9]+/current ROUND/; s/\(in [^)]+\)/(in DURATION)/')"
 
 write_json_state false null null null UUID-123
 write_apfs_state true false UUID-123 disk9s1
@@ -3830,8 +3881,8 @@ assert_status_snapshot "recorded unlock repair" \
   'plaintext present, ciphertext absent, hash present' \
   'repairable: run vaultlock unlock'
 repair_colour_output=$(run_vaultlock status --color=always)
-check_line "repair status colours only assessment label yellow" \
-  "${status_esc}[33mAssessment:${status_esc}[0m repairable: run vaultlock unlock" \
+check_contains "repair status colours state word yellow" \
+  "${status_esc}[33mREPAIRABLE${status_esc}[0m" \
   "$repair_colour_output"
 
 write_json_state false null null null UUID-123
@@ -3854,8 +3905,8 @@ assert_status_snapshot "recorded locked but APFS unlocked" \
   'plaintext absent, ciphertext present, hash present' \
   inconsistent
 inconsistent_colour_output=$(run_vaultlock status --color=always)
-check_line "inconsistent status colours only assessment label red" \
-  "${status_esc}[31mAssessment:${status_esc}[0m inconsistent" \
+check_contains "inconsistent status colours state word red" \
+  "${status_esc}[31mINCONSISTENT${status_esc}[0m" \
   "$inconsistent_colour_output"
 
 write_apfs_state true true UUID-123 disk9s1
@@ -3998,17 +4049,17 @@ assert_invalid_snapshot "malformed JSON"
 write_json_state false null null null UUID-123
 chmod 000 "$state_dir/state.json"
 : > "$action_log"
-if output=$(run_vaultlock status 2>&1); then
+if output=$(run_vaultlock status -v 2>&1); then
   status=0
 else
   status=$?
 fi
 chmod 600 "$state_dir/state.json"
 check "unreadable state exits successfully" 0 "$status"
-check_line "unreadable state reports boundary failure" \
-  'Recorded: unknown (state file is unreadable)' "$output"
-check_line "unreadable state is inconsistent" \
-  'Assessment: inconsistent' "$output"
+check_contains "unreadable state reports boundary failure" \
+  'unknown (state file is unreadable)' "$output"
+check_contains "unreadable state is inconsistent" \
+  'INCONSISTENT' "$output"
 check_empty "unreadable state performs no system operation" "$action_log"
 
 write_json_state false null null null UUID-123
@@ -4031,8 +4082,50 @@ write_apfs_state false true UUID-123 disk9s1
 printf '%s\n' "$test_root/Volumes/vaultXtest" \
   > "$apfs_state/mount_point"
 output=$(run_vaultlock status)
-check_line "mount point matching is literal" \
-  'Assessment: inconsistent' "$output"
+check_contains "mount point matching is literal" \
+  'INCONSISTENT' "$output"
+
+write_json_state true 2099-01-02T03:04:00+0100 4070999040 792731235 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+rm -f "$apfs_state/mount_point"
+write_recovery_state false false false
+combined_recovery_output=$(run_vaultlock status --color=never)
+check_contains "combined recovery faults include missing ciphertext by default" \
+  'time-lock ciphertext is missing' "$combined_recovery_output"
+check_contains "combined recovery faults include missing hash by default" \
+  'recovery hash is missing' "$combined_recovery_output"
+
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-OTHER disk9s1
+write_recovery_state false false false
+combined_identity_output=$(run_vaultlock status --color=never)
+check_contains "combined identity faults include UUID mismatch by default" \
+  'volume UUID mismatch: expected UUID-123, actual UUID-OTHER' "$combined_identity_output"
+check_contains "combined identity faults include missing plaintext by default" \
+  'plaintext recovery material is missing' "$combined_identity_output"
+
+write_json_state true unsupported 999999999999999999 792731235 UUID-123
+write_apfs_state true false UUID-123 disk9s1
+rm -f "$apfs_state/mount_point"
+write_recovery_state false true true
+unsupported_epoch_output=$(run_vaultlock status --color=never 2>&1)
+check_line "unsupported local epoch preserves assessed locked state" \
+  'vault: LOCKED' "$unsupported_epoch_output"
+check_contains "unsupported local epoch retains numeric deadline" \
+  '999999999999999999' "$unsupported_epoch_output"
+check_contains "unsupported local epoch explains unavailable timestamp" \
+  'local timestamp unavailable' "$unsupported_epoch_output"
+check_not_contains "unsupported local epoch emits no raw date diagnostic" \
+  'date: invalid time' "$unsupported_epoch_output"
+
+write_json_state false null null null UUID-123
+write_apfs_state false true UUID-123 disk9s1
+write_recovery_state true false false
+printf '%s\n' "$test_root/Volumes/vaultXtest" > "$apfs_state/mount_point"
+
+if [[ "${VAULTLOCK_TEST_STATUS_ONLY:-0}" == 1 ]]; then
+  exit "$fail"
+fi
 
 check "lock option order" \
   $'dry_run=true\nyes=true\nhooks=false\nverbosity=0\ncolor=auto\noperands=2:00 +2d' \
@@ -4067,7 +4160,7 @@ reject_options "lock rejects invalid colour" lock --color=sometimes 20h
 reject_options "lock rejects empty colour" lock --color= 20h
 reject_options "lock rejects verbose after operand" lock 20h -v
 
-for status_operand in extra --dry-run -v --verbose -vv --very-verbose; do
+for status_operand in extra --dry-run; do
   : > "$action_log"
   if status_operand_output=$(run_vaultlock status "$status_operand" 2>&1); then
     status_operand_status=0
@@ -4092,8 +4185,8 @@ fi
 check "status accepts colour mode" 0 "$status_colour_status"
 check_contains "status with colour inspects state" \
   'diskutil info -plist UUID-123' "$(< "$action_log")"
-check_line "status never keeps output plain" \
-  'Assessment: inconsistent' "$status_colour_output"
+check_contains "status never keeps output plain" \
+  'INCONSISTENT' "$status_colour_output"
 
 for invalid_status_colour in --color= --color=sometimes; do
   : > "$action_log"
@@ -4468,12 +4561,12 @@ else
   lock_status=$?
 fi
 check "lock dry-run exits successfully" 0 "$lock_status"
-check_line "lock dry-run names target" \
-  '  Target: locked at the resolved deadline' "$lock_plan"
+check_contains "lock dry-run names target" \
+  'Target:          lock now' "$lock_plan"
 check_contains "lock dry-run resolves deadline" \
-  'Requested deadline: ' "$lock_plan"
+  'Requested:' "$lock_plan"
 check_contains "lock dry-run resolves target round" \
-  'Resolved drand round: target ' "$lock_plan"
+  'Requested round: target ' "$lock_plan"
 check_plan_coordination "lock dry-run" "$lock_plan"
 lock_actions=$(sed -n '/^Actions:$/,/^Confirmation:/p' <<< "$lock_plan" \
   | normalize_domain_plan_actions)
@@ -4551,12 +4644,12 @@ check_secret_absent "lock dry-run hides ciphertext" "$lock_plan" "$fake_cipherte
 
 lock_disabled_summary=$(run_vaultlock \
   lock --dry-run --no-hooks --color=never 2:00 +2d)
-check_line "default lock summary names repairable state" \
-  '  State: repairable: run vaultlock unlock' "$lock_disabled_summary"
+check_contains "default lock summary names repairable state" \
+  'REPAIRABLE: run vaultlock unlock' "$lock_disabled_summary"
 check_line "default lock summary names target" \
-  '  Target: locked at the resolved deadline' "$lock_disabled_summary"
-check_contains "default lock summary includes request metadata" \
-  'Requested deadline: ' "$lock_disabled_summary"
+  '  Target:    lock now' "$lock_disabled_summary"
+check_contains "default lock summary includes effective deadline" \
+  'Unlock at:' "$lock_disabled_summary"
 check_line "default lock summary names disabled hooks" \
   'Hooks: disabled' "$lock_disabled_summary"
 check "default lock summary reports dry-run result" \
@@ -4699,14 +4792,14 @@ secure_lock_plan=$(run_vaultlock lock -vv --dry-run --no-hooks 1h)
 check_count "secure lock dry-run disables hooks exactly once" 1 \
   'Hooks disabled by --no-hooks' "$secure_lock_plan"
 check_contains "secure lock retains requested deadline" \
-  'Requested deadline: ' "$secure_lock_plan"
+  'Requested:' "$secure_lock_plan"
 check_contains "secure lock retains requested round" \
-  'Resolved drand round: target ' "$secure_lock_plan"
+  'Requested round: target ' "$secure_lock_plan"
 check_contains "secure lock preserves existing deadline" \
-  'Existing locked deadline preserved: 2099-01-02T03:04:00+0100' \
+  'Preserved:       2099-01-02 02:04:00 +0100' \
   "$secure_lock_plan"
 check_contains "secure lock preserves existing round" \
-  'existing drand round 792731235' "$secure_lock_plan"
+  'Preserved round: 792731235' "$secure_lock_plan"
 
 write_json_state false null null null UUID-123
 write_apfs_state true false UUID-123 disk9s1
@@ -4840,7 +4933,7 @@ for init_preflight_command in security sudo head base64 mktemp; do
       "$init_preflight_command is required" "$init_preflight_output"
   fi
   check_count "init missing $init_preflight_command renders no plan" 0 \
-    'Initialize vault' "$init_preflight_output"
+    'Initialise vault' "$init_preflight_output"
   check_empty "init missing $init_preflight_command performs no mutation" \
     "$mutation_log"
   mv "$fake_bin/$init_preflight_command.missing" \
@@ -4855,7 +4948,7 @@ else
     'USER is missing or unsafe' "$unsafe_user_output"
 fi
 check_count "init unsafe USER renders no plan" 0 \
-  'Initialize vault' "$unsafe_user_output"
+  'Initialise vault' "$unsafe_user_output"
 check_empty "init unsafe USER performs no mutation" "$mutation_log"
 
 : > "$mutation_log"
@@ -4867,7 +4960,7 @@ else
     'keychain service is unsafe' "$unsafe_service_output"
 fi
 check_count "init unsafe service renders no plan" 0 \
-  'Initialize vault' "$unsafe_service_output"
+  'Initialise vault' "$unsafe_service_output"
 check_empty "init unsafe service performs no mutation" "$mutation_log"
 
 rm -f "$apfs_state/keychain_marker"
@@ -4896,7 +4989,7 @@ EOF
 )
 check "init dry-run ordered actions" "$expected_init_actions" "$init_actions"
 check_line "init dry-run reports absent state" \
-  '  State: absent and ready for initialization' "$init_plan"
+  '  State:  READY: absent and ready for initialisation' "$init_plan"
 check_line "init dry-run requires confirmation" \
   '  Required before normal execution changes the vault' "$init_plan"
 check "init dry-run final result" 'Result: no changes made' \
@@ -4908,9 +5001,9 @@ check_empty "init dry-run mutation log" "$mutation_log"
 printf 'dry-run confirmation sentinel\n' > "$confirm_device"
 init_summary=$(run_vaultlock init --dry-run --color=never)
 check_line "default init summary names state" \
-  '  State: absent and ready for initialization' "$init_summary"
+  '  State:  READY: absent and ready for initialisation' "$init_summary"
 check_line "default init summary names target" \
-  "  Target: an initialized, unlocked, mounted vault at $mount_point" \
+  "  Target: an initialised, unlocked, mounted vault at $mount_point" \
   "$init_summary"
 check_line "default init summary names absent hooks" \
   'Hooks: none' "$init_summary"
@@ -9430,7 +9523,7 @@ else
 fi
 check "secure lock no-op exits successfully" 0 "$secure_lock_status"
 check_contains "secure lock no-op preserves deadline" \
-  '2099-01-02T03:04:00+0100' "$secure_lock_output"
+  '2099-01-02 02:04:00 +0100' "$secure_lock_output"
 check "secure lock no-op preserves JSON deadline" \
   '2099-01-02T03:04:00+0100' "$(jq -r .deadline "$state_dir/state.json")"
 check "secure lock no-op preserves JSON round" 792731235 \
