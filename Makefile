@@ -1,54 +1,41 @@
-SHELL := /bin/bash
-REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+SHELL := /bin/sh
+GO ?= go
+BIN_DIR ?= $(HOME)/bin
+VERSION ?= dev
+export VAULTLOCK_BUILD_VERSION = $(value VERSION)
+TARGET_OS := $(shell $(GO) env GOOS)
+TARGET_ARCH := $(shell $(GO) env GOARCH)
+ARCHIVE := build/vaultlock-$(TARGET_OS)-$(TARGET_ARCH).tar.gz
 
-ifeq ($(origin BIN_DIR), undefined)
-VAULTLOCK_INSTALL_BIN_DIR_MODE := default-home
-VAULTLOCK_INSTALL_HOME = $(value HOME)
+ifeq ($(origin BIN_DIR),file)
+export VAULTLOCK_INSTALL_BIN_DIR_MODE := default-home
 else
-VAULTLOCK_INSTALL_BIN_DIR_MODE := explicit
-VAULTLOCK_INSTALL_BIN_DIR = $(value BIN_DIR)
+export VAULTLOCK_INSTALL_BIN_DIR_MODE := explicit
 endif
+export VAULTLOCK_INSTALL_BIN_DIR = $(value BIN_DIR)
 
-export VAULTLOCK_INSTALL_REPO_ROOT := $(REPO_ROOT)
-export VAULTLOCK_INSTALL_BIN_DIR_MODE
-export VAULTLOCK_INSTALL_BIN_DIR
-export VAULTLOCK_INSTALL_HOME
-unexport BIN_DIR
+.PHONY: build dist test test-ci check check-ci lint check-format install clean
 
-.PHONY: test test-ci test-helpers test-deadlines test-cli test-cli-ci test-install check-syntax lint check check-ci install
+build:
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-X github.com/wolph/vaultlock/internal/cli.Version=$$VAULTLOCK_BUILD_VERSION" -o build/vaultlock ./cmd/vaultlock
 
-test: test-helpers test-deadlines test-cli test-install
+dist: build
+	tar -czf $(ARCHIVE) -C build vaultlock
+	cd build && shasum -a 256 $(notdir $(ARCHIVE)) > $(notdir $(ARCHIVE)).sha256
 
-test-ci: test-helpers test-deadlines test-cli-ci test-install
-
-test-helpers:
-	tests/vaultlock-test.sh bin/vaultlock
-
-test-deadlines:
-	tests/vaultlock-time-test.sh bin/vaultlock
-
-test-cli:
-	VAULTLOCK_TEST_CI_ONLY=0 tests/vaultlock-cli-test.sh bin/vaultlock
-
-test-cli-ci:
-	VAULTLOCK_TEST_CI_ONLY=1 tests/vaultlock-cli-test.sh bin/vaultlock
-
-# Nested fixture builds run serially without the outer make jobserver.
-test-install:
-	MAKEFLAGS= MFLAGS= tests/install-test.sh
-
-check-syntax:
-	@for shell_source in bin/vaultlock scripts/install.sh tests/vaultlock-test.sh tests/vaultlock-time-test.sh tests/vaultlock-cli-test.sh tests/install-test.sh; do \
-		printf 'Checking Bash syntax: %s\n' "$$shell_source"; \
-		/bin/bash -n "$$shell_source" || exit $$?; \
-	done
+test test-ci:
+	$(GO) test ./...
 
 lint:
-	shellcheck bin/vaultlock scripts/install.sh tests/vaultlock-test.sh tests/vaultlock-time-test.sh tests/vaultlock-cli-test.sh tests/install-test.sh
+	$(GO) vet ./...
 
-check: test check-syntax lint
+check-format:
+	@test -z "$$(gofmt -l cmd internal)" || { echo 'Go formatting needed' >&2; exit 1; }
 
-check-ci: test-ci check-syntax lint
+check check-ci: test lint check-format build
 
 install: check
-	@scripts/install.sh
+	$(GO) run ./cmd/vaultlock-install build/vaultlock
+
+clean:
+	rm -rf build

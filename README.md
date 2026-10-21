@@ -77,374 +77,283 @@ still be living with at hour 19.
 
 Vaultlock time-locks an encrypted APFS volume against a future drand round.
 At lock time it rotates the APFS passphrase, encrypts the new passphrase with
-`tle`, verifies the recovery artifacts, removes plaintext recovery material,
-and locks the volume. At unlock time it recovers the passphrase after the
+the embedded `drand/tlock` library, verifies the recovery artefacts, removes
+plaintext recovery material, and locks the volume. At unlock time it recovers the passphrase after the
 deadline and converges the volume to a mounted, usable state.
 
 ## Requirements
 
-Vaultlock targets macOS and APFS. The executable remains compatible with the
-system Bash 3.2. Normal use requires:
+The installed command is a standalone Go binary for macOS and APFS. It includes
+its Go libraries and needs no separately installed `tle`, `jq`, `curl`, OpenSSL,
+Homebrew packages, or Go runtime.
 
-- macOS tools including `diskutil`, `plutil`, `security`, `tmutil`, and `lsof`
-- `tle` on `PATH`, in `~/bin`, or in `~/go/bin`
-- `jq`
-- `curl` and internet access to the Quicknet drand service
-- administrator access for the `sudo tmutil` operations used while locking
-
-Development checks also require Git, GNU Make, and ShellCheck. Use a clone
-with full Git history so the crypto tests can read the original baseline.
-Run the CI checks locally:
-
-```console
-make check-ci
-```
-
-This runs the complete helper, deadline, and guarded-install suites, plus
-CLI smoke tests for status, options, colour, help, lock, unlock, init, adopt
-dry-runs, and a broken output pipe during locking. It also checks Bash syntax
-and runs ShellCheck on every shell source. All lifecycle tests use temporary
-fixtures and do not perform a real APFS operation.
-
-Run the complete regressions before installation:
-
-```console
-make check
-```
-
-The complete gate also covers the slower filesystem, recovery, hook, and
-fault-injection scenarios, including adopt operations on fixtures.
-`make install` requires this complete gate.
-
-[GitHub Actions](https://github.com/wolph/vaultlock/actions/workflows/ci.yml)
-runs the CI tests and syntax checks on macOS 15 and 26, using both Intel and
-Apple Silicon runners with the system Bash 3.2. At most two isolated suites
-run concurrently in each job. ShellCheck runs once on the
-macOS 15 Apple Silicon runner. Pushes to `master` and pull requests trigger
-all four jobs, each limited to five minutes. A failed job cancels the remaining jobs.
-A new run cancels an older run for the same branch or pull request. You can
-also start the workflow manually from the Actions tab.
+Storage operations use `diskutil`, `security`, `tmutil`, `sudo`, and `ditto`,
+which macOS supplies. Locking and unlocking need internet access to Quicknet.
+Administrator access is required for the privileged APFS and Time Machine
+operations. User hooks can have requirements of their own.
 
 ## Installation
 
-Install the command and its original helper suite into `~/bin`:
+Build and install from a checkout with Go 1.25 or newer:
 
 ```console
 make install
 ```
 
-Choose another destination with `BIN_DIR`:
+This runs the Go tests, vet, formatting check, and a build with CGO disabled,
+then copies the executable to `~/bin/vaultlock`. The installed executable is
+independent of the checkout. Choose another destination with `BIN_DIR`:
 
 ```console
 make install BIN_DIR="$HOME/.local/bin"
 ```
 
-`make install` runs `make check` first. It validates both repository sources,
-both imported baseline blobs, and both destination paths before creating the
-destination directory or replacing either target. It accepts only:
+The installer accepts a missing target, an existing Vaultlock Go binary, or an
+absolute symlink naming this checkout's `bin/vaultlock`. That recognised legacy
+symlink is replaced by the Go binary. The Bash source and its local edits stay
+in the checkout. Relative, unexpected, or dangling symlinks, unrelated files,
+and special files are refused. The installer stages the executable in the destination directory.
+It creates a missing target without overwriting a newly appeared file, or
+replaces an existing binary with a rename after checking the target again.
 
-- a missing target
-- an absolute symlink whose raw link text already names this repository source
-- a regular file byte-identical to that source's first imported Git blob
+You can also use the usual Go installation command from the checkout:
 
-It refuses modified files, relative or unexpected symlinks, dangling symlinks,
-directories, devices, sockets, and FIFOs. Each accepted target is replaced by
-an absolute repository symlink through a private staged link and verified
-afterward.
+```console
+go install ./cmd/vaultlock
+```
 
-The two final replacements are separate filesystem operations, not one atomic
-pair. An interruption can leave the first link installed and the second target
-unchanged. Rerunning `make install` converges that safe partial state.
+That uses Go's installation directory and replacement rules. Go is needed to
+build from source, but people receiving a compiled executable only need the
+binary. CI builds and uploads archives for Intel and Apple Silicon, with
+checksums and executable permissions preserved. Extract the matching archive
+and place `vaultlock` in a directory on your `PATH`.
 
-The installer revalidates each source, destination, and staged link immediately
-before its rename. It cannot make the final pathname check and rename atomic
-against a hostile process already running as the same macOS user. Such a
-process can swap a pathname in that interval.
+Build without installing, then inspect the command:
 
-The defaults are:
+```console
+make build
+./build/vaultlock --help
+./build/vaultlock --version
+```
 
-- State directory: `~/.vaultlock`
-- Volume name: `vault`
-- APFS container: `disk3`
-- Mount point: `/Volumes/vault`
-- Keychain service: `vaultlock-vault`
+`make dist` builds an archive and checksum in `build/` for distribution.
 
-Each one reads an environment override, for example `VAULTLOCK_CONTAINER`.
-Review them in `bin/vaultlock` before `init`, because `disk3` is a default and
-not a guess about your machine. Creating or adopting a vault changes storage
-state. Start with `--dry-run`.
+The defaults and their environment overrides are:
+
+| Setting | Default | Override |
+| --- | --- | --- |
+| State directory | `~/.vaultlock` | `VAULTLOCK_STATE_DIR` |
+| Volume name | `vault` | `VAULTLOCK_VOLUME` |
+| APFS container | `disk3` | `VAULTLOCK_CONTAINER` |
+| Mount point | `/Volumes/vault` | `VAULTLOCK_MOUNT_POINT` |
+| Confirmation terminal | `/dev/tty` | `VAULTLOCK_CONFIRM_DEVICE` |
+
+The Keychain service is `vaultlock-<volume>`. Check your container before `init`.
+`disk3` is a default, not automatic device discovery. Start with `--dry-run`.
 
 ## Commands
 
-Inspect the current observations before changing anything:
-
 ```console
 vaultlock status
-```
-
-Create the configured APFS volume:
-
-```console
 vaultlock init --dry-run
 vaultlock init --yes
-```
-
-Move an existing directory onto the mounted vault and replace the original
-path with a symlink:
-
-```console
 vaultlock adopt --dry-run "$HOME/path/to/data"
 vaultlock adopt --yes "$HOME/path/to/data"
-```
-
-Preview and perform a lock:
-
-```console
-vaultlock lock -v --dry-run 20h
-vaultlock lock -vv --color=always --dry-run 2:00 +2d
+vaultlock lock -vv --dry-run 20h
 vaultlock lock --yes 20h
-```
-
-Unlock after the deadline, or repair a recorded-unlocked volume that is locked
-or unmounted:
-
-```console
 vaultlock unlock --dry-run
 vaultlock unlock
 ```
 
-The complete command forms are:
+Options precede operands. `-v` and `-vv` select increasing detail.
+`--color=auto|always|never` controls colour.
+`--progress=auto|always|never` controls progress for all commands.
+`--no-hooks` skips hooks for `lock` and `unlock`.
+
+`init`, `adopt`, and `lock` require confirmation on the controlling terminal
+unless `--yes` is supplied. `unlock` does not prompt. `--dry-run` inspects the
+vault without changing APFS, files, Keychain, Time Machine configuration, or the
+operation lock, and never runs hooks.
+
+### Progress while waiting
+
+Every lengthy step reports what it is doing, including inspection, directory
+scans, hashing, copying, metadata restoration, verification passes, recovery
+writes, Keychain access, APFS operations, snapshot cleanup, hooks, and beacon
+requests. A timer refreshes the display independently of work callbacks, so a
+large file or a system command that produces no output still shows activity.
+
+Terminals show a live progress indicator. Work with known totals includes
+completed and total bytes and entries, percentage, throughput, elapsed time,
+and an estimated remaining time. Hashing advances while each file is read.
+Repeated verification identifies the current pass. Work without a measurable
+total shows the current operation and elapsed time without inventing a
+percentage or completion estimate.
+
+The default `auto` mode refreshes terminal activity every 200 milliseconds.
+Subprocess progress that uses carriage returns shares the live display, so a
+hook's progress bar and vaultlock's activity indicator update in place. Ordinary
+log lines and errors remain visible above the display.
+
+When progress output is redirected to a file or pipe, `auto` records phase
+summaries instead of animation frames. Repeated subprocess progress is reduced
+to its initial and final snapshots. `--progress=always` also writes periodic activity snapshots to redirected
+output. `--progress=never` disables vaultlock's activity indicator. Progress goes
+to standard error. Confirmation and administrator password prompts remain
+readable.
+
+Colour separates the active phase and counters in cyan, transfer speed and
+completed work in green, waiting estimates and confirmation prompts in yellow,
+and errors in red. Paths and elapsed time use less emphasis. The palette uses
+your terminal's standard colours and keeps the same layout at narrow widths.
+`--color=never`, `NO_COLOR` (including an empty value), and `TERM=dumb` disable
+automatic colour. Each output stream detects its own terminal. Redirected output
+stays plain unless you request `--color=always`, which overrides those settings.
+
+An installation still pointing at the Bash source can report
+`malformed operation lock owner` when it encounters the Go version's kernel
+lock file. Run `make install` to migrate the recognised repository symlink and
+check `vaultlock --version`. The Go command uses the existing lock file.
+
+### Deadlines
+
+All four deadline forms remain available:
+
+| Form | Example | Meaning |
+| --- | --- | --- |
+| Duration | `1d4h30m`, `20h`, `90s` | Elapsed time from now |
+| Clock | `09:00` | Next occurrence of that local clock time |
+| Clock and days | `09:00 +2d` | That local time two calendar days from today |
+| Date and clock | `2027-01-02 09:00` | An exact local date and minute |
+
+Quote deadlines containing spaces, or pass their words separately. Local clock
+forms use the system timezone. Duration days are always 86,400 seconds, while
+calendar days can span a daylight-saving change. Explicit local times that do
+not exist are rejected. Clock-only deadlines select the next real occurrence,
+including the second occurrence of a repeated local time.
+
+The encryption round is the first Quicknet round scheduled at or after the
+deadline. A lock that is already securely sealed keeps its recorded deadline.
+
+## State and recovery
+
+The Go command reads the existing state directory and file names:
 
 ```text
-vaultlock init [-v | -vv] [--color=auto|always|never] [--dry-run] [--yes]
-vaultlock adopt [-v | -vv] [--color=auto|always|never] [--dry-run] [--yes] <directory>
-vaultlock lock [-v | -vv] [--color=auto|always|never] [--dry-run] [--yes] [--no-hooks] <deadline>
-vaultlock unlock [-v | -vv] [--color=auto|always|never] [--dry-run] [--no-hooks]
-vaultlock status [-v | -vv] [--color=auto|always|never]
+state.json
+passphrase.txt
+passphrase.sha256
+passphrase.tle
 ```
 
-Options must appear immediately after the subcommand and before the first
-operand. `lock` joins its remaining words into one deadline expression, so
-both quoted and unquoted `2:00 +2d` forms work.
+The JSON fields and unknown additional fields are preserved. Binary and armoured
+ciphertexts produced by `tle` on Quicknet remain readable. The chain hash,
+public key, and signature scheme are pinned. Beacon signatures are verified in
+process, and the local clock alone cannot make decryption succeed.
 
-| Option | `init` | `adopt` | `lock` | `unlock` | `status` | Effect |
-|---|---:|---:|---:|---:|---:|---|
-| `-v`, `--verbose` | yes | yes | yes | yes | yes | Add technical details and detailed progress descriptions |
-| `-vv`, `--very-verbose` | yes | yes | yes | yes | yes | Also show the complete numbered lifecycle plan and hook argv |
-| `--color=auto|always|never` | yes | yes | yes | yes | yes | Select terminal colour handling |
-| `--dry-run` | yes | yes | yes | yes | no | Inspect the planned outcome without making changes |
-| `--yes` | yes | yes | yes | no | no | Bypass confirmation only |
-| `--no-hooks` | no | no | yes | yes | no | Disable all lifecycle hooks |
+Protected state files require the current user as owner, mode `0600`, no ACL,
+and a single hard link. The state directory requires mode `0700` and no ACL.
+Symlinked protected files are refused. Writes use private staging files, file
+synchronisation, rename, and directory synchronisation.
 
-Repeated verbosity options select the highest requested level regardless of
-order. Repeated colour options use the last value. `status -v` and `status -vv`
-show the same technical observations, because status has no operation plan.
-The colour value must use the inline form, such as `--color=never`.
+A normal lock excludes the protected state directory and vault from Time
+Machine, deletes vault snapshots, unmounts the vault, and stages a new random
+passphrase before rotating APFS. It stores and verifies the time-lock
+ciphertext, hash, and locked state before removing plaintext and Keychain
+recovery. Data-volume snapshot cleanup then precedes the APFS lock and its
+postcondition checks.
 
-Unknown options, options after an operand, missing required operands, and extra
-fixed-arity operands are usage errors. `lock` instead joins every remaining
-word. Extra words usually make its deadline invalid during preflight rather
-than producing a usage error. `--yes --dry-run` is accepted and still changes
-nothing.
+A failed rotation or encryption can leave protected recovery material, including
+`passphrase-new.txt`. Keep those files until the failure has been inspected.
+The command reports failure and retains recovery instead of describing a
+partial transition as a sealed vault. A failed data-volume snapshot cleanup
+still allows APFS sealing, then reports the cleanup failure.
 
-## Output modes and colour
+Before the future key is available, the encrypted recipient and file structure
+can be checked, but their final authentication requires decryption. A network
+failure cannot satisfy the future-round check. A valid earlier signed beacon
+and an unavailable target beacon are required.
 
-| Mode | Output |
-| --- | --- |
-| default | Compact state, deadline and remaining time, relevant target details, hooks, short progress, warnings and result |
-| `-v`, `--verbose` | Technical observations and detailed progress descriptions |
-| `-vv`, `--very-verbose` | Verbose output plus the complete numbered lifecycle plan and exact planned hook argv |
+`status` is observational and exits successfully even when it reports
+`INCONSISTENT`. It compares recorded state with actual APFS state and recovery
+file presence. `-v` adds the observations and drand rounds. It does not repair
+the vault or establish that recovery-file contents are valid.
 
-Default lifecycle output identifies the command, current state, intended
-result, deadline, hooks and progress. Confirmation appears when required.
-Warnings and repair advice remain visible at every verbosity level.
+`unlock` can repair an unlocked record whose APFS volume is locked or unmounted,
+using verified recovery material. A recorded-locked recovery decrypts through
+the embedded library, checks the hash, and converges APFS to the expected mounted
+volume. Invalid or missing recovery material fails closed.
 
-Deadlines pair an absolute local timestamp, including seconds and the UTC
-offset, with the remaining time. Durations use days, hours and minutes, omitting
-zero units. Below one minute they use seconds. At or after the deadline the
-suffix reads `deadline passed`. Unlocking still needs the published drand round
-and an internet connection.
+Mutating commands take an exclusive lock at `~/.vaultlock-operation.lock`.
+The Go version keeps a protected file there and holds a kernel file lock while
+running. Process exit releases the kernel lock. An old Bash lock directory is
+refused, so inspect any older operation before removing its stale directory.
+Do not run the Bash and Go implementations concurrently during migration.
 
-With a fixture clock set to `2026-09-08 20:26:00 +0200`, the formatter produces:
+## Directory adoption
 
-```text
-2026-09-09 09:00:00 +0200 (in 12h 34m)
-```
+`adopt` requires the verified vault to be unlocked and mounted at the configured
+path. It refuses the filesystem root, home directory, reserved control paths,
+and sources overlapping the vault or state directory. A destination that is a
+file or symlink, including a dangling symlink, is refused. An existing real
+directory can be reused after two complete verification passes establish that
+its contents, metadata and hardlinks match the source. Confirmation and the
+source replacement transaction recheck both trees. A reused copy is not copied
+again. During an unfinished adoption, the source remains authoritative. If the
+trees differ, adoption reports the differences and builds a separate replacement
+inside a private directory on the vault. Equal file contents are reused with
+native APFS clones where available. Other files are copied from the source.
+Hardlinks, symlinks and metadata follow the source. Clone progress counts logical
+bytes reused, alongside bytes copied from the source.
 
-The absolute timestamp identifies the deadline and its time zone. The suffix
-shows the elapsed time left from that fixture clock. Normal output reads the
-current clock once per summary and again after the operation finishes.
+The existing destination stays intact while the replacement is built and
+verified. After confirmation and verification of all three trees, the previous
+destination moves into `.vaultlock-adopt-backup-*/original` on the vault and the
+replacement takes its place. The backup is retained and its path is printed,
+including on later failures. No destination-only data is discarded. A failed
+replacement leaves the source intact and reports any retained staging directory.
 
-Hook paths and deferred directories use shell-safe quoting. `after mount`
-marks a vault-local directory whose entries cannot be inspected until the
-expected volume is mounted and its identity is verified. A hook found then is
-also reported by phase, scope, and path.
+macOS `ditto` copies the tree. Native Go traversal checks file contents,
+permissions, ownership, flags, timestamps, ACLs, extended attributes, symlink
+targets, and internal hard-link relationships. Unsupported entries, nested
+filesystems, external hard links, and unstable trees are refused. Copy and
+verification progress stay separate from the transaction's success or failure.
 
-The Hooks field records `disabled` for `--no-hooks` and `none` when no known or
-deferred hooks apply. Exact hook argv appears only in very verbose output.
+Literal `._` files remain files. Copying disables `ditto`'s automatic resource
+handling, which otherwise consumes those names. Native Go code then restores
+the captured extended attributes, including resource forks and Finder metadata,
+ACLs and timestamps before verifying the complete copy.
 
-Every mode prints each meaningful progress group once across the command.
-Default mode uses short descriptions and verbose mode gives more detail.
-Execution uses `->` prefixes when a group starts. Dry-run uses `Would:` prefixes.
-Hook runs remain individual progress entries.
+Files owned by your user can still belong to a group you cannot assign, such as
+`wheel`. If macOS refuses that group change, adoption uses its native `sudo` and
+`chown` with existing administrator authorisation. The privileged command receives
+the already opened descriptor and numeric IDs. It does not resolve a path in the
+copied tree. Without authorisation, adoption stops with the source intact and
+reports how to authorise a retry. Group ownership is never silently changed.
+Symlink group changes use a detached helper session because macOS rejects their
+descriptors during `sudo` terminal setup. That session may not share credentials
+cached by `sudo -v` in your terminal. If authorisation fails, the source remains
+intact and the error identifies this restriction.
 
-Colour mode defaults to `--color=auto`. Automatic mode decides separately for
-stdout and stderr. A stream receives colour only when it is a TTY, `TERM` is
-not `dumb`, and `NO_COLOR` is unset or empty. `--color=always` and
-`--color=never` explicitly override terminal and environment detection.
-Headings are bold and labels dim. Status words use cyan for `LOCKED`, green for
-`UNLOCKED`, yellow for `REPAIRABLE` and red for `INCONSISTENT`. Warnings are yellow
-and errors red. Paths, UUIDs, devices, deadlines, rounds, operation descriptions
-and hook argv remain plain. The same words remain readable without colour.
+macOS manages `com.apple.provenance` and can rewrite its bytes on a copy, even
+after a successful native attribute write. Adoption excludes only that attribute
+from cross-copy equality. Before copying or replacing either tree, it saves the
+captured original metadata and SHA-256 hashes in private, synchronised
+`.vaultlock-adopt-metadata-*` directories on the vault. The archive retains the
+original provenance bytes. Quarantine, access-control attributes, resource forks
+and all other captured attributes still require exact equality.
 
-## Deadlines
+Verification reuses a SHA-256 result within the current command only when the
+file identity and complete native metadata, including change time, remain
+unchanged before and after the check. Removing an original file always reads and
+hashes its contents again immediately before unlinking it.
 
-Absolute, clock, and calendar-offset deadlines must resolve to a future local
-minute. A duration resolves to a future instant by adding elapsed seconds.
-
-| Form | Meaning | Example |
-|---|---|---|
-| `YYYY-MM-DD HH:MM` | Exact future local date and time | `2026-09-02 14:30` |
-| `H:MM` or `HH:MM` | First future occurrence of that local clock time | `1:00` |
-| `[Nd][Nh][Nm][Ns]` | Positive elapsed duration in day, hour, minute, second order | `1d4h`, `20h`, `90s` |
-| `H:MM +Nd` | That local clock time a positive N calendar days from today | `2:00 +2d` |
-
-An elapsed `d` is 86,400 seconds, so a duration need not land on a local minute.
-The `+Nd` form advances the local calendar date instead. A bare clock skips a
-daylight-saving gap by moving to its next valid occurrence. It can select the
-second repeated occurrence during a fall-back transition. Absolute and `+Nd`
-forms reject nonexistent local minutes and choose the first repeated
-occurrence.
-
-A duration in seconds makes short lock and unlock cycles practical to test.
-Very short deadlines race the lock itself, because the lock rotates recovery
-material and installs the ciphertext before it verifies that the drand round
-has not yet published. When that round arrives first, the lock refuses with
-`ciphertext decrypts right now (past round?), NOT locking` and leaves the vault
-unlocked.
-
-For a two-day calendar offset, these are equivalent:
-
-```console
-vaultlock lock --dry-run 2:00 +2d
-vaultlock lock --dry-run "2:00 +2d"
-```
-
-Locking an already securely locked vault preserves its existing deadline and
-round. It does not extend the lock with the newly supplied expression.
-
-## Plans, confirmation, and dry-run
-
-Every lifecycle command builds a complete typed plan from the recorded and
-actual APFS observations, requested target, resolved deadline, hooks, and
-ordered mutations. Default output renders the concise state, target, request,
-and hook summary, followed by short progress groups. Very verbose output
-renders the complete numbered `Actions:` list and exact planned hook argv.
-
-`init`, `adopt`, and `lock` prompt on the controlling terminal with
-`Confirmation required. Continue? [y/N] `. Only `y` or `yes`, ignoring case,
-proceeds. Non-interactive execution without `--dry-run` must pass `--yes`.
-That option suppresses the confirmation boilerplate only. It does not bypass
-preflight, identity, recovery, or postcondition checks.
-
-`unlock` never prompts because its target is a usable mounted vault.
-
-`--dry-run` performs read-only preflight without running hooks or changing
-APFS, files, Keychain, Time Machine configuration, or the cooperative operation
-lock. It never prompts. Its output follows the selected output mode, and a
-successful preview ends with:
-
-```text
-Result: no changes made
-```
-
-The complete typed plan includes discoverable hook paths, hook bypass state,
-and coordination steps. At `-vv`, known hooks also include each hook's named
-argv. If the verified vault is not mounted, vault-local hook discovery is
-shown as deferred. Dry-run never mounts the volume just to discover hooks.
-
-A preview is a snapshot, not a promise that later execution will succeed.
-Normal execution acquires the cooperative lock, repeats inspection, rebuilds
-the plan, and aborts without domain mutation if a typed field or identity has
-changed.
-
-### Very verbose lock plan
-
-`-vv` expands the exact numbered plan for the current command and inspected
-state. The conceptual order for a normal transition is:
-
-Typical standard full-lock sequence:
-
-1. Acquire the cooperative operation lock
-2. Conditionally quarantine a verified stale operation lock
-3. Run each planned pre-lock hook with its exact argv
-4. Persistently exclude the protected state directory from Time Machine and verify the exclusion
-5. Add the vault volume root to Time Machine exclusions
-6. Delete local Time Machine snapshots for the vault
-7. Unmount the vault
-8. Generate and durably stage a new random recovery passphrase
-9. Rotate the APFS volume passphrase, then commit the staged plaintext recovery file
-10. Update Keychain with the rotated recovery material
-11. Encrypt the rotated recovery material for the resolved drand round
-12. Verify the time-lock ciphertext is nonempty and not yet decryptable
-13. Write the recovery hash and durably record the locked deadline and round
-14. Remove plaintext recovery material and its Keychain entry
-15. Delete local Time Machine snapshots for the data volume
-16. Lock the APFS volume
-17. Verify APFS encryption, locked state, and failed unauthenticated mounting
-18. Release the cooperative operation lock
-
-This is a typical sequence, not fixed output. Actual `-vv` items vary with the
-inspected state. Known hooks, multiple hooks, post-hooks, repairs, no-ops,
-disabled hooks, deferred hook discovery, and failure-boundary operations can
-add, remove, or replace applicable items. Hooks found through deferred
-discovery report exact argv at `-vv` when they run.
-
-## Status and convergence
-
-`status` shows `LOCKED`, `UNLOCKED`, `REPAIRABLE` or `INCONSISTENT`, with the
-relevant deadline, mount observation and next action. Problems and repair
-advice appear even without `-v`.
-
-`status -v` also reports recorded JSON state and actual APFS state separately,
-the expected and actual mount point, recovery-file presence, and the target
-and current drand rounds for recorded-locked state.
-
-The verbose assessment is one of:
-
-- `usable`: recorded unlocked, APFS unlocked and mounted as expected, with
-  plaintext recovery material present
-- `securely locked`: recorded locked, APFS locked and unmounted, with
-  ciphertext and hash present and plaintext absent
-- `repairable: run diskutil mount <device>`: recorded unlocked, APFS unlocked
-  but unmounted, and plaintext present
-- `repairable: run vaultlock unlock`: recorded unlocked, APFS locked and
-  unmounted, with plaintext and hash present
-- `inconsistent`: every other combination, including some recorded-locked
-  drift that `lock` or a post-deadline `unlock` can still converge safely
-
-`status` is observational. It renders and exits 0 even when state is absent,
-invalid, or assessed as inconsistent. It does not repair state, verify
-recovery-file contents, or compare a Keychain value.
-
-The `locked` value in `state.json` is not the only source of truth. `lock` and
-`unlock` also inspect APFS locked and mounted state, volume UUID, device,
-mount identity, recovery artifacts, and hashes before choosing operations.
-
-Important convergence cases include:
-
-- `unlock` mounts an unlocked but unmounted vault.
-- `unlock` can use verified local plaintext when JSON says unlocked but APFS
-  is locked and unmounted.
-- `lock` repairs a recorded-unlocked vault to mounted and usable before the
-  requested lock transition.
-- A secure recorded-locked state is verified as a no-op and keeps its current
-  deadline.
-- An unexpectedly unlocked recorded-locked vault fails before the deadline.
-  After the deadline, `unlock` resumes only through verified recovery.
-
-Missing, inconsistent, or hash-mismatched recovery material fails closed.
-Vaultlock does not guess a passphrase or rewrite state to hide a mismatch.
+After verification, the original is renamed into a private sibling directory
+and its path is replaced by a symlink to the verified copy. Failures before
+original-data removal attempt rollback. Once removal starts, a failure retains
+the remaining original entries and reports the verified copy's location.
+After a successful adoption, the original source data is gone and its path is a
+symlink. Reads and writes through that path use the vault copy.
 
 ## Lifecycle hooks
 
@@ -465,26 +374,19 @@ Vault-local hooks live on the mounted filesystem:
 /Volumes/vault/.vaultlock/hooks/post-unlock.d
 ```
 
-There is no vault-local `post-lock` or `pre-unlock` directory because the
-filesystem is unavailable at those points. The phase order is:
+The phase order is unchanged:
 
 1. pre-lock: legacy global script, global directory, vault-local directory
 2. post-lock: global directory
 3. pre-unlock: global directory
 4. post-unlock: vault-local directory, global directory
 
-Directories run non-hidden executable regular files and executable symlinks
-that resolve to regular files. Ordering uses C-locale filename order. Missing
-directories and non-executable entries are ignored. A hook's path, type,
-identity, and executable state are rechecked before execution.
+Directories run non-hidden executable regular files and executable symlinks to
+regular files, in bytewise filename order. Missing directories and
+non-executable entries are ignored. Hook identity and executable state are
+checked before execution. Vault-local hooks require the verified mount.
 
-Default output lists every known hook by phase, scope, and safely quoted path.
-It lists an unavailable vault-local hook directory with `after mount`. Every
-mode reports each hook run as an individual progress entry. `-vv` adds exact
-argv for hooks known while planning and for hooks found through deferred
-discovery during execution.
-
-Each hook receives exactly these 24 argv words, in this order:
+Each hook receives these 24 argv words:
 
 ```text
 --phase VALUE
@@ -501,101 +403,40 @@ Each hook receives exactly these 24 argv words, in this order:
 --locked VALUE
 ```
 
-`--scope` is `global` or `vault`. `--locked` is `false` for `pre-lock` and
-`post-unlock`, and `true` for `post-lock` and `pre-unlock`. During a
-recorded-unlocked APFS-unlock repair, `--deadline`, `--deadline-epoch`, and
-`--round` are the literal value `null`.
+The scope is `global` or `vault`. The locked value is `false` for `pre-lock`
+and `post-unlock`, and `true` for `post-lock` and `pre-unlock`. Missing deadline
+values are the literal string `null`. Secret-like exported variables are removed
+from child environments. Recovery secrets never appear in hook argv. Hooks are
+trusted user programs. Interactive hooks use a private controlling terminal on
+macOS. Terminal input and visible output are forwarded, while terminal queries
+are kept out of the user's terminal and log files.
 
-Passphrases, decrypted recovery values, ciphertext, hashes, and Keychain values
-never appear in hook argv. Vaultlock removes exported secret-like variables
-before hooks inherit the remaining caller environment, working directory,
-stdin, stdout, and stderr. Hooks are trusted user programs and are not
-sandboxed.
+A failed pre-hook stops the transition. Failed post-hooks allow remaining
+post-hooks to run, then return failure. `--no-hooks` skips all hooks.
 
-The first pre-hook process that exits nonzero stops the transition. If a
-post-hook process exits nonzero, remaining post-hook processes run before
-Vaultlock returns nonzero for the otherwise reached target. Hook path, type,
-identity, permission, or mount drift aborts immediately instead of continuing
-the phase. `--no-hooks` skips the legacy, global, and vault-local hooks. Concise
-output reports `Hooks: disabled`, and `-vv` also adds an explicit disabled-hooks
-item to the numbered plan. When hooks are enabled but none are known or
-deferred, concise output reports `Hooks: none`.
+Every successful `unlock` runs the post-unlock hooks, including when the vault
+is already unlocked and mounted. Run `unlock` again to retry a failed service
+start. Write these hooks so that running them again is safe. Use `--no-hooks`
+to check and repair the unlocked vault without starting its services.
 
-Pre-unlock hooks run only for recorded-locked recovery. A usable unlock no-op
-and an unlock that only mounts an already-unlocked volume do not run lifecycle
-hooks. A user `unlock` that actually performs the expected APFS unlock runs
-post-unlock hooks after the usable target is verified. Secure lock no-op and
-repair paths do not run hooks. If deferred data-volume snapshot cleanup fails,
-Vaultlock still locks and verifies APFS but skips the planned post-lock hooks.
+## Development
 
-## Time Machine behavior
-
-A full lock transition persistently excludes the canonical state directory
-with `sudo tmutil addexclusion -p` and verifies the exact exclusion. This asks
-for administrator authorization and leaves `STATE_DIR` excluded from Time
-Machine after the command. Vaultlock also excludes the mounted vault root and
-deletes vault snapshots before unmounting and rotating recovery material.
-
-Data-volume snapshot deletion occurs later, after durable locked state exists
-and plaintext and Keychain recovery values are removed. If that cleanup fails,
-Vaultlock still attempts the APFS lock and its postconditions, then reports the
-deferred failure.
-
-## Failure and recovery boundaries
-
-Recovery state uses these protected files under `~/.vaultlock`:
-
-```text
-state.json
-passphrase.txt
-passphrase.tle
-passphrase.sha256
+```console
+make check
+make test
+go test -race ./...
 ```
 
-The state directory is mode 0700 and protected files are mode 0600, with owner
-and ACL checks. Passphrases are sent to `diskutil` and Keychain operations
-through protected stdin channels. They are not placed in child process argv,
-plans, logs, errors, or hook arguments.
+Tests use temporary directories and simulated APFS, Keychain, and Time Machine
+operations. Native adoption tests use temporary trees and the macOS copy tool.
+They do not initialise, rotate, lock, or unlock a real APFS volume.
 
-Normal `init`, `adopt`, `lock`, and `unlock` executions cooperate through
-`~/.vaultlock-operation.lock`. A live owner causes refusal. Malformed or
-ambiguous ownership fails closed. A verified stale lock is moved without
-clobber to a retained sibling named
-`.vaultlock-operation.lock.quarantine.<token>`. Vaultlock never recursively
-deletes a lock or quarantine directory.
+The optional live crypto test contacts Quicknet without touching a vault:
 
-The lock serializes Vaultlock processes that follow the protocol. It does not
-provide atomic protection against a hostile process already running as the
-same macOS user. Such a process can change this script, its input trees, and
-its files between a final identity check and a pathname operation. Detected
-drift still fails closed within that boundary.
+```console
+VAULTLOCK_LIVE_DRAND=1 go test -v ./internal/timelock
+```
 
-Failures can retain protected evidence instead of guessing ownership or
-deleting data:
-
-- Init can retain generated recovery material, staged state, or a
-  `.state-quarantine.*` directory.
-- Adopt uses sibling `.vaultlock-link`, `.vaultlock-backup`, and
-  `.vaultlock-quarantine.*` paths. It rolls back before verified replacement
-  and reports any retained verified or unverified path.
-- Unlock can retain `.unlock-recovery.*`, `.tle-unlock.*`, or
-  `.state-unlock.*` files.
-- Lock can retain `passphrase-new.txt`, `.passphrase-lock.*`, `.tle-lock.*`,
-  `.hash-lock.*`, `.state-lock.*`, `.tle-verify.*`, or `.security-output.*`
-  files. After an attempted APFS passphrase rotation, it reports whether staged
-  recovery material was verified.
-
-Unexpected transient paths fail preflight. Retained quarantines and backups
-require manual inspection. Vaultlock does not automatically delete them on a
-later run.
-
-## Exit behavior
-
-For lifecycle commands, exit 0 means the requested target was verified or a
-trustworthy dry-run plan was rendered. `status` renders its observations and
-exits 0 even for inconsistent state. Usage errors exit 64. Declined
-confirmation, failed preflight, repair failure, hook failure, incomplete
-convergence, or a retained operation lock returns nonzero. Errors identify the
-failed operation and unmet postcondition without printing recovery material.
-
-Vaultlock is released under the BSD 3-Clause license. See [LICENSE](LICENSE).
+The previous Bash implementation and its shell regression tests remain in
+`bin/`, `scripts/`, and `tests/` while existing work is preserved. The Go build,
+installation, and CI use `cmd/` and `internal/`.

@@ -13,48 +13,41 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    shell: /bin/bash --noprofile --norc -e -o pipefail {0}
-
 jobs:
   check:
-    name: Check (${{ matrix.os }}, Bash 3.2)
+    name: Go (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    timeout-minutes: 15
     strategy:
       fail-fast: true
       matrix:
-        os:
-          - macos-15-intel
-          - macos-15
-          - macos-26-intel
-          - macos-26
+        os: [macos-15-intel, macos-15, macos-26-intel, macos-26]
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Crypto regression tests read the original imported baseline commit.
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Install test dependencies
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: "1"
-        run: brew install jq shellcheck
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
 
-      - name: Run CI tests with native macOS tools
-        run: |
-          export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$(brew --prefix)/bin:$PATH"
-          sw_vers
-          uname -m
-          /bin/bash --version
-          /usr/bin/make --version
-          /usr/bin/git --version
-          jq --version
-          shellcheck --version
-          /usr/bin/make -j2 test-ci check-syntax
+      - name: Test and build the standalone binary
+        run: make check-ci
 
-      - name: Check all shell sources with ShellCheck
-        if: matrix.os == 'macos-15'
-        run: /usr/bin/make lint
+      - name: Check for data races
+        run: go test -race ./...
+
+      - name: Package binary with executable permissions
+        run: make dist
+
+      - name: Upload standalone binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vaultlock-${{ matrix.os }}
+          path: |
+            build/*.tar.gz
+            build/*.sha256
+          if-no-files-found: error

@@ -20,6 +20,19 @@
 
 ### Changed
 
+- Reimplemented the installed command in Go with embedded drand/tlock. The
+  standalone binary needs no external tle, jq, curl, or Go installation.
+- Adoption can resume with source changes taking precedence, verified copies,
+  retained destination backups, and guarded removal of the original data.
+- Handle encrypted APFS volumes that lock automatically on unmount by loading
+  their keys without mounting before passphrase rotation.
+- Run post-unlock hooks after verified convergence even when the vault is
+  already unlocked, so failed service starts can be retried.
+- Share one terminal display between vault activity and subprocess progress.
+  Redirected output keeps compact summaries. Private hook terminals prevent
+  colour queries from corrupting visible output while preserving input.
+- Build and test native Go binaries in CI on Intel and Apple Silicon macOS,
+  including race detection and executable archives with SHA-256 checksums.
 - Added bold headings, aligned fields, and coloured status words throughout
   the CLI. Short progress groups now appear by default, with detailed `-v`
   descriptions and complete `-vv` audit plans. Hook paths remain visible.
