@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wolph/vaultlock/internal/deadline"
+	"github.com/wolph/vaultlock/internal/timelock"
 	"howett.net/plist"
 )
 
@@ -109,6 +112,7 @@ func (r *lifecycleRunner) Run(ctx context.Context, path string, args []string, i
 type fixtureCrypto struct {
 	encryptFailure, verifyFailure bool
 	decrypted                     []byte
+	decryptError                  error
 	beforeEncrypt                 func()
 }
 
@@ -121,7 +125,12 @@ func (c *fixtureCrypto) Encrypt(_ context.Context, pass []byte, _ uint64) ([]byt
 	}
 	return append([]byte("cipher:"), pass...), nil
 }
-func (c *fixtureCrypto) Decrypt(context.Context, []byte) ([]byte, error) { return c.decrypted, nil }
+func (c *fixtureCrypto) Decrypt(context.Context, []byte) ([]byte, error) {
+	if c.decryptError != nil {
+		return nil, c.decryptError
+	}
+	return c.decrypted, nil
+}
 func (c *fixtureCrypto) VerifyFuture(context.Context, []byte, uint64) error {
 	if c.verifyFailure {
 		return errors.New("future verification failed")
@@ -425,6 +434,47 @@ func TestRecordedLockedDryRunDoesNotNeedCrypto(t *testing.T) {
 	a.Options.DryRun = true
 	if err := a.Run(context.Background(), "unlock", nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEarlyUnlockReportsAbsoluteAndRemainingDeadline(t *testing.T) {
+	var a *App
+
+	a, _ = lifecycleFixture(t)
+	if err := a.Run(context.Background(), "lock", []string{"1h"}); err != nil {
+		t.Fatal(err)
+	}
+	var expected string = deadline.Format(time.Unix(a.Now().Add(time.Hour).Unix(), 0), a.Now())
+	if !strings.HasSuffix(expected, "(in 1h)") {
+		t.Fatalf("fixture deadline %q lacks remaining time", expected)
+	}
+	var output bytes.Buffer
+	a.Out = &output
+	a.Crypto = &fixtureCrypto{decryptError: timelock.ErrTooEarly}
+	var err error = a.Run(context.Background(), "unlock", nil)
+	if err == nil {
+		t.Fatal("early unlock succeeded")
+	}
+	var wanted string = "still locked until " + expected + " - this failure is the lock working"
+	if err.Error() != wanted {
+		t.Fatalf("error %q, wanted %q", err.Error(), wanted)
+	}
+	var plan string = "Unlock UUID after " + expected + ", drand round"
+	if !strings.Contains(output.String(), plan) {
+		t.Fatalf("output %q lacks plan line %q", output.String(), plan)
+	}
+	a.Crypto = &fixtureCrypto{decryptError: errors.New("beacon unreachable")}
+	err = a.Run(context.Background(), "unlock", nil)
+	if err == nil || !strings.Contains(err.Error(), expected) || !strings.Contains(err.Error(), "beacon unreachable") {
+		t.Fatalf("outage error %v lacks deadline %q or cause", err, expected)
+	}
+	output.Reset()
+	a.Options.DryRun = true
+	if err = a.Run(context.Background(), "unlock", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), plan) {
+		t.Fatalf("dry-run output %q lacks plan line %q", output.String(), plan)
 	}
 }
 

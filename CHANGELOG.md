@@ -13,6 +13,7 @@
 - Elapsed durations such as `1d4h`, `20h`, and `90s`, plus calendar clock
   offsets such as `2:00 +2d`.
 - Global and vault-local lifecycle hooks with a stable 24-word named argv
+  `make build` installs the fresh executable to `BIN_DIR` as its last step.
   contract and `--no-hooks` bypass.
 - Status output that separates recorded JSON state from actual APFS state.
 - Compact status with `-v` and `-vv` options for technical observations.
@@ -36,6 +37,10 @@
 - Added bold headings, aligned fields, and coloured status words throughout
   the CLI. Short progress groups now appear by default, with detailed `-v`
   descriptions and complete `-vv` audit plans. Hook paths remain visible.
+- `unlock` on a locked vault prints the recorded deadline as a local timestamp
+  with the remaining time before contacting drand, and an early attempt fails
+  with "still locked until <timestamp> (in <remaining>)" as the bash version
+  did. Other recovery failures carry the deadline and the underlying cause.
 - Migrated the standalone command and helper suite into a complete local Git
   project.
 - Lock and unlock now converge repairable observations to verified target

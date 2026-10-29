@@ -128,13 +128,16 @@ binary. CI builds and uploads archives for Intel and Apple Silicon, with
 checksums and executable permissions preserved. Extract the matching archive
 and place `vaultlock` in a directory on your `PATH`.
 
-Build without installing, then inspect the command:
+Build without the checks, then inspect the command:
 
 ```console
 make build
 ./build/vaultlock --help
 ./build/vaultlock --version
 ```
+
+Every build also installs the fresh executable to `BIN_DIR`, so the command on
+your `PATH` never lags behind the checkout.
 
 `make dist` builds an archive and checksum in `build/` for distribution.
 

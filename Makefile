@@ -18,6 +18,7 @@ export VAULTLOCK_INSTALL_BIN_DIR = $(value BIN_DIR)
 
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-X github.com/wolph/vaultlock/internal/cli.Version=$$VAULTLOCK_BUILD_VERSION" -o build/vaultlock ./cmd/vaultlock
+	$(GO) run ./cmd/vaultlock-install build/vaultlock
 
 dist: build
 	tar -czf $(ARCHIVE) -C build vaultlock
@@ -35,7 +36,6 @@ check-format:
 check check-ci: test lint check-format build
 
 install: check
-	$(GO) run ./cmd/vaultlock-install build/vaultlock
 
 clean:
 	rm -rf build

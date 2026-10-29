@@ -241,8 +241,11 @@ func (a *App) unlock(ctx context.Context) error {
 	if _, err = a.read("passphrase.sha256"); err != nil {
 		return errors.New("recovery hash is missing or unsafe")
 	}
+	var when time.Time = time.Unix(*s.DeadlineEpoch, 0)
+
+	a.Report("Unlock %s after %s, drand round %d", s.VolumeUUID, deadline.Format(when, a.Now()), *s.Round)
 	if a.Options.DryRun {
-		a.Report("Would recover the passphrase after %s and unlock %s", *s.Deadline, s.VolumeUUID)
+		a.Report("Would recover the passphrase and unlock %s", s.VolumeUUID)
 		a.Report("Result: no changes made")
 		return nil
 	}
@@ -258,8 +261,11 @@ func (a *App) unlock(ctx context.Context) error {
 	var pass []byte
 
 	pass, err = a.decryptRecovery(ctx, cipher)
+	if errors.Is(err, timelock.ErrTooEarly) {
+		return fmt.Errorf("still locked until %s - this failure is the lock working", deadline.Format(when, a.Now()))
+	}
 	if err != nil {
-		return errors.New("time-lock recovery failed, the beacon may not be available yet")
+		return fmt.Errorf("time-lock recovery failed, the beacon may not be available yet, locked until %s: %w", deadline.Format(when, a.Now()), err)
 	}
 	pass, err = normaliseSecret(pass)
 	if err != nil {
