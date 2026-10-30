@@ -90,7 +90,9 @@ Homebrew packages, or Go runtime.
 Storage operations use `diskutil`, `security`, `tmutil`, `sudo`, and `ditto`,
 which macOS supplies. Locking and unlocking need internet access to Quicknet.
 Administrator access is required for the privileged APFS and Time Machine
-operations. User hooks can have requirements of their own.
+operations, through `sudo` by default or through the optional setuid helper
+described under [Running without sudo prompts](#running-without-sudo-prompts).
+User hooks can have requirements of their own.
 
 ## Installation
 
@@ -139,7 +141,60 @@ make build
 Every build also installs the fresh executable to `BIN_DIR`, so the command on
 your `PATH` never lags behind the checkout.
 
-`make dist` builds an archive and checksum in `build/` for distribution.
+`make dist` builds an archive and checksum in `build/` for distribution. The
+archive carries `vaultlock` and the optional `vaultlock-privileged` helper.
+
+### Running without sudo prompts
+
+Every `lock` and `unlock` stops at a `sudo` password prompt because `diskutil`
+and `tmutil` need root for the volume operations. That prompt also blocks any
+unattended run, such as a launchd job that unlocks at the deadline. The
+optional helper removes it. It is a separate small binary installed setuid root,
+and it runs exactly seven operations, only for volumes an administrator has
+listed for your user:
+
+```console
+make install-helper
+vaultlock privileged allow
+vaultlock status
+```
+
+Read back line by line:
+
+- `make install-helper` builds and asks for your password once. It copies the
+  helper to `/Library/PrivilegedHelperTools/vaultlock-privileged` as root with
+  mode 4755 and creates the empty allowlist `/etc/vaultlock/volumes`.
+- `vaultlock privileged allow` adds the recorded volume UUID of your vault to
+  that allowlist as `UUID uid`, bound to the account that ran `sudo`, again
+  through one `sudo`. A vault created later by `vaultlock init` registers
+  itself while `init` still holds the sudo credentials it needed to create the
+  volume.
+- `vaultlock status` prints `Privileged helper: installed, volume allowed`.
+  From then on `lock` and `unlock` run without a prompt. If the helper is
+  missing, not setuid, writable by anyone but root, or the volume is not
+  listed, vaultlock falls back to `sudo` as before and says so in `status`.
+
+The helper accepts an operation name and a volume UUID, looks the device and
+mount point up with `diskutil` itself, runs with an empty environment, and
+reads passphrases only from standard input. It refuses anything else:
+lower-case or malformed UUIDs, device names, volumes listed for another user,
+paths you don't own, and any `diskutil` or `tmutil` subcommand outside its
+table. Deleting the local snapshots of the system data volume, the one step
+that is not tied to a vault, needs the caller to be in the `admin` group. The
+administrative subcommands `allow`, `revoke`, `list`, and `uninstall` work only
+under `sudo`.
+
+> [!NOTE]
+> The helper moves the authorisation decision from "you typed your password"
+> to "this volume is on the allowlist for this user". Any process running as
+> your user can then lock, unlock, or rotate the passphrase of an allowed
+> volume without a prompt. The time lock itself is unaffected, a locked vault still needs the
+> drand round, but a hostile local process could seal your vault early or
+> rotate its passphrase away. Keep `sudo` if that trade-off is wrong for your
+> machine, and remove the helper with `sudo /Library/PrivilegedHelperTools/vaultlock-privileged uninstall`.
+
+Adoption's rare group-restoring `chown` keeps using `sudo`, see
+[Directory adoption](#directory-adoption).
 
 The defaults and their environment overrides are:
 
@@ -158,6 +213,7 @@ The Keychain service is `vaultlock-<volume>`. Check your container before `init`
 
 ```console
 vaultlock status
+vaultlock privileged allow
 vaultlock init --dry-run
 vaultlock init --yes
 vaultlock adopt --dry-run "$HOME/path/to/data"
@@ -174,7 +230,8 @@ Options precede operands. `-v` and `-vv` select increasing detail.
 `--no-hooks` skips hooks for `lock` and `unlock`.
 
 `init`, `adopt`, and `lock` require confirmation on the controlling terminal
-unless `--yes` is supplied. `unlock` does not prompt. `--dry-run` inspects the
+unless `--yes` is supplied. `unlock` does not prompt. `privileged allow`
+registers the vault with the setuid helper and supports `--dry-run`. `--dry-run` inspects the
 vault without changing APFS, files, Keychain, Time Machine configuration, or the
 operation lock, and never runs hooks.
 

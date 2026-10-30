@@ -22,6 +22,7 @@ Commands:
   lock <deadline>      Seal the vault until a future drand round.
   unlock               Recover and mount the vault after its deadline.
   status               Inspect recorded state and actual APFS state.
+  privileged allow     Allow this vault's volume for the setuid helper.
 
 Options (before operands):
   --dry-run            Preview lifecycle operations without changing anything.
@@ -57,7 +58,7 @@ func parse(arguments []string) (invocation, error) {
 	}
 	result.command = arguments[0]
 	switch result.command {
-	case "init", "adopt", "lock", "unlock", "status":
+	case "init", "adopt", "lock", "unlock", "status", "privileged":
 	default:
 		return result, fmt.Errorf("unknown command: %s", result.command)
 	}
@@ -127,6 +128,15 @@ func parseOption(options *vault.Options, argument string) error {
 func validate(value invocation) error {
 	if value.command == "status" && (value.options.DryRun || value.options.Yes || !value.options.Hooks) {
 		return fmt.Errorf("status accepts only presentation options")
+	}
+	if value.command == "privileged" {
+		if len(value.operands) != 1 || value.operands[0] != "allow" {
+			return fmt.Errorf("privileged requires the allow operand")
+		}
+		if value.options.Yes || !value.options.Hooks {
+			return fmt.Errorf("privileged allow accepts only --dry-run and presentation options")
+		}
+		return nil
 	}
 	if value.command == "unlock" && value.options.Yes {
 		return fmt.Errorf("--yes is not valid for unlock")
@@ -213,5 +223,5 @@ func wantsHelp(arguments []string) bool {
 	if len(arguments) == 1 && (arguments[0] == "help" || arguments[0] == "--help" || arguments[0] == "-h") {
 		return true
 	}
-	return len(arguments) == 2 && (arguments[1] == "--help" || arguments[1] == "-h") && strings.Contains(" init adopt lock unlock status ", " "+arguments[0]+" ")
+	return len(arguments) == 2 && (arguments[1] == "--help" || arguments[1] == "-h") && strings.Contains(" init adopt lock unlock status privileged ", " "+arguments[0]+" ")
 }

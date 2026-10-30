@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/wolph/vaultlock/internal/privileged"
 	"github.com/wolph/vaultlock/internal/progress"
 	"howett.net/plist"
 )
@@ -254,6 +255,9 @@ func operationLabel(path string, args []string) string {
 	if path == "/usr/bin/sudo" && len(args) > 0 {
 		return "Wait for administrator authorisation and " + operationLabel(args[0], args[1:])
 	}
+	if path == privileged.HelperPath {
+		return helperLabel(args)
+	}
 	if len(args) == 0 {
 		return "Wait for a system operation"
 	}
@@ -364,6 +368,9 @@ func mutatesStorage(path string, args []string) bool {
 	if path == "/usr/bin/sudo" && len(args) > 0 {
 		return mutatesStorage(args[0], args[1:])
 	}
+	if path == privileged.HelperPath {
+		return true
+	}
 	if len(args) == 0 {
 		return false
 	}
@@ -376,4 +383,30 @@ func mutatesStorage(path string, args []string) bool {
 		return args[0] != "isexcluded"
 	}
 	return false
+}
+
+// helperLabel names the storage operation behind a privileged helper call
+// the same way the direct command would, without the sudo wait.
+func helperLabel(args []string) string {
+	var request privileged.Request
+	var err error
+	request, err = privileged.Parse(args)
+	if err != nil {
+		return "Wait for the privileged helper"
+	}
+	switch request.Kind {
+	case privileged.KindUnlock:
+		return "Unlock the encrypted APFS volume"
+	case privileged.KindUnlockNoMount:
+		return "Load APFS encryption keys without mounting for passphrase rotation"
+	case privileged.KindRotate:
+		return "Rotate the APFS recovery passphrase"
+	case privileged.KindLock:
+		return "Seal the encrypted APFS volume"
+	case privileged.KindExcludeVolume, privileged.KindExcludePath:
+		return "Exclude protected storage from Time Machine"
+	case privileged.KindDeleteSnapshots, privileged.KindDeleteDataSnapshots:
+		return "Delete local Time Machine snapshots"
+	}
+	return "Wait for the privileged helper"
 }

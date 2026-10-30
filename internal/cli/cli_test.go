@@ -23,6 +23,8 @@ func TestInvalidArgumentsFailBeforeConfiguration(t *testing.T) {
 		{"unlock", "--yes"}, {"init", "--no-hooks"}, {"adopt", "--no-hooks", "/data"},
 		{"lock", "--color=purple", "20h"}, {"adopt", "--progress=sometimes", "/data"},
 		{"status", "extra"}, {"lock", "20h", "--dry-run"}, {"status", "--surprise"},
+		{"privileged"}, {"privileged", "revoke"}, {"privileged", "allow", "--yes"},
+		{"privileged", "allow", "extra"},
 	}
 	var arguments []string
 	for _, arguments = range cases {
@@ -77,5 +79,18 @@ func TestUsageErrorEscapesUntrustedTerminalControls(t *testing.T) {
 	}
 	if !strings.Contains(errors.String(), "--bad?[2J?") {
 		t.Fatalf("missing escaped argument: %q", errors.String())
+	}
+}
+
+func TestPrivilegedAllowParsesWithDryRun(t *testing.T) {
+	var parsed invocation
+	var err error
+	parsed, err = parse([]string{"privileged", "--dry-run", "allow"})
+	if err != nil || parsed.command != "privileged" || !parsed.options.DryRun || strings.Join(parsed.operands, " ") != "allow" {
+		t.Fatalf("parsed=%+v err=%v", parsed, err)
+	}
+	var output bytes.Buffer
+	if status := Run(context.Background(), []string{"privileged", "--help"}, &output, &output); status != 0 || !strings.Contains(output.String(), "privileged allow") {
+		t.Fatalf("help status %d output %q", status, output.String())
 	}
 }

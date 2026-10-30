@@ -38,6 +38,7 @@ type App struct {
 	Confirm               io.Reader
 	Now                   func() time.Time
 	Options               Options
+	HelperProbe           func(uuid string) bool
 	hookPlans             map[string]hookPlan
 	display               *progress.Display
 	progressInterval      time.Duration
@@ -121,6 +122,12 @@ func (a *App) Run(ctx context.Context, command string, operands []string) (runEr
 			return errors.New("status accepts no operands")
 		}
 		return a.status(ctx)
+	}
+	if command == "privileged" {
+		if len(operands) != 1 || operands[0] != "allow" {
+			return errors.New("privileged accepts only the allow operand")
+		}
+		return a.allowHelper(ctx)
 	}
 	switch command {
 	case "init", "unlock":

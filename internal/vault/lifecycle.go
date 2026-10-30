@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wolph/vaultlock/internal/deadline"
+	"github.com/wolph/vaultlock/internal/privileged"
 	"github.com/wolph/vaultlock/internal/timelock"
 	"howett.net/plist"
 )
@@ -178,7 +179,7 @@ func (a *App) unlockWith(ctx context.Context, s State, info VolumeInfo, pass []b
 		if _, err := a.expected(ctx, s, info); err != nil {
 			return info, err
 		}
-		if err := a.sudo(ctx, "/usr/sbin/diskutil", []string{"apfs", "unlockVolume", info.Device, "-stdinpassphrase"}, pass); err != nil {
+		if err := a.privileged(ctx, privileged.Request{Kind: privileged.KindUnlock, UUID: info.UUID}, "/usr/sbin/diskutil", []string{"apfs", "unlockVolume", info.Device, "-stdinpassphrase"}, pass); err != nil {
 			return info, err
 		}
 		var err error
@@ -463,7 +464,7 @@ func (a *App) prepareLock(ctx context.Context, planned, s State, info VolumeInfo
 	if err != nil || digest(verified) != digest(pass) {
 		return info, o, errors.New("recovery state changed during pre-lock hooks")
 	}
-	if err = a.excludeSnapshots(ctx); err != nil {
+	if err = a.excludeSnapshots(ctx, info.UUID); err != nil {
 		return info, o, err
 	}
 	if err = a.unchanged(ctx, o); err != nil {
@@ -489,7 +490,7 @@ func (a *App) unmountForRotation(ctx context.Context, s State, info VolumeInfo, 
 	// Encrypted APFS can lock automatically on unmount. Rotation needs its keys
 	// loaded, while the filesystem stays unmounted so applications cannot reopen it.
 	if info.Locked {
-		if err = a.sudo(ctx, "/usr/sbin/diskutil", []string{"apfs", "unlockVolume", device, "-nomount", "-stdinpassphrase"}, pass); err != nil {
+		if err = a.privileged(ctx, privileged.Request{Kind: privileged.KindUnlockNoMount, UUID: s.VolumeUUID}, "/usr/sbin/diskutil", []string{"apfs", "unlockVolume", device, "-nomount", "-stdinpassphrase"}, pass); err != nil {
 			return info, errors.New("cannot unlock unmounted APFS volume for rotation, original recovery retained")
 		}
 		info.Locked = false
@@ -525,7 +526,7 @@ func (a *App) rotateRecovery(ctx context.Context, s State, info VolumeInfo, pass
 	}
 	var rotationInput []byte = append(append(append([]byte{}, pass...), '\n'), fresh...)
 	rotationInput = append(rotationInput, '\n')
-	if err = a.sudo(ctx, "/usr/sbin/diskutil", []string{"apfs", "changePassphrase", info.Device, "-user", "disk", "-oldStdinpassphrase", "-newStdinpassphrase"}, rotationInput); err != nil {
+	if err = a.privileged(ctx, privileged.Request{Kind: privileged.KindRotate, UUID: info.UUID}, "/usr/sbin/diskutil", []string{"apfs", "changePassphrase", info.Device, "-user", "disk", "-oldStdinpassphrase", "-newStdinpassphrase"}, rotationInput); err != nil {
 		return nil, errors.New("APFS passphrase rotation failed, staged recovery retained at passphrase-new.txt")
 	}
 	// Every error after rotation retains the new plaintext until all durable artefacts verify.
@@ -631,7 +632,7 @@ func (a *App) sealRecovery(ctx context.Context, planned State, info VolumeInfo, 
 	var cleanupContext context.Context
 	var cancelCleanup context.CancelFunc
 	cleanupContext, cancelCleanup = context.WithTimeout(context.WithoutCancel(operationContext), 30*time.Second)
-	var cleanupErr error = a.sudo(cleanupContext, "/usr/bin/tmutil", []string{"deletelocalsnapshots", "/System/Volumes/Data"}, nil)
+	var cleanupErr error = a.privileged(cleanupContext, privileged.Request{Kind: privileged.KindDeleteDataSnapshots}, "/usr/bin/tmutil", []string{"deletelocalsnapshots", "/System/Volumes/Data"}, nil)
 	cancelCleanup()
 	var lockContext context.Context
 	var cancelLock context.CancelFunc
@@ -644,7 +645,7 @@ func (a *App) sealRecovery(ctx context.Context, planned State, info VolumeInfo, 
 	if err = a.unchanged(ctx, sealed); err != nil {
 		return err
 	}
-	if err = a.sudo(ctx, "/usr/sbin/diskutil", []string{"apfs", "lockVolume", info.Device}, nil); err != nil {
+	if err = a.privileged(ctx, privileged.Request{Kind: privileged.KindLock, UUID: info.UUID}, "/usr/sbin/diskutil", []string{"apfs", "lockVolume", info.Device}, nil); err != nil {
 		return errors.New("APFS lock failed after recovery removal, target security is unverified")
 	}
 	info, err = a.CheckMount(ctx, planned)
@@ -663,7 +664,7 @@ func (a *App) sealRecovery(ctx context.Context, planned State, info VolumeInfo, 
 	}
 	return a.RunHooks(ctx, "post-lock", planned, info)
 }
-func (a *App) excludeSnapshots(ctx context.Context) error {
+func (a *App) excludeSnapshots(ctx context.Context, uuid string) error {
 	var canonical string
 	var err error
 
@@ -671,7 +672,7 @@ func (a *App) excludeSnapshots(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err = a.sudo(ctx, "/usr/bin/tmutil", []string{"addexclusion", "-p", canonical}, nil); err != nil {
+	if err = a.privileged(ctx, privileged.Request{Kind: privileged.KindExcludePath, Path: canonical}, "/usr/bin/tmutil", []string{"addexclusion", "-p", canonical}, nil); err != nil {
 		return err
 	}
 	var output []byte
@@ -684,10 +685,10 @@ func (a *App) excludeSnapshots(ctx context.Context) error {
 	if _, err = plist.Unmarshal(output, &result); err != nil || len(result) != 1 || result[0]["Path"] != canonical || fmt.Sprint(result[0]["IsExcluded"]) != "1" {
 		return errors.New("Time Machine state-directory exclusion is unverified")
 	}
-	if err = a.sudo(ctx, "/usr/bin/tmutil", []string{"addexclusion", "-v", a.Config.MountPoint}, nil); err != nil {
+	if err = a.privileged(ctx, privileged.Request{Kind: privileged.KindExcludeVolume, UUID: uuid}, "/usr/bin/tmutil", []string{"addexclusion", "-v", a.Config.MountPoint}, nil); err != nil {
 		return err
 	}
-	return a.sudo(ctx, "/usr/bin/tmutil", []string{"deletelocalsnapshots", a.Config.MountPoint}, nil)
+	return a.privileged(ctx, privileged.Request{Kind: privileged.KindDeleteSnapshots, UUID: uuid}, "/usr/bin/tmutil", []string{"deletelocalsnapshots", a.Config.MountPoint}, nil)
 }
 func (a *App) secureTarget(ctx context.Context, s State, info VolumeInfo) error {
 	if !info.Locked || info.MountPoint != "" || !info.FileVault {
@@ -869,6 +870,7 @@ func (a *App) init(ctx context.Context) error {
 		return err
 	}
 	a.Report("UNLOCKED at %s", info.MountPoint)
+	a.registerHelperVolume(ctx, info.UUID)
 	return nil
 }
 func (a *App) checkVolumeAbsent(ctx context.Context) error {
@@ -987,6 +989,7 @@ func (a *App) status(ctx context.Context) error {
 	default:
 		a.Report("INCONSISTENT: recorded and observed vault states differ")
 	}
+	a.Report("%s", a.helperStatus(s.VolumeUUID))
 	if a.Options.Verbosity > 0 {
 		a.Report("Recorded locked: %t\nAPFS locked: %t\nDevice: %s\nMount: %s\nExpected mount: %s\nPlaintext: %t\nCiphertext: %t\nHash: %t", s.Locked, info.Locked, info.Device, info.MountPoint, a.Config.MountPoint, plain, cipher, hash)
 		if s.Round != nil {

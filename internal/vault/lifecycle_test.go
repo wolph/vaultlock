@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/wolph/vaultlock/internal/deadline"
+	"github.com/wolph/vaultlock/internal/privileged"
 	"github.com/wolph/vaultlock/internal/timelock"
 	"howett.net/plist"
 )
@@ -31,6 +32,7 @@ type lifecycleRunner struct {
 	rotated      []byte
 	before       func(string, []string)
 	unmountLocks bool
+	allowed      []string
 }
 
 func (r *lifecycleRunner) Run(ctx context.Context, path string, args []string, input []byte) ([]byte, error) {
@@ -44,6 +46,13 @@ func (r *lifecycleRunner) Run(ctx context.Context, path string, args []string, i
 	if path == "/usr/bin/sudo" {
 		path = args[0]
 		args = args[1:]
+	}
+	if path == privileged.HelperPath && len(args) == 2 && args[0] == "allow" {
+		r.allowed = append(r.allowed, args[1])
+		return nil, nil
+	}
+	if path == privileged.HelperPath {
+		path, args = r.translateHelper(args)
 	}
 	var joined string = strings.Join(args, " ")
 	if r.fail != "" && strings.Contains(joined, r.fail) {
@@ -109,6 +118,39 @@ func (r *lifecycleRunner) Run(ctx context.Context, path string, args []string, i
 	return nil, nil
 }
 
+// translateHelper maps a helper request onto the system command the real
+// helper would run, so the fixture's storage emulation stays in one place.
+func (r *lifecycleRunner) translateHelper(args []string) (string, []string) {
+	var request privileged.Request
+	var err error
+	request, err = privileged.Parse(args)
+	if err != nil {
+		panic("fixture received a malformed helper request: " + err.Error())
+	}
+	if request.UUID != "" && request.UUID != r.info.UUID {
+		panic("fixture received a helper request for an unknown volume " + request.UUID)
+	}
+	switch request.Kind {
+	case privileged.KindUnlock:
+		return "/usr/sbin/diskutil", []string{"apfs", "unlockVolume", r.info.Device, "-stdinpassphrase"}
+	case privileged.KindUnlockNoMount:
+		return "/usr/sbin/diskutil", []string{"apfs", "unlockVolume", r.info.Device, "-nomount", "-stdinpassphrase"}
+	case privileged.KindRotate:
+		return "/usr/sbin/diskutil", []string{"apfs", "changePassphrase", r.info.Device, "-user", "disk", "-oldStdinpassphrase", "-newStdinpassphrase"}
+	case privileged.KindLock:
+		return "/usr/sbin/diskutil", []string{"apfs", "lockVolume", r.info.Device}
+	case privileged.KindExcludeVolume:
+		return "/usr/bin/tmutil", []string{"addexclusion", "-v", r.info.MountPoint}
+	case privileged.KindDeleteSnapshots:
+		return "/usr/bin/tmutil", []string{"deletelocalsnapshots", r.info.MountPoint}
+	case privileged.KindDeleteDataSnapshots:
+		return "/usr/bin/tmutil", []string{"deletelocalsnapshots", "/System/Volumes/Data"}
+	case privileged.KindExcludePath:
+		return "/usr/bin/tmutil", []string{"addexclusion", "-p", request.Path}
+	}
+	panic("fixture cannot translate helper request")
+}
+
 type fixtureCrypto struct {
 	encryptFailure, verifyFailure bool
 	decrypted                     []byte
@@ -149,6 +191,7 @@ func lifecycleFixture(t *testing.T) (*App, *lifecycleRunner) {
 	a.Err = io.Discard
 	a.Options.Yes = true
 	a.Options.Hooks = false
+	a.HelperProbe = func(string) bool { return false }
 	a.Now = func() time.Time { return time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC) }
 	var r *lifecycleRunner = &lifecycleRunner{app: a, info: VolumeInfo{UUID: "UUID", Device: "disk3s7", MountPoint: config.MountPoint, Name: "vault", FileVault: true}, key: []byte("b2xkcGFzcw==")}
 	a.Runner = r

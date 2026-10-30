@@ -14,14 +14,15 @@ export VAULTLOCK_INSTALL_BIN_DIR_MODE := explicit
 endif
 export VAULTLOCK_INSTALL_BIN_DIR = $(value BIN_DIR)
 
-.PHONY: build dist test test-ci check check-ci lint check-format install clean
+.PHONY: build dist test test-ci check check-ci lint check-format install install-helper clean
 
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-X github.com/wolph/vaultlock/internal/cli.Version=$$VAULTLOCK_BUILD_VERSION" -o build/vaultlock ./cmd/vaultlock
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "-X main.Version=$$VAULTLOCK_BUILD_VERSION" -o build/vaultlock-privileged ./cmd/vaultlock-privileged
 	$(GO) run ./cmd/vaultlock-install build/vaultlock
 
 dist: build
-	tar -czf $(ARCHIVE) -C build vaultlock
+	tar -czf $(ARCHIVE) -C build vaultlock vaultlock-privileged
 	cd build && shasum -a 256 $(notdir $(ARCHIVE)) > $(notdir $(ARCHIVE)).sha256
 
 test test-ci:
@@ -36,6 +37,9 @@ check-format:
 check check-ci: test lint check-format build
 
 install: check
+
+install-helper: build
+	sudo build/vaultlock-privileged install
 
 clean:
 	rm -rf build
