@@ -251,8 +251,32 @@ func TestResolveExcludePathRequiresOwnedCanonicalDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := command.Path + " " + strings.Join(command.Args, " "); got != "/usr/bin/tmutil addexclusion -p "+owned {
-		t.Fatalf("exclude-path built %q", got)
+	if got := command.Path + " " + strings.Join(command.Args, " "); got != "/usr/bin/tmutil addexclusion -p ." || command.Directory == nil {
+		t.Fatalf("exclude-path built %q with directory %v", got, command.Directory)
+	}
+	var pinned, expected os.FileInfo
+	pinned, err = command.Directory.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err = os.Stat(owned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(pinned, expected) {
+		t.Fatal("pinned directory is not the requested one")
+	}
+	if err = os.Rename(owned, filepath.Join(real, "moved")); err != nil {
+		t.Fatal(err)
+	}
+	var moved os.FileInfo
+	moved, err = os.Stat(filepath.Join(real, "moved"))
+	if err != nil || !os.SameFile(pinned, moved) {
+		t.Fatalf("pinned directory did not follow the rename: %v", err)
+	}
+	command.Directory.Close()
+	if err = os.Rename(filepath.Join(real, "moved"), owned); err != nil {
+		t.Fatal(err)
 	}
 	var rejected []struct {
 		path string
@@ -260,7 +284,7 @@ func TestResolveExcludePathRequiresOwnedCanonicalDirectory(t *testing.T) {
 	} = []struct {
 		path string
 		uid  int
-	}{{link, uid}, {file, uid}, {owned, uid + 1}, {filepath.Join(real, "missing"), uid}}
+	}{{link, uid}, {file, uid}, {owned, uid + 1}, {filepath.Join(real, "missing"), uid}, {"/", uid}}
 	if root != real {
 		rejected = append(rejected, struct {
 			path string
@@ -268,7 +292,10 @@ func TestResolveExcludePathRequiresOwnedCanonicalDirectory(t *testing.T) {
 		}{root, uid})
 	}
 	for _, bad := range rejected {
-		if _, err = Resolve(context.Background(), Request{Kind: KindExcludePath, Path: bad.path}, &fakeRunner{}, bad.uid, nil); err == nil {
+		var rejectedCommand Command
+		rejectedCommand, err = Resolve(context.Background(), Request{Kind: KindExcludePath, Path: bad.path}, &fakeRunner{}, bad.uid, nil)
+		if err == nil {
+			rejectedCommand.Directory.Close()
 			t.Fatalf("exclude-path accepted %q for uid %d", bad.path, bad.uid)
 		}
 	}

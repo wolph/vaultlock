@@ -179,8 +179,11 @@ mount point up with `diskutil` itself, runs with an empty environment, and
 reads passphrases only from standard input. It refuses anything else:
 lower-case or malformed UUIDs, device names, volumes listed for another user,
 paths you don't own, and any `diskutil` or `tmutil` subcommand outside its
-table. Deleting the local snapshots of the system data volume, the one step
-that is not tied to a vault, needs the caller to be in the `admin` group. The
+table. The state-directory exclusion opens your directory one component at a
+time without following symlinks and runs `tmutil` inside that pinned
+directory, so renaming a component after the check changes nothing. Deleting
+the local snapshots of the system data volume, the one step that is not tied
+to a vault, needs the caller to be in the `admin` group. The
 administrative subcommands `allow`, `revoke`, `list`, and `uninstall` work only
 under `sudo`.
 

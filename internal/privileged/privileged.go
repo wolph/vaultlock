@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"unicode"
 
+	"golang.org/x/sys/unix"
 	"howett.net/plist"
 )
 
@@ -53,9 +54,12 @@ type Request struct {
 }
 
 // Command is the system command the helper runs for a verified request.
+// Directory, when set, is the pinned directory the command must run in so a
+// relative operand cannot be redirected after verification. The caller closes it.
 type Command struct {
-	Path string
-	Args []string
+	Path      string
+	Args      []string
+	Directory *os.File
 }
 
 // Runner executes a read-only inspection command and returns its output.
@@ -269,12 +273,15 @@ func Resolve(ctx context.Context, request Request, runner Runner, realUID int, g
 		if !AdminMember(groups) {
 			return Command{}, errors.New("deleting data-volume snapshots requires an administrator account")
 		}
-		return Command{tmutilPath, []string{"deletelocalsnapshots", DataVolume}}, nil
+		return Command{Path: tmutilPath, Args: []string{"deletelocalsnapshots", DataVolume}}, nil
 	case KindExcludePath:
-		if err := checkOwnedDirectory(request.Path, realUID); err != nil {
+		var directory *os.File
+		var err error
+		directory, err = openOwnedDirectory(request.Path, realUID)
+		if err != nil {
 			return Command{}, err
 		}
-		return Command{tmutilPath, []string{"addexclusion", "-p", request.Path}}, nil
+		return Command{Path: tmutilPath, Args: []string{"addexclusion", "-p", "."}, Directory: directory}, nil
 	}
 	var device, mount string
 	var err error
@@ -284,21 +291,21 @@ func Resolve(ctx context.Context, request Request, runner Runner, realUID int, g
 	}
 	switch request.Kind {
 	case KindUnlock:
-		return Command{diskutilPath, []string{"apfs", "unlockVolume", device, "-stdinpassphrase"}}, nil
+		return Command{Path: diskutilPath, Args: []string{"apfs", "unlockVolume", device, "-stdinpassphrase"}}, nil
 	case KindUnlockNoMount:
-		return Command{diskutilPath, []string{"apfs", "unlockVolume", device, "-nomount", "-stdinpassphrase"}}, nil
+		return Command{Path: diskutilPath, Args: []string{"apfs", "unlockVolume", device, "-nomount", "-stdinpassphrase"}}, nil
 	case KindRotate:
-		return Command{diskutilPath, []string{"apfs", "changePassphrase", device, "-user", "disk", "-oldStdinpassphrase", "-newStdinpassphrase"}}, nil
+		return Command{Path: diskutilPath, Args: []string{"apfs", "changePassphrase", device, "-user", "disk", "-oldStdinpassphrase", "-newStdinpassphrase"}}, nil
 	case KindLock:
-		return Command{diskutilPath, []string{"apfs", "lockVolume", device}}, nil
+		return Command{Path: diskutilPath, Args: []string{"apfs", "lockVolume", device}}, nil
 	case KindExcludeVolume, KindDeleteSnapshots:
 		if mount == "" {
 			return Command{}, errors.New("volume is not mounted")
 		}
 		if request.Kind == KindExcludeVolume {
-			return Command{tmutilPath, []string{"addexclusion", "-v", mount}}, nil
+			return Command{Path: tmutilPath, Args: []string{"addexclusion", "-v", mount}}, nil
 		}
-		return Command{tmutilPath, []string{"deletelocalsnapshots", mount}}, nil
+		return Command{Path: tmutilPath, Args: []string{"deletelocalsnapshots", mount}}, nil
 	}
 	return Command{}, errors.New("unknown operation")
 }
@@ -343,34 +350,46 @@ func inspect(ctx context.Context, runner Runner, uuid string) (string, string, e
 	return device, mount, nil
 }
 
-func checkOwnedDirectory(path string, realUID int) error {
+// openOwnedDirectory opens path one component at a time without following
+// symlinks, then checks on the descriptor that it is a directory owned by the
+// invoking user. The descriptor pins that directory, so the command that runs
+// in it cannot be redirected by renaming a component afterwards.
+func openOwnedDirectory(path string, realUID int) (*os.File, error) {
 	if err := validPath(path); err != nil {
-		return err
+		return nil, err
 	}
-	var canonical string
+	if path == "/" {
+		return nil, errors.New("the root directory cannot be excluded")
+	}
+	var fd int
 	var err error
-	canonical, err = filepath.EvalSymlinks(path)
+	fd, err = unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return fmt.Errorf("cannot resolve %s", path)
+		return nil, err
 	}
-	if canonical != path {
-		return errors.New("path must not traverse symlinks")
+	for _, component := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+		var next int
+		next, err = unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		unix.Close(fd)
+		if err != nil {
+			return nil, fmt.Errorf("cannot open %s as a directory without following symlinks", path)
+		}
+		fd = next
 	}
-	var info os.FileInfo
-	info, err = os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("cannot inspect %s", path)
+	var stat unix.Stat_t
+	if err = unix.Fstat(fd, &stat); err != nil {
+		unix.Close(fd)
+		return nil, err
 	}
-	if !info.IsDir() {
-		return errors.New("path must be a directory")
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		unix.Close(fd)
+		return nil, errors.New("path must be a directory")
 	}
-	var stat *syscall.Stat_t
-	var ok bool
-	stat, ok = info.Sys().(*syscall.Stat_t)
-	if !ok || int(stat.Uid) != realUID {
-		return errors.New("directory must belong to the invoking user")
+	if int(stat.Uid) != realUID {
+		unix.Close(fd)
+		return nil, errors.New("directory must belong to the invoking user")
 	}
-	return nil
+	return os.NewFile(uintptr(fd), path), nil
 }
 
 // Usable reports whether the helper's file metadata makes it safe to invoke:

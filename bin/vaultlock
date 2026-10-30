@@ -2710,6 +2710,9 @@ progress_join() { # fields...
 progress_bar_line() { # done_bytes total_bytes done_count total_count elapsed width label pass current
   local done_bytes=$1 total_bytes=$2 done_count=$3 total_count=$4
   local elapsed=$5 width=$6 label=$7 pass_text=$8 current=$9
+  # File names come from the copied tree. A control character in one must
+  # not reach the terminal as an escape sequence.
+  current=${current//[[:cntrl:]]/?}
   local value percent cells amount rate eta counts line available
   for value in "$done_bytes" "$total_bytes" "$done_count" "$total_count" \
       "$elapsed" "$width"; do
@@ -4689,7 +4692,10 @@ adopt_consume_ditto_output() {
         progress_tick "$bytes" "$path"
         ;;
       'hardlinked ./'*|'linked ./'*) progress_tick 0 "${line#* ./}" ;;
-      'ditto: '*) presentation_stderr ditto-diagnostic "$line"$'\n' || true ;;
+      'ditto: '*)
+        presentation_stderr ditto-diagnostic "${line//[[:cntrl:]]/?}"$'\n' \
+          || true
+        ;;
     esac
   done
   return 0

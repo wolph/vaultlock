@@ -110,7 +110,17 @@ func operate(ctx context.Context, args []string, ids identity, stdin io.Reader, 
 	}
 	var child *exec.Cmd = exec.CommandContext(ctx, command.Path, command.Args...)
 	child.Env = minimalEnvironment()
-	child.Dir = "/"
+	if command.Directory != nil {
+		// Run inside the pinned directory: the child resolves "." through the
+		// descriptor's directory, whatever the path is called by now.
+		defer command.Directory.Close()
+		if err = syscall.Fchdir(int(command.Directory.Fd())); err != nil {
+			fmt.Fprintf(stderr, "vaultlock-privileged: cannot enter the verified directory: %s\n", err)
+			return 1
+		}
+	} else {
+		child.Dir = "/"
+	}
 	child.Stdin = stdin
 	child.Stdout = stdout
 	child.Stderr = stderr
