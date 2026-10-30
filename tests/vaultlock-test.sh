@@ -987,4 +987,93 @@ else
   fail=1
 fi
 
+# Progress bar formatting helpers used by adopt.
+progress_format() { # kind value
+  VAULTLOCK_TEST_FAKE_SYSTEM=1 "$VL" __progress_format "$@" 2>&1
+}
+check "progress bytes zero" '0 B' "$(progress_format bytes 0)"
+check "progress bytes under a kilobyte" '999 B' "$(progress_format bytes 999)"
+check "progress bytes rounds to one decimal" '1.2 MB' \
+  "$(progress_format bytes 1234567)"
+check "progress bytes rounds half up" '1.3 MB' \
+  "$(progress_format bytes 1250000)"
+check "progress bytes gigabytes" '86.2 GB' \
+  "$(progress_format bytes 86200000000)"
+check "progress bytes terabytes" '1.5 TB' \
+  "$(progress_format bytes 1500000000000)"
+check "progress bytes carries into the next unit" '1.0 GB' \
+  "$(progress_format bytes 999950000)"
+check "progress duration seconds" '0:59' "$(progress_format duration 59)"
+check "progress duration minutes" '4:36' "$(progress_format duration 276)"
+check "progress duration hours" '1:02:05' \
+  "$(progress_format duration 3725)"
+progress_format_status=0
+progress_format bytes abc >/dev/null || progress_format_status=$?
+check "progress format rejects non-numeric input" 64 \
+  "$progress_format_status"
+
+progress_bar() { # done_bytes total_bytes done_count total_count elapsed width label pass current
+  VAULTLOCK_TEST_FAKE_SYSTEM=1 "$VL" __progress_bar "$@" 2>&1
+}
+check "progress bar renders every field" \
+  'Verify copied source [########------------]  43%  86.2 GB / 200.1 GB  412.4 MB/s  ETA 4:36  12345/67890  pass 2/6 destination  games/Elden Ring/data.pak' \
+  "$(progress_bar 86200000000 200100000000 12345 67890 209 200 \
+    'Verify copied source' 'pass 2/6 destination' \
+    'games/Elden Ring/data.pak')"
+check "progress bar without elapsed time shows no rate" \
+  'Copy source into vault [--------------------]   0%  0 B / 200.1 GB  -- B/s  ETA --:--  0/67890  games/a' \
+  "$(progress_bar 0 200100000000 0 67890 0 200 'Copy source into vault' '' \
+    'games/a')"
+check "progress bar counts entries when bytes are unknown" \
+  'Restore timestamps [##########----------]  50%  5/10  ETA 0:03' \
+  "$(progress_bar 0 0 5 10 3 200 'Restore timestamps' '' '')"
+check "progress bar clamps overshoot" \
+  'Copy source into vault [####################] 100%  201.0 GB / 200.1 GB  2.0 GB/s  ETA 0:00  67891/67890' \
+  "$(progress_bar 201000000000 200100000000 67891 67890 100 200 \
+    'Copy source into vault' '' '')"
+narrow_bar=$(progress_bar 86200000000 200100000000 12345 67890 209 140 \
+  'Verify copied source' 'pass 2/6 destination' \
+  'games/Elden Ring/some/very/long/path/to/data.pak')
+check "progress bar fits a narrow terminal" 139 "${#narrow_bar}"
+check "progress bar keeps the tail of a long path" '.../data.pak' \
+  "${narrow_bar##*  }"
+check "progress bar drops the path when nothing fits" \
+  'Verify copied source [########------------]  43%  86.2 GB / 200.1 GB  412.4 MB/s  ETA 4:36  12345/67890  pass 2/6 destination' \
+  "$(progress_bar 86200000000 200100000000 12345 67890 209 130 \
+    'Verify copied source' 'pass 2/6 destination' 'games/data.pak')"
+check "progress bar sheds counts and rate before its label" \
+  'Verify copied source [########------------]  43%  86.2 GB / 200.1 GB  ETA 4:36' \
+  "$(progress_bar 86200000000 200100000000 12345 67890 209 80 \
+    'Verify copied source' 'pass 2/6 destination' 'games/data.pak')"
+
+# Progress mode resolution mirrors colour: auto needs a stdout terminal.
+progress_mode() { # mode
+  /bin/bash "$VL" __progress_mode "$@" 2>&1
+}
+check "auto progress renders on a stdout terminal" 'true 100' \
+  "$(VAULTLOCK_TEST_FAKE_SYSTEM=1 VAULTLOCK_TEST_STDOUT_TTY=true \
+    COLUMNS=100 TERM=xterm-256color progress_mode auto)"
+check "auto progress stays silent through pipes" 'false 100' \
+  "$(VAULTLOCK_TEST_FAKE_SYSTEM=1 VAULTLOCK_TEST_STDOUT_TTY=false \
+    COLUMNS=100 TERM=xterm-256color progress_mode auto)"
+check "auto progress stays silent on a dumb terminal" 'false 100' \
+  "$(VAULTLOCK_TEST_FAKE_SYSTEM=1 VAULTLOCK_TEST_STDOUT_TTY=true \
+    COLUMNS=100 TERM=dumb progress_mode auto)"
+check "always progress ignores the pipe" 'true 100' \
+  "$(VAULTLOCK_TEST_FAKE_SYSTEM=1 VAULTLOCK_TEST_STDOUT_TTY=false \
+    COLUMNS=100 TERM=dumb progress_mode always)"
+check "never progress ignores the terminal" 'false 100' \
+  "$(VAULTLOCK_TEST_FAKE_SYSTEM=1 VAULTLOCK_TEST_STDOUT_TTY=true \
+    COLUMNS=100 TERM=xterm-256color progress_mode never)"
+check "progress width falls back to 80 columns" 'true 80' \
+  "$(VAULTLOCK_TEST_FAKE_SYSTEM=1 VAULTLOCK_TEST_STDOUT_TTY=false \
+    COLUMNS='' PATH=/nonexistent TERM=xterm-256color progress_mode always)"
+check "progress width ignores a non-numeric COLUMNS" 'true 80' \
+  "$(VAULTLOCK_TEST_FAKE_SYSTEM=1 VAULTLOCK_TEST_STDOUT_TTY=false \
+    COLUMNS=wide PATH=/nonexistent TERM=xterm-256color progress_mode always)"
+progress_mode_status=0
+VAULTLOCK_TEST_FAKE_SYSTEM=1 progress_mode sometimes >/dev/null \
+  || progress_mode_status=$?
+check "progress mode rejects unknown values" 64 "$progress_mode_status"
+
 exit "$fail"

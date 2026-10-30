@@ -636,6 +636,9 @@ $fixture_ditto_destination_parent/$fixture_ditto_destination_leaf
       if [[ -f "$VAULTLOCK_TEST_APFS_STATE/ditto_emits_success" ]]; then
         /usr/bin/printf 'Copy completed\n'
       fi
+      if [[ -f "$VAULTLOCK_TEST_APFS_STATE/ditto_emits_warning" ]]; then
+        /usr/bin/printf 'ditto: fixture warning\n' >&2
+      fi
       ;;
     dirname) /usr/bin/dirname "$@" ;;
     basename) /usr/bin/basename "$@" ;;
@@ -2289,6 +2292,7 @@ reset_operation_lock_fixture() {
     "$apfs_state/tmutil_emits_success_stderr" \
     "$apfs_state/unmount_emits_success" \
     "$apfs_state/ditto_emits_success" \
+    "$apfs_state/ditto_emits_warning" \
     "$apfs_state/validation_transition_ran" \
     "$apfs_state"/transition_*
 }
@@ -3698,6 +3702,102 @@ test_default_adopt_progress() {
     '-> Replace source with symlink'
 }
 
+prepare_progress_bar_source() { # name
+  reset_task2_deferred_fixture
+  write_json_state false null null null UUID-INIT
+  write_apfs_state false true UUID-INIT disk8s1
+  printf '%s' "$task2_unlock_passphrase" > "$state_dir/passphrase.txt"
+  PROGRESS_BAR_SOURCE="$test_root/$1"
+  /bin/mkdir -p "$PROGRESS_BAR_SOURCE/sub"
+  printf 'payload\n' > "$PROGRESS_BAR_SOURCE/file with spaces"
+  printf 'more\n' > "$PROGRESS_BAR_SOURCE/sub/more"
+}
+
+# One full adopt with forced bars. A full adopt costs about a minute in this
+# harness, so CI runs only this scenario and the full suite adds the rest.
+test_adopt_progress_bars_forced() {
+  local output esc=$'\033' cr=$'\r'
+
+  prepare_progress_bar_source "progress bar always source"
+  output=$(COLUMNS=200 run_vaultlock adopt --progress=always --yes \
+    "$PROGRESS_BAR_SOURCE" 2>&1)
+  check_contains "forced adopt draws the copy bar" \
+    "${cr}Copy source into vault [" "$output"
+  check_contains "forced adopt completes the copy bar" \
+    "] 100%  13 B / 13 B" "$output"
+  check_contains "forced adopt names the current file" \
+    "  sub/more${esc}[K" "$output"
+  check_contains "forced adopt draws the manifest bar" \
+    "${cr}Manifest source [" "$output"
+  check_contains "forced adopt shows the hardlink index before each pass" \
+    "  indexing hardlinks  sub/more${esc}[K" "$output"
+  check_contains "forced adopt draws the verification passes" \
+    "  pass 6/6 source" "$output"
+  check_contains "forced adopt draws the replacement passes" \
+    "  pass 4/4 destination" "$output"
+  check_contains "forced adopt draws the timestamp bar" \
+    "${cr}Restore timestamps [" "$output"
+  check_contains "forced adopt clears the bar before its summary" \
+    "${cr}${esc}[K   Copied 4 entries, 13 B in " "$output"
+  check_line "forced adopt reports the scanned source" \
+    '   Scanned 4 entries, 13 B' "$output"
+  check_contains "forced adopt reports the source manifest passes" \
+    "${cr}${esc}[K   Hashed 2 passes over 4 entries, 13 B in " "$output"
+  check_contains "forced adopt reports restored timestamps" \
+    "${cr}${esc}[K   Restored timestamps on 4 entries in " "$output"
+  check_contains "forced adopt reports the verification passes" \
+    "${cr}${esc}[K   Hashed 6 passes over 4 entries, 13 B in " "$output"
+  check_contains "forced adopt reports the replacement passes" \
+    "${cr}${esc}[K   Hashed 4 passes over 4 entries, 13 B in " "$output"
+  task3_check_output_order "forced adopt summaries follow their groups" \
+    "$output" \
+    '-> Copy source into vault' '   Scanned 4 entries, 13 B' \
+    '   Hashed 2 passes over 4 entries' '   Copied 4 entries' \
+    '   Restored timestamps on 4 entries' \
+    '-> Verify copied source' '   Hashed 6 passes over 4 entries' \
+    '-> Replace source with symlink' '   Hashed 4 passes over 4 entries' \
+    'Result: adopted'
+  check_line_prefix_count "forced adopt keeps three start arrows" \
+    3 '->' "$output"
+  check "forced adopt replaces the source" true \
+    "$([[ -L "$PROGRESS_BAR_SOURCE" ]] && printf true || printf false)"
+}
+
+test_adopt_progress_bars_modes() {
+  local output cr=$'\r'
+
+  prepare_progress_bar_source "progress bar piped source"
+  : > "$apfs_state/ditto_emits_warning"
+  run_vaultlock adopt --yes "$PROGRESS_BAR_SOURCE" \
+    > "$test_root/progress-piped-stdout" \
+    2> "$test_root/progress-piped-stderr" || true
+  /bin/rm -f "$apfs_state/ditto_emits_warning"
+  output=$(< "$test_root/progress-piped-stdout")
+  check_not_contains "piped adopt draws no progress bar" "$cr" "$output"
+  check_line "piped adopt reports the scanned source" \
+    '   Scanned 4 entries, 13 B' "$output"
+  check_contains "piped adopt reports the copy" \
+    $'\n   Copied 4 entries, 13 B in ' "$output"
+  check_contains "piped adopt reports the verification passes" \
+    $'\n   Hashed 6 passes over 4 entries, 13 B in ' "$output"
+  check_line_prefix_count "piped adopt keeps three start arrows" \
+    3 '->' "$output"
+  check_not_contains "ditto diagnostics stay off stdout" \
+    'ditto: fixture warning' "$output"
+  check_contains "ditto diagnostics reach stderr" \
+    'ditto: fixture warning' "$(< "$test_root/progress-piped-stderr")"
+  check "piped adopt replaces the source" true \
+    "$([[ -L "$PROGRESS_BAR_SOURCE" ]] && printf true || printf false)"
+
+  prepare_progress_bar_source "progress bar never source"
+  output=$(VAULTLOCK_TEST_STDOUT_TTY=true run_vaultlock adopt \
+    --progress=never --yes "$PROGRESS_BAR_SOURCE" 2>&1)
+  check_not_contains "never progress draws no bar on a terminal" \
+    "$cr" "$output"
+  check_contains "never progress still summarises" \
+    '   Copied 4 entries, 13 B in ' "$output"
+}
+
 test_ci_adopt_dry_run() {
   local output source
 
@@ -3752,6 +3852,8 @@ run_task3_progress_tests() {
   test_default_unlock_progress
   test_default_init_progress
   test_default_adopt_progress
+  test_adopt_progress_bars_forced
+  test_adopt_progress_bars_modes
   test_task3_lock_progress
   test_task3_unlock_progress
   test_task3_secure_and_repair_progress
@@ -4450,7 +4552,7 @@ check_line "help lists init safety options" \
   '  init [--dry-run] [--yes] [-v|-vv] [--color=MODE]' \
   "$help_output"
 check_line "help lists adopt safety options" \
-  '  adopt [--dry-run] [--yes] [-v|-vv] [--color=MODE] <dir>' \
+  '  adopt [--dry-run] [--yes] [-v|-vv] [--color=MODE] [--progress=MODE] <dir>' \
   "$help_output"
 check_line "help lists long verbose options" \
   '  -v, --verbose             detailed progress and state information' "$help_output"
@@ -4463,6 +4565,8 @@ check_line "help lists status presentation options" \
 check_line "help documents colour modes" \
   '  --color=auto|always|never  control terminal colour (default: auto)' \
   "$help_output"
+check_line "help documents progress modes" \
+  '  --progress=auto|always|never' "$help_output"
 
 if [[ "${VAULTLOCK_TEST_CI_ONLY:-0}" == "1" ]]; then
   test_default_lock_progress
@@ -4471,6 +4575,7 @@ if [[ "${VAULTLOCK_TEST_CI_ONLY:-0}" == "1" ]]; then
   test_task3_progress_mapper_prevalidation
   check_not_contains "CI mapper failure performs no coordination action" \
     'transition-fixture progress_plan_before_validation' "$(< "$action_log")"
+  test_adopt_progress_bars_forced
   test_ci_adopt_dry_run
   test_ci_lock_stdout_epipe
   exit "$fail"

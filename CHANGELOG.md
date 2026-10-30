@@ -4,6 +4,14 @@
 
 ### Added
 
+- Progress bars for `adopt`: byte and entry totals from a scan of the source,
+  then a redrawn bar with percentage, rate, ETA, pass number, and current file
+  for the manifest, copy, timestamp, and verification phases. Each phase
+  leaves one summary line. `--progress=auto|always|never` controls the bars,
+  with `auto` drawing only on a stdout terminal.
+- `scripts/install-deps.sh` installs `tle` from a checksum-verified tlock
+  release and `jq` through Homebrew where macOS doesn't bundle it, with
+  `--dry-run` and `--bin-dir`. See `docs/installing-requirements.md`.
 - Repository workflow with `make test`, `make check`, and guarded `make install`.
 - GitHub Actions checks on macOS 15 and 26 for Intel and Apple Silicon.
 - A bounded `make check-ci` gate with CLI smoke coverage. The complete

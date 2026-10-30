@@ -63,7 +63,10 @@ OPTION_YES=false
 OPTION_HOOKS=true
 OPTION_VERBOSITY=0
 OPTION_COLOR=auto
+OPTION_PROGRESS=auto
 OPTION_OPERANDS=""
+PROGRESS_ENABLED=false
+PROGRESS_WIDTH=80
 
 COLOR_STDOUT=false
 COLOR_STDERR=false
@@ -271,6 +274,35 @@ stream_is_terminal() { # stream
   esac
 }
 
+# Progress bars need a stdout terminal: they redraw the line in place.
+resolve_progress() { # mode
+  local mode=$1
+  PROGRESS_ENABLED=false
+  case "$mode" in
+    always) PROGRESS_ENABLED=true ;;
+    never) ;;
+    auto)
+      if [[ "${TERM:-}" != "dumb" ]] && stream_is_terminal 1; then
+        PROGRESS_ENABLED=true
+      fi
+      ;;
+    *) die_usage "invalid progress mode: $mode" ;;
+  esac
+  PROGRESS_WIDTH=$(progress_terminal_width)
+}
+
+progress_terminal_width() {
+  local width=${COLUMNS:-}
+  if [[ ! "$width" =~ ^[1-9][0-9]*$ ]]; then
+    width=$(/usr/bin/tput cols 2>/dev/null) || width=""
+  fi
+  if [[ "$width" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s\n' "$width"
+  else
+    printf '80\n'
+  fi
+}
+
 resolve_colour() { # mode
   local mode=$1
   COLOR_STDOUT=false
@@ -427,7 +459,7 @@ report_hook_failure() { # phase scope status hook
   print_error "$1 $2 hook failed with exit $3: $4"
 }
 
-die() { print_error "$*" || true; exit 1; }
+die() { progress_abort; print_error "$*" || true; exit 1; }
 die_usage() { print_error "$*" || true; exit 64; }
 note() { local text; printf -v text '%s\n' "$*"; presentation_stdout note "$text"; }
 
@@ -481,8 +513,10 @@ parse_command_options() { # command argv
   OPTION_HOOKS=true
   OPTION_VERBOSITY=0
   OPTION_COLOR=auto
+  OPTION_PROGRESS=auto
   OPTION_OPERANDS=""
   resolve_colour "$OPTION_COLOR"
+  resolve_progress "$OPTION_PROGRESS"
 
   while [[ $# -gt 0 ]]; do
     argument=$1
@@ -498,6 +532,13 @@ parse_command_options() { # command argv
         resolve_colour "$OPTION_COLOR"
         ;;
       --color=*) die_usage "invalid colour mode: ${argument#--color=}" ;;
+      --progress=auto|--progress=always|--progress=never)
+        OPTION_PROGRESS=${argument#--progress=}
+        resolve_progress "$OPTION_PROGRESS"
+        ;;
+      --progress=*)
+        die_usage "invalid progress mode: ${argument#--progress=}"
+        ;;
       --dry-run) OPTION_DRY_RUN=true ;;
       --yes) OPTION_YES=true ;;
       --no-hooks) OPTION_HOOKS=false ;;
@@ -2591,6 +2632,277 @@ lock:tm_delete_vault_snapshots|lock:tm_delete_data_snapshots)
   esac
 }
 
+PROGRESS_BAR_CELLS=20
+
+progress_format_bytes() { # bytes
+  local bytes=$1 unit=1 index=0 tenths
+  local suffixes=(B KB MB GB TB PB)
+  [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+  while (( bytes >= 1000 * unit && index < 5 )); do
+    unit=$((unit * 1000))
+    index=$((index + 1))
+  done
+  if (( index == 0 )); then
+    printf '%d B\n' "$bytes"
+    return 0
+  fi
+  tenths=$(( (bytes * 10 + unit / 2) / unit ))
+  if (( tenths >= 10000 && index < 5 )); then
+    unit=$((unit * 1000))
+    index=$((index + 1))
+    tenths=$(( (bytes * 10 + unit / 2) / unit ))
+  fi
+  printf '%d.%d %s\n' $((tenths / 10)) $((tenths % 10)) "${suffixes[$index]}"
+}
+
+progress_format_duration() { # seconds
+  local seconds=$1
+  [[ "$seconds" =~ ^[0-9]+$ ]] || return 1
+  if (( seconds >= 3600 )); then
+    printf '%d:%02d:%02d\n' $((seconds / 3600)) $((seconds % 3600 / 60)) \
+      $((seconds % 60))
+  else
+    printf '%d:%02d\n' $((seconds / 60)) $((seconds % 60))
+  fi
+}
+
+progress_bar_cells() { # percent
+  local filled=$(( $1 * PROGRESS_BAR_CELLS / 100 )) cells="" index
+  for ((index = 0; index < PROGRESS_BAR_CELLS; index++)); do
+    if (( index < filled )); then cells+='#'; else cells+='-'; fi
+  done
+  printf '[%s]\n' "$cells"
+}
+
+# Estimated seconds remaining from the completed share and elapsed time.
+progress_eta() { # done total elapsed
+  local done=$1 total=$2 elapsed=$3 remaining
+  if (( elapsed == 0 || done == 0 )); then
+    printf -- '--:--\n'
+    return 0
+  fi
+  remaining=$(( total - done ))
+  (( remaining >= 0 )) || remaining=0
+  progress_format_duration $(( remaining * elapsed / done ))
+}
+
+progress_rate() { # done_bytes elapsed
+  if (( $2 == 0 )); then
+    printf -- '-- B/s\n'
+    return 0
+  fi
+  printf '%s/s\n' "$(progress_format_bytes $(( $1 / $2 )))"
+}
+
+progress_join() { # fields...
+  local joined="" field
+  for field in "$@"; do
+    [[ -n "$field" ]] || continue
+    if [[ -n "$joined" ]]; then joined+="  $field"; else joined=$field; fi
+  done
+  printf '%s\n' "$joined"
+}
+
+# One rendered bar line that fits within width - 1 columns. Fields are shed
+# in a fixed order when the terminal is too narrow: the current path is
+# shortened or dropped first, then the pass text, the counts, the rate, and
+# finally the label.
+progress_bar_line() { # done_bytes total_bytes done_count total_count elapsed width label pass current
+  local done_bytes=$1 total_bytes=$2 done_count=$3 total_count=$4
+  local elapsed=$5 width=$6 label=$7 pass_text=$8 current=$9
+  local value percent cells amount rate eta counts line available
+  for value in "$done_bytes" "$total_bytes" "$done_count" "$total_count" \
+      "$elapsed" "$width"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  done
+  if (( total_bytes > 0 )); then
+    percent=$(( done_bytes * 100 / total_bytes ))
+    amount="$(progress_format_bytes "$done_bytes") / $(progress_format_bytes "$total_bytes")"
+    rate=$(progress_rate "$done_bytes" "$elapsed")
+    eta="ETA $(progress_eta "$done_bytes" "$total_bytes" "$elapsed")"
+  elif (( total_count > 0 )); then
+    percent=$(( done_count * 100 / total_count ))
+    amount="$done_count/$total_count"
+    rate=""
+    eta="ETA $(progress_eta "$done_count" "$total_count" "$elapsed")"
+  else
+    percent=0
+    amount=""
+    rate=""
+    eta=""
+  fi
+  (( percent <= 100 )) || percent=100
+  counts=""
+  (( total_bytes == 0 || total_count == 0 )) \
+    || counts="$done_count/$total_count"
+  # The bar and its percentage share a single space, unlike the other fields.
+  printf -v cells '%s %3d%%' "$(progress_bar_cells "$percent")" "$percent"
+  line=$(progress_join "$label" "$cells" "$amount" "$rate" "$eta" \
+    "$counts" "$pass_text")
+  # The label and the bar share a single space as well.
+  [[ -z "$label" ]] || line="$label ${line#"$label  "}"
+  if [[ -n "$current" ]]; then
+    available=$(( width - 1 - ${#line} - 2 ))
+    if (( available >= ${#current} )); then
+      line+="  $current"
+    elif (( available >= 8 )); then
+      line+="  ...${current:$(( ${#current} - available + 3 ))}"
+    fi
+  fi
+  (( ${#line} >= width )) || { printf '%s\n' "$line"; return 0; }
+  line=$(progress_join "$label" "$cells" "$amount" "$rate" "$eta" "$counts")
+  [[ -z "$label" ]] || line="$label ${line#"$label  "}"
+  (( ${#line} >= width )) || { printf '%s\n' "$line"; return 0; }
+  line=$(progress_join "$label" "$cells" "$amount" "$rate" "$eta")
+  [[ -z "$label" ]] || line="$label ${line#"$label  "}"
+  (( ${#line} >= width )) || { printf '%s\n' "$line"; return 0; }
+  line=$(progress_join "$label" "$cells" "$amount" "$eta")
+  [[ -z "$label" ]] || line="$label ${line#"$label  "}"
+  (( ${#line} >= width )) || { printf '%s\n' "$line"; return 0; }
+  progress_join "$cells" "$amount" "$eta"
+}
+
+# Live progress state for one adopt phase. Ticks may arrive from pipeline
+# subshells, so the parent advances completed passes itself.
+PROGRESS_ACTIVE=false
+PROGRESS_LABEL=""
+PROGRESS_TOTAL_BYTES=0
+PROGRESS_TOTAL_COUNT=0
+PROGRESS_PASSES=1
+PROGRESS_PASS=0
+PROGRESS_PASS_TEXT=""
+PROGRESS_DONE_BYTES=0
+PROGRESS_DONE_COUNT=0
+PROGRESS_START_SECONDS=0
+PROGRESS_LAST_KEY=""
+PROGRESS_SAVED_PASS_TEXT=""
+
+# Rendering is cosmetic. It only writes through the pinned presentation
+# descriptors, so a bar can never leak into a captured command substitution
+# or a digest pipeline, and a failed write never changes the outcome.
+progress_can_render() {
+  [[ "$PROGRESS_ENABLED" == true && "$PRESENTATION_FDS_PINNED" == true ]]
+}
+
+progress_begin() { # label total_bytes total_count passes
+  PROGRESS_ACTIVE=true
+  PROGRESS_LABEL=$1
+  PROGRESS_TOTAL_BYTES=$2
+  PROGRESS_TOTAL_COUNT=$3
+  PROGRESS_PASSES=$4
+  PROGRESS_PASS=0
+  PROGRESS_PASS_TEXT=""
+  PROGRESS_DONE_BYTES=0
+  PROGRESS_DONE_COUNT=0
+  PROGRESS_START_SECONDS=$SECONDS
+  PROGRESS_LAST_KEY=""
+  progress_render "" force
+}
+
+# Start the next pass over the tree, named for the bar (source, destination).
+progress_pass() { # name
+  [[ "$PROGRESS_ACTIVE" == true ]] || return 0
+  PROGRESS_PASS=$((PROGRESS_PASS + 1))
+  PROGRESS_DONE_BYTES=$(( (PROGRESS_PASS - 1) * PROGRESS_TOTAL_BYTES ))
+  PROGRESS_DONE_COUNT=$(( (PROGRESS_PASS - 1) * PROGRESS_TOTAL_COUNT ))
+  PROGRESS_PASS_TEXT=""
+  (( PROGRESS_PASSES <= 1 )) \
+    || PROGRESS_PASS_TEXT="pass $PROGRESS_PASS/$PROGRESS_PASSES $1"
+  PROGRESS_LAST_KEY=""
+  progress_render "" force
+}
+
+# Record passes that ran inside a command substitution.
+progress_passes_done() { # count
+  [[ "$PROGRESS_ACTIVE" == true ]] || return 0
+  PROGRESS_PASS=$((PROGRESS_PASS + $1))
+  PROGRESS_DONE_BYTES=$(( PROGRESS_PASS * PROGRESS_TOTAL_BYTES ))
+  PROGRESS_DONE_COUNT=$(( PROGRESS_PASS * PROGRESS_TOTAL_COUNT ))
+}
+
+# The hardlink index walks every regular file before a manifest pass. It
+# runs in the same subshell as the pass, so the counter it advances is
+# discarded with that subshell and the pass starts from its own baseline.
+progress_index_begin() {
+  [[ "$PROGRESS_ACTIVE" == true ]] || return 0
+  PROGRESS_SAVED_PASS_TEXT=$PROGRESS_PASS_TEXT
+  PROGRESS_PASS_TEXT="indexing hardlinks"
+}
+
+progress_index_end() {
+  [[ "$PROGRESS_ACTIVE" == true ]] || return 0
+  PROGRESS_PASS_TEXT=$PROGRESS_SAVED_PASS_TEXT
+  PROGRESS_LAST_KEY=""
+}
+
+progress_tick() { # bytes path
+  [[ "$PROGRESS_ACTIVE" == true ]] || return 0
+  PROGRESS_DONE_BYTES=$((PROGRESS_DONE_BYTES + $1))
+  PROGRESS_DONE_COUNT=$((PROGRESS_DONE_COUNT + 1))
+  progress_render "$2"
+}
+
+# Redraw when the completed share of bytes or entries (per mille) or the
+# elapsed second changes, which bounds the redraws per pass.
+progress_render() { # path [force]
+  progress_can_render || return 0
+  local total_bytes=$(( PROGRESS_TOTAL_BYTES * PROGRESS_PASSES ))
+  local total_count=$(( PROGRESS_TOTAL_COUNT * PROGRESS_PASSES ))
+  local elapsed=$(( SECONDS - PROGRESS_START_SECONDS )) permille=0
+  local count_permille=0 key line
+  (( total_bytes == 0 )) \
+    || permille=$(( PROGRESS_DONE_BYTES * 1000 / total_bytes ))
+  (( total_count == 0 )) \
+    || count_permille=$(( PROGRESS_DONE_COUNT * 1000 / total_count ))
+  key="$permille:$count_permille:$elapsed"
+  [[ "${2:-}" == force || "$key" != "$PROGRESS_LAST_KEY" ]] || return 0
+  PROGRESS_LAST_KEY=$key
+  line=$(progress_bar_line "$PROGRESS_DONE_BYTES" "$total_bytes" \
+    "$PROGRESS_DONE_COUNT" "$total_count" "$elapsed" "$PROGRESS_WIDTH" \
+    "$PROGRESS_LABEL" "$PROGRESS_PASS_TEXT" "$1") || return 0
+  presentation_stdout progress-bar $'\r'"$line"$'\033[K' || true
+}
+
+progress_clear_line() {
+  progress_can_render || return 0
+  presentation_stdout progress-bar $'\r\033[K' || true
+}
+
+# One indented summary line that stays in the transcript after the bar.
+progress_summary() { # text
+  local text
+  [[ "$PRESENTATION_FDS_PINNED" == true ]] || return 0
+  if [[ "$COLOR_STDOUT" == true ]]; then
+    printf -v text '%s   %s%s\n' "$COLOR_DIM" "$1" "$COLOR_RESET"
+  else
+    printf -v text '   %s\n' "$1"
+  fi
+  presentation_stdout progress-summary "$text" || true
+}
+
+progress_elapsed() {
+  progress_format_duration $(( SECONDS - PROGRESS_START_SECONDS ))
+}
+
+progress_end() { # summary
+  [[ "$PROGRESS_ACTIVE" == true ]] || return 0
+  PROGRESS_ACTIVE=false
+  progress_clear_line
+  progress_summary "$1"
+}
+
+progress_abort() {
+  [[ "$PROGRESS_ACTIVE" == true ]] || return 0
+  PROGRESS_ACTIVE=false
+  progress_clear_line
+}
+
+progress_hash_summary() { # passes
+  printf 'Hashed %s passes over %s entries, %s in %s\n' "$1" \
+    "$ADOPT_SCAN_COUNT" "$(progress_format_bytes "$ADOPT_SCAN_BYTES")" \
+    "$(progress_elapsed)"
+}
+
 progress_group_was_emitted() { # group_id
   local group_id=$1 emitted_id
   for emitted_id in \
@@ -3863,6 +4175,7 @@ build_hardlink_map() { # root expected_device map identities...
   sorted=$map.sorted
   grouped=$map.grouped
   private_file_is_valid "$raw" "$raw_identity" 600 1 || return 1
+  progress_index_begin
   if ! LC_ALL=C "$BSD_FIND" -P -s -x "$root" -type f -print0 \
       | while IFS= read -r -d '' path; do
         metadata=$(path_stat_signature "$path") || return 1
@@ -3876,12 +4189,15 @@ build_hardlink_map() { # root expected_device map identities...
         else
           return 1
         fi
+        progress_tick 0 "$relative"
         path_hex=$(hex_string "$relative") || return 1
         printf '%s:%s\t%s\t%s\n' "$device" "$inode" "$path_hex" "$nlink" \
           >> "$raw" || return 1
       done; then
+    progress_index_end
     return 1
   fi
+  progress_index_end
   private_file_is_valid "$raw" "$raw_identity" 600 1 || return 1
   LC_ALL=C /usr/bin/sort -t $'\t' -k1,1 -k2,2 "$raw" > "$sorted" \
     || return 1
@@ -3996,6 +4312,11 @@ tree_manifest_stream_with_map() { # root expected_device map map_identity
         type=f
       else
         return 1
+      fi
+      if [[ "$type" == f ]]; then
+        progress_tick "$size" "$relative"
+      else
+        progress_tick 0 "$relative"
       fi
       acl=$(path_acl_digest "$path") || return 1
       xattrs=$(path_xattr_digest "$path") || return 1
@@ -4194,9 +4515,11 @@ tree_digest_once() { # root expected_identity expected_device
   printf '%s\n' "$digest"
 }
 
-stable_tree_digest() { # root expected_identity expected_device
+stable_tree_digest() { # root expected_identity expected_device [pass_name]
   local first second
+  progress_pass "${4:-}"
   first=$(tree_digest_once "$1" "$2" "$3") || return 1
+  progress_pass "${4:-}"
   second=$(tree_digest_once "$1" "$2" "$3") || return 1
   [[ "$first" == "$second" ]] || return 1
   printf '%s\n' "$first"
@@ -4208,7 +4531,8 @@ assert_adopt_source_manifest() { # failure message
   assert_path_identity "$ADOPT_PARENT" "$ADOPT_PARENT_IDENTITY" \
     "source parent"
   digest=$(stable_tree_digest "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" \
-    "$ADOPT_SOURCE_DEVICE") || die "$1"
+    "$ADOPT_SOURCE_DEVICE" source) || die "$1"
+  progress_passes_done 2
   [[ "$digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] || die "$1"
 }
 
@@ -4217,7 +4541,9 @@ assert_adopt_destination_manifest() { # failure message
   assert_path_identity "$ADOPT_DESTINATION" "$ADOPT_DESTINATION_IDENTITY" \
     "destination"
   digest=$(stable_tree_digest "$ADOPT_DESTINATION" \
-    "$ADOPT_DESTINATION_IDENTITY" "$ADOPT_DESTINATION_DEVICE") || die "$1"
+    "$ADOPT_DESTINATION_IDENTITY" "$ADOPT_DESTINATION_DEVICE" destination) \
+    || die "$1"
+  progress_passes_done 2
   [[ "$digest" == "$ADOPT_DESTINATION_TREE_DIGEST" ]] || die "$1"
 }
 
@@ -4270,6 +4596,7 @@ restore_adopt_copy_birthtimes() {
   LC_ALL=C "$BSD_FIND" -P -s -x "$ADOPT_SOURCE" -depth -print0 \
     | while IFS= read -r -d '' source_path; do
       if [[ "$source_path" == "$ADOPT_SOURCE" ]]; then
+        relative=.
         destination_path=$ADOPT_DESTINATION
       elif [[ "$source_path" == "$ADOPT_SOURCE/"* ]]; then
         relative=${source_path#"$ADOPT_SOURCE/"}
@@ -4277,6 +4604,7 @@ restore_adopt_copy_birthtimes() {
       else
         return 1
       fi
+      progress_tick 0 "$relative"
       source_kind=$(path_timestamp_kind "$source_path") || return 1
       destination_kind=$(path_timestamp_kind "$destination_path") || return 1
       [[ "$destination_kind" == "$source_kind" ]] || return 1
@@ -4328,6 +4656,59 @@ restore_adopt_copy_birthtimes() {
     done
 }
 
+# Entry and byte totals for the progress bars. A failed scan leaves both at
+# zero, which only degrades the bars, never the copy.
+ADOPT_SCAN_COUNT=0
+ADOPT_SCAN_BYTES=0
+
+adopt_scan_source() {
+  local count bytes=0 size
+  count=$(LC_ALL=C "$BSD_FIND" -P -x "$ADOPT_SOURCE" -print0 2>/dev/null \
+    | /usr/bin/tr -dc '\0' | /usr/bin/wc -c) || return 1
+  count=${count//[[:space:]]/}
+  [[ "$count" =~ ^[0-9]+$ ]] || return 1
+  while IFS= read -r size; do
+    [[ "$size" =~ ^[0-9]+$ ]] || return 1
+    bytes=$((bytes + size))
+  done < <(LC_ALL=C "$BSD_FIND" -P -x "$ADOPT_SOURCE" -type f -print0 \
+    2>/dev/null | /usr/bin/xargs -0 "$BSD_STAT" -f '%z' -- 2>/dev/null)
+  ADOPT_SCAN_COUNT=$count
+  ADOPT_SCAN_BYTES=$bytes
+}
+
+# ditto -V reports each copied entry on stderr. Byte lines feed the bar and
+# ditto's own diagnostics are passed on, everything else is noise.
+adopt_consume_ditto_output() {
+  local line bytes path
+  while IFS= read -r line; do
+    case "$line" in
+      *' bytes for ./'*)
+        bytes=${line%% bytes for ./*}
+        path=${line#* bytes for ./}
+        [[ "$bytes" =~ ^[0-9]+$ ]] || continue
+        progress_tick "$bytes" "$path"
+        ;;
+      'hardlinked ./'*|'linked ./'*) progress_tick 0 "${line#* ./}" ;;
+      'ditto: '*) presentation_stderr ditto-diagnostic "$line"$'\n' || true ;;
+    esac
+  done
+  return 0
+}
+
+adopt_copy_with_ditto() {
+  local status=0
+  {
+    if /usr/bin/env -u DITTONORSRC "$DITTO_COMMAND" -V -X --rsrc --extattr \
+        --acl --qtn --preserveHFSCompression "$ADOPT_SOURCE" \
+        "$ADOPT_DESTINATION" 2>&1 1>&3 | adopt_consume_ditto_output; then
+      status=0
+    else
+      status=${PIPESTATUS[0]}
+    fi
+  } 3>&1
+  [[ "$status" == 0 ]]
+}
+
 execute_adopt_copy() {
   assert_path_identity "$ADOPT_PARENT" "$ADOPT_PARENT_IDENTITY" \
     "source parent"
@@ -4335,21 +4716,30 @@ execute_adopt_copy() {
   verify_adopt_mount_identity
   [[ ! -e "$ADOPT_DESTINATION" && ! -L "$ADOPT_DESTINATION" ]] \
     || die "$ADOPT_DESTINATION appeared before copy"
+adopt_scan_source || { ADOPT_SCAN_COUNT=0; ADOPT_SCAN_BYTES=0; }
+  progress_summary "Scanned $ADOPT_SCAN_COUNT entries, $(progress_format_bytes "$ADOPT_SCAN_BYTES")"
+  progress_begin "Manifest source" "$ADOPT_SCAN_BYTES" "$ADOPT_SCAN_COUNT" 2
   ADOPT_SOURCE_TREE_DIGEST=$(stable_tree_digest "$ADOPT_SOURCE" \
-    "$ADOPT_SOURCE_IDENTITY" "$ADOPT_SOURCE_DEVICE") \
+    "$ADOPT_SOURCE_IDENTITY" "$ADOPT_SOURCE_DEVICE" source) \
     || die "cannot create stable source manifest, source remains at $ADOPT_SOURCE"
+  progress_passes_done 2
+  progress_end "$(progress_hash_summary 2)"
   assert_path_identity "$ADOPT_PARENT" "$ADOPT_PARENT_IDENTITY" \
     "source parent"
   assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
   verify_adopt_mount_identity
-  /usr/bin/env -u DITTONORSRC "$DITTO_COMMAND" -X --rsrc --extattr --acl \
-    --qtn --preserveHFSCompression "$ADOPT_SOURCE" "$ADOPT_DESTINATION" \
+  progress_begin "Copy source into vault" "$ADOPT_SCAN_BYTES" \
+    "$ADOPT_SCAN_COUNT" 1
+  adopt_copy_with_ditto \
     || die "copy failed, source remains at $ADOPT_SOURCE and partial copy may remain at $ADOPT_DESTINATION"
+  progress_end "Copied $ADOPT_SCAN_COUNT entries, $(progress_format_bytes "$ADOPT_SCAN_BYTES") in $(progress_elapsed)"
   run_named_transition adopt_copy_before_source_identity_check \
     "$ADOPT_SOURCE"
   assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
+  progress_begin "Restore timestamps" 0 "$ADOPT_SCAN_COUNT" 1
   restore_adopt_copy_birthtimes \
     || die "copy verification failed, source remains at $ADOPT_SOURCE and partial copy may remain at $ADOPT_DESTINATION"
+  progress_end "Restored timestamps on $ADOPT_SCAN_COUNT entries in $(progress_elapsed)"
 }
 
 execute_adopt_verify() {
@@ -4357,9 +4747,12 @@ execute_adopt_verify() {
   assert_path_identity "$ADOPT_SOURCE" "$ADOPT_SOURCE_IDENTITY" "source"
   assert_path_identity "$ADOPT_PARENT" "$ADOPT_PARENT_IDENTITY" \
     "source parent"
+  progress_begin "Verify copied source" "$ADOPT_SCAN_BYTES" \
+    "$ADOPT_SCAN_COUNT" 6
   source_digest=$(stable_tree_digest "$ADOPT_SOURCE" \
-    "$ADOPT_SOURCE_IDENTITY" "$ADOPT_SOURCE_DEVICE") \
+    "$ADOPT_SOURCE_IDENTITY" "$ADOPT_SOURCE_DEVICE" source) \
     || die "source manifest changed after copy, source remains at $ADOPT_SOURCE"
+  progress_passes_done 2
   [[ "$source_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] \
     || die "source manifest changed after copy, source remains at $ADOPT_SOURCE"
   [[ ! -L "$ADOPT_DESTINATION" && -d "$ADOPT_DESTINATION" ]] \
@@ -4374,16 +4767,19 @@ execute_adopt_verify() {
   ADOPT_DESTINATION_DEVICE=$("$BSD_STAT" -f '%d' -- "$ADOPT_DESTINATION" \
     2>/dev/null) || die "cannot capture copied destination device"
   destination_digest=$(stable_tree_digest "$ADOPT_DESTINATION" \
-    "$ADOPT_DESTINATION_IDENTITY" "$ADOPT_DESTINATION_DEVICE") \
+    "$ADOPT_DESTINATION_IDENTITY" "$ADOPT_DESTINATION_DEVICE" destination) \
     || die "copy verification failed, source remains at $ADOPT_SOURCE"
+  progress_passes_done 2
   [[ "$destination_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] \
     || die "copy verification failed, source remains at $ADOPT_SOURCE"
   ADOPT_DESTINATION_TREE_DIGEST=$destination_digest
   source_digest=$(stable_tree_digest "$ADOPT_SOURCE" \
-    "$ADOPT_SOURCE_IDENTITY" "$ADOPT_SOURCE_DEVICE") \
+    "$ADOPT_SOURCE_IDENTITY" "$ADOPT_SOURCE_DEVICE" source) \
     || die "source manifest changed after copy, source remains at $ADOPT_SOURCE"
+  progress_passes_done 2
   [[ "$source_digest" == "$ADOPT_SOURCE_TREE_DIGEST" ]] \
     || die "source manifest changed after copy, source remains at $ADOPT_SOURCE"
+  progress_end "$(progress_hash_summary 6)"
   ADOPT_COPY_VERIFIED=true
 }
 
@@ -4923,10 +5319,13 @@ execute_adopt_replace_source() {
   local staged_inode staged_owner staged_link_count
   [[ "$ADOPT_COPY_VERIFIED" == "true" ]] \
     || die "adopt replacement requires verified copy"
+  progress_begin "Verify before replacement" "$ADOPT_SCAN_BYTES" \
+    "$ADOPT_SCAN_COUNT" 4
   assert_adopt_source_manifest \
     "source manifest changed before replacement, source remains at $ADOPT_SOURCE"
   assert_adopt_destination_manifest \
     "destination manifest changed before replacement, source remains at $ADOPT_SOURCE"
+  progress_end "$(progress_hash_summary 4)"
   verify_adopt_mount_identity
   [[ ! -e "$ADOPT_STAGED_LINK" && ! -L "$ADOPT_STAGED_LINK" \
       && ! -e "$ADOPT_BACKUP" && ! -L "$ADOPT_BACKUP" ]] \
@@ -7601,7 +8000,7 @@ usage: vaultlock <command>
 commands:
   init [--dry-run] [--yes] [-v|-vv] [--color=MODE]
                              create the encrypted vault volume
-  adopt [--dry-run] [--yes] [-v|-vv] [--color=MODE] <dir>
+  adopt [--dry-run] [--yes] [-v|-vv] [--color=MODE] [--progress=MODE] <dir>
                              move a directory onto the vault, leave a symlink
   lock [--dry-run] [--yes] [--no-hooks] [-v|-vv] [--color=MODE] <deadline>
                              time-lock the vault until a future deadline
@@ -7620,6 +8019,11 @@ presentation levels:
 
 colour options for all commands:
   --color=auto|always|never  control terminal colour (default: auto)
+
+progress options for adopt:
+  --progress=auto|always|never
+                             redraw copy and verification progress bars
+                             (default: auto, on a stdout terminal)
 
 deadline forms:
   "YYYY-MM-DD HH:MM"         absolute local date and time
@@ -7681,6 +8085,14 @@ case "${1:-}" in
     PRESENTATION_MUTABLE=true
     PRESENTATION_STDERR_FAILED=true
     finish_presentation_status
+    ;;
+  __progress_mode)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __progress_mode"
+    [[ $# -eq 2 ]] \
+      || die_usage "usage: vaultlock __progress_mode <auto|always|never>"
+    resolve_progress "$2"
+    printf '%s %s\n' "$PROGRESS_ENABLED" "$PROGRESS_WIDTH"
     ;;
   __colour)
     [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
@@ -7963,6 +8375,27 @@ inconsistent_missing_hash|inconsistent_retained_plaintext)
     known_operation_id "$3" \
       || die "no progress group for operation ID: $3"
     progress_group_for_operation "$2" "$3"
+    ;;
+  __progress_format)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __progress_format"
+    [[ $# -eq 3 ]] \
+      || die_usage "usage: vaultlock __progress_format <bytes|duration> <value>"
+    case "$2" in
+      bytes) progress_format_bytes "$3" || die_usage "invalid byte count: $3" ;;
+      duration)
+        progress_format_duration "$3" || die_usage "invalid duration: $3"
+        ;;
+      *) die_usage "unknown progress format: $2" ;;
+    esac
+    ;;
+  __progress_bar)
+    [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
+      || die_usage "unknown command: __progress_bar"
+    [[ $# -eq 10 ]] \
+      || die_usage "usage: vaultlock __progress_bar <done_bytes> <total_bytes> <done_count> <total_count> <elapsed> <width> <label> <pass> <current>"
+    shift
+    progress_bar_line "$@" || die_usage "invalid progress bar input"
     ;;
   __known_operations)
     [[ "${VAULTLOCK_TEST_FAKE_SYSTEM:-0}" == "1" ]] \
